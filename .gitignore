@@ -14,3 +14,6 @@ dist/*.zip
 # Environments
 .venv/
 env/
+
+# Superseded backup files (never track)
+*_backup.py
