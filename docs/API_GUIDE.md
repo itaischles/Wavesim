@@ -1,0 +1,584 @@
+# FDTD Engine — User API Guide (v1)
+
+A practical guide to building and running 2D-in-3D FDTD electromagnetic
+simulations with this engine. It documents every public function you need,
+the canonical simulation loop, the conventions that bite if you get them
+wrong, and three complete worked examples drawn from the validated test suite.
+
+> **Scope.** This covers the current v1 API: a functional NumPy solver running
+> 3D arrays as a thin `Nz=1` slice, with CPML and PEC boundaries, Gaussian
+> sources, time/snapshot/energy monitors, and visualisation helpers.
+
+---
+
+## Contents
+
+1. [Mental model](#1-mental-model)
+2. [Setup & running](#2-setup--running)
+3. [Quickstart](#3-quickstart)
+4. [The simulation loop (canonical pattern)](#4-the-simulation-loop-canonical-pattern)
+5. [Conventions you must know](#5-conventions-you-must-know)
+6. [API reference](#6-api-reference)
+   - [grid](#grid) · [materials](#materials) · [sources](#sources) ·
+     [pml](#pml) · [pec](#pec) · [monitors](#monitors) · [viz](#viz) ·
+     [constants](#constants)
+7. [Worked examples](#7-worked-examples)
+8. [Troubleshooting](#8-troubleshooting)
+
+---
+
+## 1. Mental model
+
+The engine is **functional**: there is one state object, `FDTDGrid`, and a set
+of pure-ish functions that take it and return it (mutating its arrays in place).
+There is **no `Simulation` class** — *you* write the time loop in your script.
+
+```
+create_grid ──► set materials ──► init boundaries / sources / monitors
+                                          │
+                                          ▼
+                        ┌── for n in range(N_STEPS): ──┐
+                        │   advance H, E (+ CPML)       │
+                        │   enforce PEC                 │
+                        │   inject source               │
+                        │   record monitors             │
+                        └───────────────────────────────┘
+                                          │
+                                          ▼
+                              plot / animate results
+```
+
+Everything operates on full 3D arrays of shape `(Nx, Ny, Nz)`. For v1 you keep
+`Nz = 1`; the third dimension is carried so the same code becomes full 3D later
+without restructuring. With `Nz=1` and an `Ez` source you are simulating the
+**TM_z** polarisation: the live fields are `Ez`, `Hx`, `Hy` (all z-derivatives
+vanish automatically).
+
+---
+
+## 2. Setup & running
+
+The engine needs **NumPy**, **Matplotlib**, and (for some analysis in the tests)
+**SciPy**. Use the dedicated conda environment:
+
+```bash
+# the env that has the dependencies
+C:\Users\itais\miniconda3\envs\fdtd\python.exe  your_script.py
+```
+
+On the Windows console, set UTF-8 first if your script prints non-ASCII glyphs:
+
+```bash
+set PYTHONIOENCODING=utf-8
+```
+
+Import from the `fdtd` package (run scripts from the repo root, or add it to
+`sys.path` as the tests do):
+
+```python
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))  # if in tests/
+```
+
+---
+
+## 3. Quickstart
+
+A complete free-space pulse in ~20 lines:
+
+```python
+import numpy as np
+from fdtd.grid import create_grid
+from fdtd.materials import set_vacuum
+from fdtd.update import update_H, update_E
+from fdtd.pml import init_cpml, update_H_pml, update_E_pml
+from fdtd.pec import apply_pec_mask
+from fdtd.sources import GaussianSource, gaussian_pulse
+from fdtd.monitors import SnapshotMonitor, record_snapshot
+
+grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)   # dt set automatically
+grid = set_vacuum(grid)
+cpml = init_cpml(grid, d_pml=10)                       # absorb on all 4 faces
+
+src  = GaussianSource(t0=4/(2*np.pi*10e9), width=1/(2*np.pi*10e9))
+snap = SnapshotMonitor(component='Ez', k_slice=0, interval=20)
+
+for n in range(2000):
+    t = n * grid.dt
+    grid = update_H(grid);  grid, cpml = update_H_pml(grid, cpml)
+    grid = update_E(grid);  grid, cpml = update_E_pml(grid, cpml)
+    grid = apply_pec_mask(grid)                        # no-op without PEC
+    grid.Ez[100, 100, 0] += gaussian_pulse(src, t)     # soft injection
+    record_snapshot(snap, grid)
+    grid.time_step += 1
+```
+
+`snap.snapshots` now holds a list of `(Nx, Ny)` `Ez` slices you can plot or
+animate (see [viz](#viz)).
+
+---
+
+## 4. The simulation loop (canonical pattern)
+
+**The order of operations is fixed. Do not reorder it.** Each step depends on
+the previous one being applied to the correct half-update.
+
+```python
+for n in range(N_STEPS):
+    t = n * grid.dt
+
+    # 1. H update (interior, full curl)
+    grid = update_H(grid)
+    # 2. CPML H correction (only if using CPML)
+    grid, cpml = update_H_pml(grid, cpml)
+
+    # 3. E update (interior, full curl)
+    grid = update_E(grid)
+    # 4. CPML E correction
+    grid, cpml = update_E_pml(grid, cpml)
+
+    # 5. Enforce PEC — ALWAYS after the E update (+ CPML)
+    grid = apply_pec_faces(grid, faces=('y0', 'y1'))   # omit if no PEC walls
+    grid = apply_pec_mask(grid)                         # no-op if pec_mask is None
+
+    # 6. Inject source (soft, additive)
+    grid.Ez[i_src, j_src, 0] += gaussian_pulse(source, t)
+
+    # 7. Record monitors
+    record_field(fmon, grid)
+    record_energy(emon, grid)
+    record_snapshot(snap_mon, grid)
+
+    # 8. Advance the step counter (monitors read it for their time axis)
+    grid.time_step += 1
+```
+
+| # | Step | Skip when… |
+|---|------|-----------|
+| 1–2 | H update + CPML | never advance H; CPML optional (lossless cavity) |
+| 3–4 | E update + CPML | CPML optional |
+| 5 | PEC faces / mask | no PEC walls / no conductors |
+| 6 | Source injection | — |
+| 7 | Monitors | — |
+| 8 | `time_step += 1` | **never** — monitors timestamp from it |
+
+If you are **not** using CPML (e.g. a closed PEC cavity), simply drop steps 2
+and 4 and don't create a `cpml` object.
+
+---
+
+## 5. Conventions you must know
+
+These are the things that silently produce wrong physics if you ignore them.
+
+### Units are SI (metres, seconds)
+All geometry and timing inputs are in **metres** and **seconds**. `dx=0.5e-3`
+is 0.5 mm. `set_box(grid, 0.02, 0.04, ...)` is 20–40 mm. Plot helpers *display*
+in mm/ns, but every API input is base SI.
+
+### Materials are *relative* (`eps_r`, `mu_r`)
+`grid.eps_*` and `grid.mu_*` store relative permittivity/permeability. Vacuum is
+`1.0`. The physical constants `EPS0`/`MU0` are applied inside the update
+functions — you never multiply them in yourself.
+
+### `dt` is computed for you
+`create_grid` sets `grid.dt` from the conservative 3D CFL condition
+(`CFL = 0.99`). **Never set `dt` manually** — doing so risks instability
+(energy blow-up) or wasted resolution.
+
+### Soft injection only (`+=`, never `=`)
+Add the source to the existing field value:
+`grid.Ez[i, j, 0] += gaussian_pulse(...)`. A hard assignment (`=`) acts like a
+PEC sheet and reflects every wave that reaches it.
+
+### Effective domain size: the `(N−1)` rule
+`apply_pec_faces` zeroes the field on the **node planes** `i=0` and `i=Nx-1`.
+A standing wave therefore spans the distance *between* those planes,
+`(Nx−1)·dx`, **not** `Nx·dx`. This matters whenever you compare against an
+analytic resonance or cutoff:
+
+```python
+a_eff = (Nx - 1) * grid.dx        # cavity width seen by the fields
+b_eff = (Ny - 1) * grid.dy
+```
+
+Using the nominal `Nx·dx` injects a ~1% error — enough to fail a 1% tolerance.
+(See the cavity and waveguide examples.)
+
+### `gaussian_pulse` is a *baseband* envelope
+It returns `amplitude · exp(-½((t-t0)/width)²)` — a pulse centred at DC with
+bandwidth `≈ 1/(2π·width)`. For a **single-frequency / narrowband** excitation
+(e.g. testing above/below a waveguide cutoff) multiply by a carrier yourself:
+
+```python
+g = np.sin(2*np.pi*f0*(t - t0)) * np.exp(-0.5*((t - t0)/tau)**2)
+grid.Ez[i_src, :, 0] += g
+```
+
+### CPML only on open faces
+Put CPML on faces that should *absorb*. Faces that are PEC walls or symmetry
+planes must be **excluded** from CPML, or they will wrongly absorb the guided
+or standing mode. Select faces explicitly:
+
+```python
+cpml = init_cpml(grid, d_pml=10, faces=('x0', 'x1'))   # open ends only
+```
+
+### Monitors timestamp from `grid.time_step`
+Every `record_*` call stores `grid.time_step * grid.dt` as the time. Increment
+`grid.time_step` once per loop (step 8). `SnapshotMonitor` records a frame only
+when `time_step % interval == 0`.
+
+---
+
+## 6. API reference
+
+Import paths are `from fdtd.<module> import <name>`.
+
+### grid
+
+```python
+@dataclass
+class FDTDGrid:
+    Ex, Ey, Ez, Hx, Hy, Hz          # field arrays, shape (Nx, Ny, Nz)
+    eps_x, eps_y, eps_z             # relative permittivity per component
+    mu_x,  mu_y,  mu_z              # relative permeability per component
+    dx, dy, dz, dt                  # spacing (m) and timestep (s)
+    Nx, Ny, Nz                      # cell counts
+    pec_mask                        # bool array or None
+    time_step = 0                   # integer step counter
+```
+
+```python
+create_grid(Nx, Ny, Nz, dx, dy=None, dz=None) -> FDTDGrid
+```
+Allocate a grid with all fields zero and all materials vacuum (`eps_r=mu_r=1`).
+`dy`/`dz` default to `dx` (cubic cells). `dt` is set automatically from the CFL
+condition. **This is your starting point for every simulation.**
+
+```python
+grid = create_grid(Nx=100, Ny=80, Nz=1, dx=1e-3)
+print(grid.dt)          # ~1.9 ps for 1 mm cells
+```
+
+Access fields/materials directly as attributes: `grid.Ez[i, j, k]`,
+`grid.eps_z[...] = 4.0`, etc.
+
+---
+
+### materials
+
+Always `set_vacuum` first, then place geometry.
+
+```python
+set_vacuum(grid) -> grid
+```
+Reset the entire domain to `eps_r = mu_r = 1`.
+
+```python
+set_box(grid, x0, x1, y0, y1, z0, z1, eps_r, mu_r=1.0, pec=False) -> grid
+```
+Fill an axis-aligned box (corners in **metres**, snapped to the nearest cell)
+with a uniform material. With `pec=True` the region is marked in `grid.pec_mask`
+instead (a solid conductor), and `eps_r`/`mu_r` are ignored.
+
+```python
+set_cylinder(grid, cx, cy, radius, z0, z1, eps_r, mu_r=1.0, pec=False) -> grid
+```
+Fill a Z-aligned cylinder. `cx, cy, radius` in **metres**. `pec=True` marks it
+as a conductor.
+
+```python
+set_coax(grid, cx, cy, r_inner, r_outer, eps_r_fill=1.0) -> grid
+```
+Build a coaxial cross-section: inner conductor (PEC), dielectric fill
+(`eps_r_fill`) in the annulus, and everything at `r ≥ r_outer` marked PEC as the
+outer wall. Radii in **metres**.
+
+```python
+set_material_arrays(grid, eps_x, eps_y, eps_z, mu_x, mu_y, mu_z,
+                    pec_mask=None) -> grid
+```
+Assign pre-computed `(Nx, Ny, Nz)` arrays directly (validated for shape). Use
+this when you have built material distributions yourself.
+
+```python
+grid = set_vacuum(grid)
+grid = set_box(grid, 0.03, 0.07, 0.03, 0.05, 0, grid.dz, eps_r=4.0)  # dielectric
+grid = set_cylinder(grid, 0.05, 0.04, 0.005, 0, grid.dz, eps_r=1, pec=True)  # PEC rod
+```
+
+---
+
+### sources
+
+```python
+@dataclass
+class GaussianSource:
+    t0: float          # pulse centre time (s)
+    width: float       # std-dev (s); bandwidth ≈ 1/(2π·width)
+    amplitude = 1.0
+```
+
+```python
+gaussian_pulse(source, t) -> float
+```
+Evaluate the baseband Gaussian envelope at time `t`.
+
+```python
+make_source_for_fmax(f_max, amplitude=1.0) -> GaussianSource
+```
+Convenience constructor that picks `width = 1/(2π f_max)` and `t0 = 4·width` so
+the pulse is fully contained in the window and carries energy up to ≈ `f_max`.
+
+```python
+src = make_source_for_fmax(5e9)                 # content up to ~5 GHz
+grid.Ez[100, 100, 0] += gaussian_pulse(src, t)  # in the loop
+```
+
+For a narrowband/CW excitation, modulate the envelope with a carrier yourself
+(see [Conventions](#5-conventions-you-must-know)).
+
+---
+
+### pml
+
+CPML (convolutional PML) absorbing boundaries. Create one `CPMLArrays` object
+once, then call the two correction functions inside the loop.
+
+```python
+ALL_FACES = ('x0', 'x1', 'y0', 'y1', 'z0', 'z1')
+
+init_cpml(grid, d_pml=10, faces=ALL_FACES) -> CPMLArrays
+```
+Allocate auxiliary arrays and precompute absorption profiles. `d_pml` is the
+PML thickness in cells (8–12 recommended; thicker = lower reflection, more
+memory). **`faces`** selects which boundaries absorb — pass a subset to leave
+PEC-wall or symmetry faces transparent. `'x0'` is the face at `i=0`, `'x1'` at
+`i=Nx-1`, etc. Unknown face names raise `ValueError`. (For `Nz=1`, the z-faces
+are automatically inert.)
+
+```python
+update_H_pml(grid, cpml) -> (grid, cpml)
+update_E_pml(grid, cpml) -> (grid, cpml)
+```
+Apply the CPML correction on top of `update_H` / `update_E`. **Call order is
+fixed:** `update_H → update_H_pml → update_E → update_E_pml`. Both return the
+updated `(grid, cpml)` tuple — reassign both.
+
+```python
+cpml = init_cpml(grid, d_pml=10)                       # absorb everywhere
+cpml = init_cpml(grid, d_pml=10, faces=('x0', 'x1'))   # waveguide: open ends only
+```
+
+---
+
+### pec
+
+Perfect-electric-conductor enforcement. Both functions zero E components and run
+**after** the E update (and CPML correction).
+
+```python
+apply_pec_faces(grid, faces=('x0', 'x1', 'y0', 'y1')) -> grid
+```
+Zero the tangential E components on the named domain faces — i.e. make those
+walls perfect conductors. Subset of `('x0','x1','y0','y1','z0','z1')`.
+
+```python
+apply_pec_mask(grid) -> grid
+```
+Zero all E components in cells where `grid.pec_mask` is `True` (interior
+conductors placed by `set_box`/`set_cylinder`/`set_coax`). A no-op when
+`pec_mask` is `None`, so it is always safe to call.
+
+```python
+grid = apply_pec_faces(grid, faces=('y0', 'y1'))   # waveguide side walls
+grid = apply_pec_mask(grid)                          # interior conductors
+```
+
+---
+
+### monitors
+
+Each monitor is a dataclass holding configuration plus accumulated data lists;
+each `record_*` appends the current value and returns the monitor (it also
+mutates in place, so the return value is optional).
+
+```python
+FieldMonitor(component, i, j, k)            # component: 'Ex'..'Hz'
+record_field(monitor, grid) -> monitor      # -> monitor.times, monitor.values
+```
+Record one field component at a fixed cell.
+
+```python
+MagnitudeMonitor(field, i, j, k)            # field: 'E' or 'H'
+record_magnitude(monitor, grid) -> monitor
+```
+Record `|E|` or `|H|` (vector magnitude) at a fixed cell.
+
+```python
+SnapshotMonitor(component, k_slice, interval)
+record_snapshot(monitor, grid) -> monitor    # -> monitor.snapshots, .snap_times
+```
+Capture the 2D `(Nx, Ny)` slice of `component` at `k_slice`, every `interval`
+steps (records when `time_step % interval == 0`). Stored as copies.
+
+```python
+EnergyMonitor()
+record_energy(monitor, grid) -> monitor      # -> monitor.times, monitor.values
+```
+Total EM energy `U = ½ Σ(eps·|E|² + mu·|H|²)·dV`. In a stable run it must not
+grow without bound; a steadily rising curve means a CFL/stability problem.
+
+```python
+fmon = FieldMonitor(component='Ez', i=150, j=100, k=0)
+emon = EnergyMonitor()
+snap = SnapshotMonitor(component='Ez', k_slice=0, interval=20)
+# in the loop:
+record_field(fmon, grid); record_energy(emon, grid); record_snapshot(snap, grid)
+```
+
+---
+
+### viz
+
+All plotting lives here. Functions that draw a figure return `(fig, ax)`;
+`animate_snapshots` returns a Matplotlib `FuncAnimation`. Use the non-interactive
+backend (`matplotlib.use('Agg')`) when saving to file in a headless run.
+
+```python
+plot_grid_xy(grid, cpml=None, ax=None) -> (fig, ax)
+```
+Yee cell grid with staggered E/H marker positions; shades the PML region if
+`cpml` is given.
+
+```python
+plot_materials_xy(grid, component='eps_z', cpml=None, ax=None) -> (fig, ax)
+```
+Colour map of a material array; overlays PML shading and hatches PEC cells.
+`component` is one of `'eps_x'..'mu_z'`.
+
+```python
+plot_source_waveform(source, dt, n_steps, ax=None) -> (fig, ax)
+```
+Plot the Gaussian pulse over the run window; prints the estimated bandwidth and
+the residual amplitude at both ends (to confirm the pulse fits).
+
+```python
+plot_field_snapshot(snapshot_array, grid, timestep, component='Ez', ax=None)
+```
+Render a single 2D snapshot with a zero-centred diverging colour map.
+
+```python
+animate_snapshots(snapshot_monitor, grid, interval_ms=50) -> FuncAnimation
+anim.save('out.gif', writer='pillow', fps=20)
+```
+Animate a `SnapshotMonitor`'s frames.
+
+```python
+plot_monitor_time_series(monitor, dt, ax=None) -> (fig, ax)   # Field/Magnitude
+plot_energy(monitor, dt, ax=None) -> (fig, ax)                # log-scale energy
+```
+
+```python
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+fig, ax = plot_materials_xy(grid, component='eps_z', cpml=cpml)
+plt.savefig('materials.png', dpi=120)
+```
+
+---
+
+### constants
+
+```python
+from fdtd.constants import C0, EPS0, MU0, ETA0
+# C0   = 299792458.0      speed of light (m/s)
+# EPS0 = 8.8541878e-12    vacuum permittivity (F/m)
+# MU0  = 1.2566370e-6     vacuum permeability (H/m)
+# ETA0 = 376.730313       free-space impedance (Ω)
+```
+
+Use these for analytic comparisons (e.g. `f = C0/(2*b_eff)`).
+
+---
+
+## 7. Worked examples
+
+Each corresponds to a validated test in `tests/`. Only the distinctive parts are
+shown; the loop body follows [section 4](#4-the-simulation-loop-canonical-pattern).
+
+### 7.1 Free-space pulse + absorbing boundaries (`test_02`)
+
+CPML on all four faces; soft `Ez` point source; check the wavefront is absorbed
+(energy decays, no reflections).
+
+```python
+grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)
+grid = set_vacuum(grid)
+cpml = init_cpml(grid, d_pml=10)                       # all faces absorb
+src  = make_source_for_fmax(10e9)
+# loop: H, H_pml, E, E_pml, apply_pec_mask (no-op),
+#       grid.Ez[100,100,0] += gaussian_pulse(src, t)
+```
+
+### 7.2 Closed PEC cavity resonance (`test_03`)
+
+**No CPML** (the cavity is lossless); PEC on all four faces; broadband pulse
+rings as a sum of eigenmodes; FFT the field monitors to read the resonances.
+
+```python
+grid = create_grid(Nx=100, Ny=80, Nz=1, dx=1e-3)
+grid = set_vacuum(grid)
+# NO init_cpml; drop the *_pml calls from the loop
+# loop: update_H, update_E,
+#       apply_pec_faces(grid, faces=('x0','x1','y0','y1')),
+#       grid.Ez[23,17,0] += gaussian_pulse(src, t)
+
+# analytic check uses the EFFECTIVE dimensions:
+a_eff, b_eff = (100-1)*grid.dx, (80-1)*grid.dx
+f_mn = 0.5*C0*np.sqrt((m/a_eff)**2 + (n/b_eff)**2)     # m,n >= 1
+```
+
+### 7.3 Rectangular waveguide dispersion (`test_04`)
+
+PEC side walls at `y0/y1`; CPML on the propagation-axis faces **only**;
+narrowband (modulated-Gaussian) source on a transverse line; below cutoff the
+field is evanescent, above cutoff it propagates.
+
+```python
+grid = create_grid(Nx=200, Ny=50, Nz=1, dx=0.5e-3)
+grid = set_vacuum(grid)
+cpml = init_cpml(grid, d_pml=10, faces=('x0', 'x1'))   # y-faces are PEC walls
+
+b_eff = (50-1)*grid.dx                                   # effective width
+f_c   = C0 / (2*b_eff)                                   # ~6.12 GHz
+
+f0, tau, t0 = 9e9, 6/9e9, 3.5*(6/9e9)                    # narrowband above cutoff
+# in the loop, after the *_pml calls:
+grid = apply_pec_faces(grid, faces=('y0', 'y1'))         # waveguide walls
+g = np.sin(2*np.pi*f0*(t - t0)) * np.exp(-0.5*((t - t0)/tau)**2)
+grid.Ez[20, :, 0] += g                                   # line source
+```
+
+---
+
+## 8. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Energy grows without bound; fields → NaN | `dt` set manually / CFL violated | Let `create_grid` set `dt`; never override it |
+| Strong reflections off the domain edge | No CPML, or CPML correction omitted | `init_cpml` + call `update_H_pml`/`update_E_pml` in the right order |
+| Guided/standing mode is damped near a wall | CPML active on a PEC-wall face | Exclude that face: `init_cpml(..., faces=(...))` |
+| Source reflects waves back | Hard injection (`=`) | Use soft injection (`+=`) |
+| Measured resonance/cutoff off by ~1% | Used nominal `N·d` instead of effective `(N−1)·d` | Use `(N-1)*dx` for the mode span |
+| Single-frequency test has huge bandwidth | Used bare `gaussian_pulse` (baseband) | Multiply by a `sin(2π f0 t)` carrier |
+| `SnapshotMonitor` is empty | `time_step` never incremented, or `interval` > run length | Increment `grid.time_step` each step; check `interval` |
+| Monitor time axis is all zeros | `grid.time_step += 1` missing | Add step 8 of the loop |
+| Wave won't propagate (waveguide) | Driving below cutoff | Drive above `f_c = c/(2·b_eff)`, or expect evanescence |
+
+---
+
+*This guide documents the v1 engine as built. The fixed loop order, SI/relative-
+material conventions, the `(N−1)` effective-dimension rule, and per-face CPML
+selection are the four things most worth committing to memory.*

@@ -87,7 +87,7 @@ class CPMLArrays:
 # ---------------------------------------------------------------------- #
 # Profile construction
 # ---------------------------------------------------------------------- #
-def _calc_profile_1d(N, ds, dt, d_pml, staggered):
+def _calc_profile_1d(N, ds, dt, d_pml, staggered, low=True, high=True):
     """
     Build the 1D (b, c) CPML coefficient arrays along one axis.
 
@@ -100,12 +100,22 @@ def _calc_profile_1d(N, ds, dt, d_pml, staggered):
     where d is the depth into the PML (0 at the inner edge, d_pml*ds at the
     domain boundary). Returns (b, c) of length N; both reduce to (1, 0)
     outside the PML so the correction vanishes in the interior.
+
+    Parameters
+    ----------
+    low, high : bool
+        Whether to build the absorbing slab at the low-index face (depth grows
+        towards index 0) and the high-index face (towards index N-1). Set a
+        face False to leave it transparent (e.g. when that face is a PEC wall
+        or a symmetry plane). With b=1, c=0 there the psi recursion stays at 0,
+        so no correction is applied on that side.
     """
     b = np.ones(N)
     c = np.zeros(N)
 
-    # Too thin to host two PML slabs (e.g. Nz=1 slice): no PML on this axis.
-    if N <= 2 * d_pml:
+    # Too thin to host two PML slabs (e.g. Nz=1 slice), or both faces disabled:
+    # no PML on this axis.
+    if N <= 2 * d_pml or not (low or high):
         return b, c
 
     m = 3
@@ -129,18 +139,20 @@ def _calc_profile_1d(N, ds, dt, d_pml, staggered):
     idx = np.arange(N)
     coord = (idx - 0.5) * ds if staggered else idx * ds
 
-    # Left slab: depth grows towards the boundary (coord -> 0).
+    # Left slab (low-index face): depth grows towards the boundary (coord -> 0).
     # clip handles the unused over-range staggered node at idx=0 (coord<0).
-    left = coord < left_edge
-    depth_l = np.clip((left_edge - coord[left]) / d_pml_len, 0.0, 1.0)
-    sigma[left] = sigma_max * depth_l ** m
-    alpha[left] = alpha_max * (1.0 - depth_l)
+    if low:
+        left = coord < left_edge
+        depth_l = np.clip((left_edge - coord[left]) / d_pml_len, 0.0, 1.0)
+        sigma[left] = sigma_max * depth_l ** m
+        alpha[left] = alpha_max * (1.0 - depth_l)
 
-    # Right slab: depth grows towards the boundary (coord -> N*ds).
-    right = coord > right_edge
-    depth_r = np.clip((coord[right] - right_edge) / d_pml_len, 0.0, 1.0)
-    sigma[right] = sigma_max * depth_r ** m
-    alpha[right] = alpha_max * (1.0 - depth_r)
+    # Right slab (high-index face): depth grows towards the boundary (coord -> N*ds).
+    if high:
+        right = coord > right_edge
+        depth_r = np.clip((coord[right] - right_edge) / d_pml_len, 0.0, 1.0)
+        sigma[right] = sigma_max * depth_r ** m
+        alpha[right] = alpha_max * (1.0 - depth_r)
 
     # kappa = 1, so the standard CPML coefficients simplify to:
     #   b = exp(-(sigma + alpha) * dt / EPS0)
@@ -154,24 +166,48 @@ def _calc_profile_1d(N, ds, dt, d_pml, staggered):
     return b, c
 
 
-def init_cpml(grid: FDTDGrid, d_pml: int = 10) -> CPMLArrays:
+ALL_FACES = ('x0', 'x1', 'y0', 'y1', 'z0', 'z1')
+
+
+def init_cpml(grid: FDTDGrid, d_pml: int = 10,
+              faces: tuple = ALL_FACES) -> CPMLArrays:
     """
     Allocate the psi convolution arrays and precompute the (b, c) profiles
     for every axis on both the E (staggered) and H (non-staggered) grids.
 
+    Parameters
+    ----------
+    faces : tuple of str
+        Which domain faces are absorbing CPML. Any subset of
+        ('x0','x1','y0','y1','z0','z1'). Faces left out are transparent — use
+        this when a face is a PEC wall or symmetry plane (e.g. a waveguide with
+        PEC side walls absorbs only on the propagation-axis faces:
+        faces=('x0','x1')). Defaults to all six faces.
+        'x0' = the face at i=0, 'x1' = the face at i=Nx-1, etc.
+
     # 3D-UPGRADE: the z-axis profiles return (1, 0) when Nz <= 2*d_pml, so the
     #             z-face PML is inert for Nz=1 slices and activates on its own
-    #             once Nz is large enough.
+    #             once Nz is large enough (subject to z0/z1 being in `faces`).
     """
+    bad = set(faces) - set(ALL_FACES)
+    if bad:
+        raise ValueError(f"Unknown face(s) {sorted(bad)}. "
+                         f"Must be a subset of {ALL_FACES}.")
+
+    # Map each axis to (low-index face enabled, high-index face enabled).
+    x_lo, x_hi = 'x0' in faces, 'x1' in faces
+    y_lo, y_hi = 'y0' in faces, 'y1' in faces
+    z_lo, z_hi = 'z0' in faces, 'z1' in faces
+
     shape = (grid.Nx, grid.Ny, grid.Nz)
     z = lambda: np.zeros(shape, dtype=np.float64)
 
-    bx_E, cx_E = _calc_profile_1d(grid.Nx, grid.dx, grid.dt, d_pml, staggered=True)
-    bx_H, cx_H = _calc_profile_1d(grid.Nx, grid.dx, grid.dt, d_pml, staggered=False)
-    by_E, cy_E = _calc_profile_1d(grid.Ny, grid.dy, grid.dt, d_pml, staggered=True)
-    by_H, cy_H = _calc_profile_1d(grid.Ny, grid.dy, grid.dt, d_pml, staggered=False)
-    bz_E, cz_E = _calc_profile_1d(grid.Nz, grid.dz, grid.dt, d_pml, staggered=True)
-    bz_H, cz_H = _calc_profile_1d(grid.Nz, grid.dz, grid.dt, d_pml, staggered=False)
+    bx_E, cx_E = _calc_profile_1d(grid.Nx, grid.dx, grid.dt, d_pml, True,  x_lo, x_hi)
+    bx_H, cx_H = _calc_profile_1d(grid.Nx, grid.dx, grid.dt, d_pml, False, x_lo, x_hi)
+    by_E, cy_E = _calc_profile_1d(grid.Ny, grid.dy, grid.dt, d_pml, True,  y_lo, y_hi)
+    by_H, cy_H = _calc_profile_1d(grid.Ny, grid.dy, grid.dt, d_pml, False, y_lo, y_hi)
+    bz_E, cz_E = _calc_profile_1d(grid.Nz, grid.dz, grid.dt, d_pml, True,  z_lo, z_hi)
+    bz_H, cz_H = _calc_profile_1d(grid.Nz, grid.dz, grid.dt, d_pml, False, z_lo, z_hi)
 
     return CPMLArrays(
         psi_Ez_y=z(), psi_Ey_z=z(), psi_Ex_z=z(),
