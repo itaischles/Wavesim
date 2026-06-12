@@ -49,14 +49,14 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 
-from fdtd.grid import create_grid
-from fdtd.materials import set_vacuum
-from fdtd.update import update_H, update_E
-from fdtd.pec import apply_pec_faces, apply_pec_mask
-from fdtd.sources import GaussianSource, gaussian_pulse
-from fdtd.monitors import (FieldMonitor, SnapshotMonitor,
+from wavesim.grid import create_grid
+from wavesim.materials import set_vacuum
+from wavesim.update import update_H, update_E
+from wavesim.pec import apply_pec_faces, apply_pec_mask
+from wavesim.sources import GaussianSource, gaussian_pulse
+from wavesim.monitors import (FieldMonitor, SnapshotMonitor,
                            record_field, record_snapshot)
-from fdtd.constants import C0
+from wavesim.constants import C0
 
 
 def _parabolic_refine(idx, x, y):

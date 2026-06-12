@@ -15,7 +15,7 @@ Pass criteria:
     3. Bandwidth printed to stdout ≈ f_max (within 5%)
 
 Run:
-    cd C:\\Users\\itais\\Desktop\\fdtd-engine
+    cd C:\\Users\\itais\\Desktop\\Wavesim
     python tests\\test_01_source_viz.py
 
 Output: saves test_01_output.png
@@ -30,9 +30,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from fdtd.grid import create_grid
-from fdtd.sources import GaussianSource, gaussian_pulse, make_source_for_fmax
-from fdtd.viz import plot_source_waveform
+from wavesim.grid import create_grid
+from wavesim.sources import GaussianSource, gaussian_pulse, make_source_for_fmax
+from wavesim.viz import plot_source_waveform
 
 
 def test_01_source_viz():

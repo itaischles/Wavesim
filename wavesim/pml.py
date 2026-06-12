@@ -49,8 +49,8 @@ Sign convention (matches update.py exactly)
 from dataclasses import dataclass
 import numpy as np
 
-from fdtd.grid import FDTDGrid
-from fdtd.constants import EPS0, MU0, ETA0
+from wavesim.grid import FDTDGrid
+from wavesim.constants import EPS0, MU0, ETA0
 
 
 @dataclass

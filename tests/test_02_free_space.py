@@ -20,7 +20,7 @@ Validation checks:
 Pass criteria: all 4 checks pass numerically; PNG saved for visual inspection.
 
 Run:
-    cd fdtd-engine
+    cd Wavesim
     python tests\test_02_free_space.py
 """
 
@@ -33,16 +33,16 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from fdtd.grid import create_grid
-from fdtd.materials import set_vacuum
-from fdtd.update import update_H, update_E
-from fdtd.pml import init_cpml, update_H_pml, update_E_pml
-from fdtd.pec import apply_pec_mask
-from fdtd.sources import GaussianSource, gaussian_pulse
-from fdtd.monitors import (FieldMonitor, EnergyMonitor, SnapshotMonitor,
+from wavesim.grid import create_grid
+from wavesim.materials import set_vacuum
+from wavesim.update import update_H, update_E
+from wavesim.pml import init_cpml, update_H_pml, update_E_pml
+from wavesim.pec import apply_pec_mask
+from wavesim.sources import GaussianSource, gaussian_pulse
+from wavesim.monitors import (FieldMonitor, EnergyMonitor, SnapshotMonitor,
                             record_field, record_energy, record_snapshot)
-from fdtd.constants import C0
-from fdtd.viz import plot_energy
+from wavesim.constants import C0
+from wavesim.viz import plot_energy
 
 
 def run():

@@ -1,7 +1,7 @@
 # Debug Notes — CPML / `pml.py` (Test 02, free-space propagation)
 
 **Date:** 2026-06-11
-**Subsystem:** `fdtd/pml.py` (Convolutional PML, Roden–Gedney)
+**Subsystem:** `wavesim/pml.py` (Convolutional PML, Roden–Gedney)
 **Test:** `tests/test_02_free_space.py` — Gaussian Ez pulse in 2D vacuum (200×200, `Nz=1`)
 **Status:** ✅ All four validations pass; both reported anomalies explained and resolved.
 
@@ -24,7 +24,7 @@ behaviour.
 ## Bug 1 — Missing `MU0` / `EPS0` in the CPML correction (no absorption)
 
 ### What happened
-The main field updates in `fdtd/update.py` use **physical** coefficients, because
+The main field updates in `wavesim/update.py` use **physical** coefficients, because
 the material arrays store *relative* permittivity/permeability:
 
 ```python
@@ -149,8 +149,8 @@ These three facts are coupled. If `update.py`'s differencing is ever changed,
 - Full test: `python tests/test_02_free_space.py`
   (Windows console: set `PYTHONIOENCODING=utf-8` first, or the `≤` glyph in the
   output crashes the cp1252 console — a printing quirk, not a code bug.)
-- Environment: the dedicated conda env `fdtd`
-  (`C:\Users\itais\miniconda3\envs\fdtd\python.exe`), which has NumPy/Matplotlib;
+- Environment: the dedicated conda env `wavesim`
+  (`C:\Users\itais\miniconda3\envs\wavesim\python.exe`), which has NumPy/Matplotlib;
   the conda `base` env does not.
 - The reflection phase-symmetry was measured with a temporary reference-subtraction
   script (oversized reference grid, capture at step 240, signed mirror correlation

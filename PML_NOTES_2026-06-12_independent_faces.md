@@ -1,7 +1,7 @@
 # PML Change Notes — Independent per-face CPML
 
 **Date:** 2026-06-12
-**Subsystem:** `fdtd/pml.py` (CPML, Roden–Gedney)
+**Subsystem:** `wavesim/pml.py` (CPML, Roden–Gedney)
 **Driven by:** `tests/test_04_waveguide.py` (rectangular waveguide dominant mode)
 **Status:** ✅ Implemented; Test 04 passes; Tests 00/02/03 unaffected (backward compatible).
 

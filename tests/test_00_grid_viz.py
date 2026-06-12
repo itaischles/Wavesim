@@ -16,7 +16,7 @@ Pass criteria (visual inspection):
     4. Coaxial structure shows inner PEC, outer PEC, and dielectric fill distinctly
 
 Run:
-    cd fdtd_engine
+    cd Wavesim
     python tests/test_00_grid_viz.py
 
 Output: saves test_00_output.png with 4 subplots.
@@ -31,10 +31,10 @@ import matplotlib
 matplotlib.use('Agg')   # non-interactive backend — works in all environments
 import matplotlib.pyplot as plt
 
-from fdtd.grid import create_grid
-from fdtd.materials import set_vacuum, set_box, set_coax
-from fdtd.pml import init_cpml
-from fdtd.viz import plot_grid_xy, plot_materials_xy
+from wavesim.grid import create_grid
+from wavesim.materials import set_vacuum, set_box, set_coax
+from wavesim.pml import init_cpml
+from wavesim.viz import plot_grid_xy, plot_materials_xy
 
 
 def test_00_grid_viz():

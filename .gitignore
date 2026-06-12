@@ -8,9 +8,6 @@ __pycache__/
 tests/test_*_output.png
 tests/test_*_animation.gif
 
-# Build artifacts
-dist/*.zip
-
 # Environments
 .venv/
 env/

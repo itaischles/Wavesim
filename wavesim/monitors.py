@@ -13,8 +13,8 @@ Usage:
 
 from dataclasses import dataclass, field
 import numpy as np
-from fdtd.grid import FDTDGrid
-from fdtd.constants import EPS0, MU0
+from wavesim.grid import FDTDGrid
+from wavesim.constants import EPS0, MU0
 
 
 # ======================================================================= #

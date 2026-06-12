@@ -47,13 +47,13 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from fdtd.grid import create_grid
-from fdtd.materials import set_vacuum
-from fdtd.update import update_H, update_E
-from fdtd.pml import init_cpml, update_H_pml, update_E_pml
-from fdtd.pec import apply_pec_faces, apply_pec_mask
-from fdtd.monitors import FieldMonitor, SnapshotMonitor, record_field, record_snapshot
-from fdtd.constants import C0
+from wavesim.grid import create_grid
+from wavesim.materials import set_vacuum
+from wavesim.update import update_H, update_E
+from wavesim.pml import init_cpml, update_H_pml, update_E_pml
+from wavesim.pec import apply_pec_faces, apply_pec_mask
+from wavesim.monitors import FieldMonitor, SnapshotMonitor, record_field, record_snapshot
+from wavesim.constants import C0
 
 # ---------------------------------------------------------------------- #
 # Geometry / problem constants

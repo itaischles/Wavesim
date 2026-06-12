@@ -16,7 +16,7 @@ PEC enforcement must come after every E update, including after CPML corrections
 """
 
 import numpy as np
-from fdtd.grid import FDTDGrid
+from wavesim.grid import FDTDGrid
 
 
 def apply_pec_faces(grid: FDTDGrid,

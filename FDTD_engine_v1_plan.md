@@ -32,7 +32,7 @@ This document is intended as input context for AI-assisted coding sessions. Read
 ## Repository structure
 
 ```
-fdtd/
+wavesim/
 ├── grid.py          # FDTDGrid dataclass + construction helpers
 ├── materials.py     # eps/mu array builders; test scaffolding geometry primitives
 ├── update.py        # E and H field update functions (pure)
@@ -733,15 +733,15 @@ Every example and test should follow this pattern exactly. Do not deviate.
 
 ```python
 import numpy as np
-from fdtd.grid import create_grid
-from fdtd.materials import set_vacuum
-from fdtd.pml import init_cpml, update_H_pml, update_E_pml
-from fdtd.pec import apply_pec_faces, apply_pec_mask
-from fdtd.sources import GaussianSource, gaussian_pulse
-from fdtd.monitors import (FieldMonitor, MagnitudeMonitor, SnapshotMonitor,
+from wavesim.grid import create_grid
+from wavesim.materials import set_vacuum
+from wavesim.pml import init_cpml, update_H_pml, update_E_pml
+from wavesim.pec import apply_pec_faces, apply_pec_mask
+from wavesim.sources import GaussianSource, gaussian_pulse
+from wavesim.monitors import (FieldMonitor, MagnitudeMonitor, SnapshotMonitor,
                             EnergyMonitor, record_field, record_magnitude,
                             record_snapshot, record_energy)
-from fdtd.update import update_H, update_E
+from wavesim.update import update_H, update_E
 
 # --- Setup ---
 grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3, dy=0.5e-3, dz=0.5e-3)

@@ -21,8 +21,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.animation as animation
 from matplotlib.patches import Rectangle
-from fdtd.grid import FDTDGrid
-from fdtd.sources import GaussianSource, gaussian_pulse
+from wavesim.grid import FDTDGrid
+from wavesim.sources import GaussianSource, gaussian_pulse
 
 
 # ======================================================================= #

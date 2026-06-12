@@ -25,8 +25,8 @@ Update equations (Ampere — E step):
 """
 
 import numpy as np
-from fdtd.grid import FDTDGrid
-from fdtd.constants import MU0, EPS0
+from wavesim.grid import FDTDGrid
+from wavesim.constants import MU0, EPS0
 
 
 def update_H(grid: FDTDGrid) -> FDTDGrid:

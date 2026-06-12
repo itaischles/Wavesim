@@ -63,7 +63,7 @@ The engine needs **NumPy**, **Matplotlib**, and (for some analysis in the tests)
 
 ```bash
 # the env that has the dependencies
-C:\Users\itais\miniconda3\envs\fdtd\python.exe  your_script.py
+C:\Users\itais\miniconda3\envs\wavesim\python.exe  your_script.py
 ```
 
 On the Windows console, set UTF-8 first if your script prints non-ASCII glyphs:
@@ -72,7 +72,7 @@ On the Windows console, set UTF-8 first if your script prints non-ASCII glyphs:
 set PYTHONIOENCODING=utf-8
 ```
 
-Import from the `fdtd` package (run scripts from the repo root, or add it to
+Import from the `wavesim` package (run scripts from the repo root, or add it to
 `sys.path` as the tests do):
 
 ```python
@@ -88,13 +88,13 @@ A complete free-space pulse in ~20 lines:
 
 ```python
 import numpy as np
-from fdtd.grid import create_grid
-from fdtd.materials import set_vacuum
-from fdtd.update import update_H, update_E
-from fdtd.pml import init_cpml, update_H_pml, update_E_pml
-from fdtd.pec import apply_pec_mask
-from fdtd.sources import GaussianSource, gaussian_pulse
-from fdtd.monitors import SnapshotMonitor, record_snapshot
+from wavesim.grid import create_grid
+from wavesim.materials import set_vacuum
+from wavesim.update import update_H, update_E
+from wavesim.pml import init_cpml, update_H_pml, update_E_pml
+from wavesim.pec import apply_pec_mask
+from wavesim.sources import GaussianSource, gaussian_pulse
+from wavesim.monitors import SnapshotMonitor, record_snapshot
 
 grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)   # dt set automatically
 grid = set_vacuum(grid)
@@ -233,7 +233,7 @@ when `time_step % interval == 0`.
 
 ## 6. API reference
 
-Import paths are `from fdtd.<module> import <name>`.
+Import paths are `from wavesim.<module> import <name>`.
 
 ### grid
 
@@ -492,7 +492,7 @@ plt.savefig('materials.png', dpi=120)
 ### constants
 
 ```python
-from fdtd.constants import C0, EPS0, MU0, ETA0
+from wavesim.constants import C0, EPS0, MU0, ETA0
 # C0   = 299792458.0      speed of light (m/s)
 # EPS0 = 8.8541878e-12    vacuum permittivity (F/m)
 # MU0  = 1.2566370e-6     vacuum permeability (H/m)

@@ -18,7 +18,7 @@ directly.
 """
 
 import numpy as np
-from fdtd.grid import FDTDGrid
+from wavesim.grid import FDTDGrid
 
 
 # ======================================================================= #

@@ -13,7 +13,7 @@ Design decisions:
 
 from dataclasses import dataclass, field
 import numpy as np
-from fdtd.constants import C0
+from wavesim.constants import C0
 
 
 @dataclass
