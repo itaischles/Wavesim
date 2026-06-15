@@ -53,19 +53,25 @@ Checklist (search the codebase for `# 3D-UPGRADE:`):
 
 ---
 
-## 2. `Simulation` class (v2 API)
+## 2. `Simulation` class (v2 API) — **done**
 
-Today the time loop lives in each test/example by design. A thin orchestration
-layer would remove that boilerplate without hiding the physics:
+A thin orchestration layer that removes the per-script time-loop boilerplate
+without hiding the physics. Lives in `wavesim/simulation.py` and
+`wavesim/sources.py`; see `docs/API_GUIDE.md` §6 and the worked tutorial in
+`tests/test_07_simulation_api.py`.
 
-- A `Simulation` object wrapping `grid` + `cpml` + sources + monitors, with a
-  `run(n_steps)` method that executes the canonical loop
-  (`update_H → update_H_pml → update_E → update_E_pml → PEC → sources → monitors`).
-- A `Source` base class with `spatial_profile(grid)` and `time_function(t)`,
-  so arbitrary user-defined excitations drop in (the current soft-injection line
-  in the loop is already compatible with this).
-- Keep the functional core intact: the class only *orchestrates* the existing
-  pure functions, so scripts that write their own loop keep working.
+- [x] A `Simulation` object wrapping `grid` + `cpml` + sources + monitors, with a
+      `run(n_steps)` method that executes the canonical loop
+      (`update_H → update_H_pml → update_E → update_E_pml → PEC → sources → monitors`).
+      `step()` exposes a single iteration; `run(..., callback=...)` allows
+      per-step hooks (progress, etc.).
+- [x] A `Source` base class with `spatial_profile(grid)`, `time_function(t)` and
+      a soft-additive `inject(grid, t)`. Concrete `PointSource` and `ArraySource`
+      cover the common cases; `GaussianSource` is now callable so it doubles as a
+      waveform. Custom excitations subclass `Source`.
+- [x] The functional core is untouched: the class only *orchestrates* the
+      existing pure functions, so scripts that write their own loop keep working.
+      Verified bit-for-bit identical to a hand-written loop (Test 07, Check 3).
 
 ---
 

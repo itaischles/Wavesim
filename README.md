@@ -16,12 +16,15 @@ The import package is named `wavesim`.
 ## Features
 
 - **Functional core** — `FDTDGrid` dataclass + pure update functions; you write
-  the time loop, there is no hidden framework.
+  the time loop, there is no hidden framework. An optional `Simulation` class
+  runs the canonical loop for you (same physics, bit-identical results) when you
+  want to skip the boilerplate.
 - **Full 3D Yee curl** operators, vectorised with NumPy slicing (no cell loops).
 - **CPML boundaries** (Roden–Gedney) selectable **per face**, so PEC walls and
   symmetry planes are easy to combine with absorbing ends.
 - **PEC** domain faces and interior conductor masks (boxes, cylinders, coax).
-- **Gaussian sources** (baseband envelope + narrowband/CW recipe).
+- **Gaussian sources** (baseband envelope + narrowband/CW recipe), plus a v2
+  `Source` abstraction (`PointSource`, `ArraySource`, or subclass your own).
 - **Diagnostics** — point field, `|E|`/`|H|` magnitude, 2D snapshots, and total
   energy monitors.
 - **Visualisation** — grid/material/PML plots, field snapshots, animations, and
@@ -72,6 +75,18 @@ for n in range(2000):
     grid.time_step += 1
 ```
 
+Prefer to skip the loop? The same run via the v2 orchestration layer:
+
+```python
+from wavesim.simulation import Simulation
+from wavesim.sources import PointSource, make_source_for_fmax
+
+sim  = Simulation(grid, cpml=cpml)
+sim.add_source(PointSource('Ez', 100, 100, 0, make_source_for_fmax(10e9)))
+snap = sim.add_monitor(SnapshotMonitor('Ez', k_slice=0, interval=20))
+sim.run(2000)                                          # bit-identical to the loop
+```
+
 See the **[API Guide](docs/API_GUIDE.md)** for the full reference, the canonical
 loop, and the conventions worth committing to memory.
 
@@ -88,8 +103,9 @@ Wavesim/
 │   ├── update.py     # E and H field updates (3D curl)
 │   ├── pml.py        # CPML init + corrections (per-face selectable)
 │   ├── pec.py        # PEC faces and interior conductor mask
-│   ├── sources.py    # Gaussian source + pulse evaluation
+│   ├── sources.py    # Gaussian waveform + Source / PointSource / ArraySource
 │   ├── monitors.py   # field / magnitude / snapshot / energy monitors
+│   ├── simulation.py # Simulation class — runs the canonical time loop for you
 │   ├── viz.py        # all plotting and animation (2D + full-3D helpers)
 │   └── constants.py  # C0, EPS0, MU0, ETA0
 ├── tests/            # validated example simulations (run in order)
@@ -112,8 +128,9 @@ Run from the project root, in order — each validates one subsystem.
 | `test_04_waveguide.py`  | Waveguide cutoff: evanescence below, phase velocity above | ✅ |
 | `test_05_coax_tem.py`   | Coaxial TEM mode (first full 3D run, `Nz>1`): 1/r profile, `Z=η₀`, `v=c` | ✅ |
 | `test_06_box_cavity_3d.py` | Volumetric 3D PEC cavity: 14 analytic resonances within 1.5% (10 with `p≥1`, a half-wave along `z`) | ✅ |
+| `test_07_simulation_api.py` | v2 `Simulation`/`Source` API tutorial: open-boundary absorption + symmetry, bit-identical to the manual loop | ✅ |
 
-Tests 02–06 also save an animated GIF alongside their PNG (both git-ignored,
+Tests 02–07 also save an animated GIF alongside their PNG (both git-ignored,
 regenerated on each run).
 
 A profiling harness, `tools/profile_3d.py`, sweeps cube sizes and reports
@@ -128,8 +145,8 @@ backend — see [ROADMAP.md](ROADMAP.md) §1/§3 for the headline numbers.
   reference with worked examples.
 - **[docs/HOW_TO_SET_UP.md](docs/HOW_TO_SET_UP.md)** — environment setup (conda
   + VS Code) and how to run the tests.
-- **[ROADMAP.md](ROADMAP.md)** — what's planned next (full 3D, v2 `Simulation`
-  class, JAX, nonuniform grid, mode solver).
+- **[ROADMAP.md](ROADMAP.md)** — what's planned next (full 3D, JAX, nonuniform
+  grid, mode solver) and what's landed (v2 `Simulation`/`Source` layer).
 - **[DEBUG_NOTES_test02_pml.md](DEBUG_NOTES_test02_pml.md)**,
   **[PML_NOTES_2026-06-12_independent_faces.md](PML_NOTES_2026-06-12_independent_faces.md)**
   — CPML implementation notes.
@@ -146,6 +163,7 @@ dedicated orthogonal-slice helpers in `viz.py`.
 
 ## What's next
 
-See **[ROADMAP.md](ROADMAP.md)** — making full 3D first-class, a v2 `Simulation`
-class, a JAX performance backend, a nonuniform rectilinear grid, and a
-waveguide-port mode solver with modal injection.
+See **[ROADMAP.md](ROADMAP.md)** — making full 3D first-class, a JAX performance
+backend, a nonuniform rectilinear grid, and a waveguide-port mode solver with
+modal injection. (The v2 `Simulation`/`Source` orchestration layer has landed —
+see `test_07_simulation_api.py`.)

@@ -1,0 +1,176 @@
+"""
+simulation.py — Simulation orchestration class (v2 API, ROADMAP §2).
+
+A thin wrapper that runs the canonical FDTD time loop so scripts don't have to
+re-type it. It *orchestrates* the existing pure functions — it does not replace
+them or hide the physics. Anything you can do by hand you can still do by hand;
+``Simulation`` just bundles the grid, the optional CPML, the sources, the
+monitors, and the PEC-face list, and steps them in the fixed order:
+
+    update_H → update_H_pml → update_E → update_E_pml
+             → apply_pec_faces → apply_pec_mask
+             → sources.inject → monitors.record → time_step += 1
+
+This is exactly the order documented in docs/API_GUIDE.md §4; see that section
+for why it must not be reordered.
+
+Example
+-------
+    from wavesim.grid import create_grid
+    from wavesim.materials import set_vacuum
+    from wavesim.pml import init_cpml
+    from wavesim.sources import PointSource, make_source_for_fmax
+    from wavesim.monitors import SnapshotMonitor
+    from wavesim.simulation import Simulation
+
+    grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)
+    grid = set_vacuum(grid)
+    cpml = init_cpml(grid, d_pml=10)
+
+    sim = Simulation(grid, cpml=cpml)
+    sim.add_source(PointSource('Ez', 100, 100, 0, make_source_for_fmax(10e9)))
+    snap = sim.add_monitor(SnapshotMonitor('Ez', k_slice=0, interval=20))
+    sim.run(2000)
+    # snap.snapshots now holds the recorded frames; sim.grid is the final state.
+"""
+
+from typing import Callable, Iterable
+
+from wavesim.grid import FDTDGrid
+from wavesim.pml import CPMLArrays, update_H_pml, update_E_pml
+from wavesim.update import update_H, update_E
+from wavesim.pec import apply_pec_faces, apply_pec_mask
+from wavesim.sources import Source
+from wavesim.monitors import (
+    FieldMonitor, MagnitudeMonitor, SnapshotMonitor, EnergyMonitor,
+    record_field, record_magnitude, record_snapshot, record_energy,
+)
+
+
+# Map each monitor type to its recorder. Keeps the monitors as plain data
+# (the functional v1 design) while letting the loop dispatch uniformly.
+_RECORDERS = {
+    FieldMonitor:     record_field,
+    MagnitudeMonitor: record_magnitude,
+    SnapshotMonitor:  record_snapshot,
+    EnergyMonitor:    record_energy,
+}
+
+
+class Simulation:
+    """
+    Orchestrates the canonical FDTD time loop over a grid and its components.
+
+    Parameters
+    ----------
+    grid : FDTDGrid
+        The state object (already given materials/geometry).
+    cpml : CPMLArrays, optional
+        From ``init_cpml``. If omitted, the CPML correction steps are skipped
+        (use this for a closed, lossless PEC cavity).
+    sources : iterable of Source, optional
+        Excitations injected each step (see :mod:`wavesim.sources`).
+    monitors : iterable, optional
+        Any mix of FieldMonitor / MagnitudeMonitor / SnapshotMonitor /
+        EnergyMonitor; recorded each step.
+    pec_faces : tuple of str, optional
+        Domain faces to hold as PEC walls each step, e.g. ('y0', 'y1').
+        ``apply_pec_mask`` always runs as well (it is a no-op when the grid has
+        no ``pec_mask``), so interior conductors placed by the material helpers
+        are enforced automatically.
+
+    Notes
+    -----
+    The simulation time passed to sources is ``grid.time_step * grid.dt``,
+    evaluated *before* the counter is incremented — identical to the ``t = n*dt``
+    used by the hand-written loops, so results are bit-for-bit the same.
+    """
+
+    def __init__(self, grid: FDTDGrid,
+                 cpml: CPMLArrays = None,
+                 sources: Iterable[Source] = (),
+                 monitors: Iterable = (),
+                 pec_faces: tuple = ()) -> None:
+        self.grid = grid
+        self.cpml = cpml
+        self.sources = list(sources)
+        self.monitors = list(monitors)
+        self.pec_faces = tuple(pec_faces)
+
+    # ------------------------------------------------------------------ #
+    # Building up the simulation
+    # ------------------------------------------------------------------ #
+    def add_source(self, source: Source) -> Source:
+        """Register a source; returns it for convenience."""
+        self.sources.append(source)
+        return source
+
+    def add_monitor(self, monitor):
+        """Register a monitor; returns it so you can read its data later."""
+        if type(monitor) not in _RECORDERS:
+            raise TypeError(
+                f"Unknown monitor type {type(monitor).__name__}. "
+                f"Expected one of {[t.__name__ for t in _RECORDERS]}.")
+        self.monitors.append(monitor)
+        return monitor
+
+    # ------------------------------------------------------------------ #
+    # Running
+    # ------------------------------------------------------------------ #
+    def step(self) -> FDTDGrid:
+        """Advance the simulation by one timestep (the canonical loop body)."""
+        grid = self.grid
+        t = grid.time_step * grid.dt
+
+        # 1-2. H update (+ CPML correction)
+        grid = update_H(grid)
+        if self.cpml is not None:
+            grid, self.cpml = update_H_pml(grid, self.cpml)
+
+        # 3-4. E update (+ CPML correction)
+        grid = update_E(grid)
+        if self.cpml is not None:
+            grid, self.cpml = update_E_pml(grid, self.cpml)
+
+        # 5. PEC — always after the E update (+ CPML)
+        if self.pec_faces:
+            grid = apply_pec_faces(grid, faces=self.pec_faces)
+        grid = apply_pec_mask(grid)              # no-op if no pec_mask
+
+        # 6. Sources (soft, additive)
+        for src in self.sources:
+            src.inject(grid, t)
+
+        # 7. Monitors
+        for mon in self.monitors:
+            _RECORDERS[type(mon)](mon, grid)
+
+        # 8. Advance the step counter (monitors timestamp from it)
+        grid.time_step += 1
+
+        self.grid = grid
+        return grid
+
+    def run(self, n_steps: int,
+            callback: Callable[["Simulation", int], None] = None) -> FDTDGrid:
+        """
+        Run ``n_steps`` timesteps.
+
+        Parameters
+        ----------
+        n_steps : int
+            Number of steps to advance.
+        callback : callable, optional
+            Called as ``callback(sim, n)`` after each step — handy for progress
+            printing or custom per-step logic without unrolling the loop.
+
+        Returns
+        -------
+        FDTDGrid
+            The final grid state (also available as ``self.grid``).
+        """
+        for n in range(n_steps):
+            self.step()
+            if callback is not None:
+                callback(self, n)
+        return self.grid

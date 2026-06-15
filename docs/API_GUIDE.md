@@ -5,10 +5,12 @@ simulations with this engine. It documents every public function you need,
 the canonical simulation loop, the conventions that bite if you get them
 wrong, and three complete worked examples drawn from the validated test suite.
 
-> **Scope.** This covers the current v1 API: a functional NumPy solver on full
+> **Scope.** This covers the current API: a functional NumPy solver on full
 > 3D arrays — usually run as a thin `Nz=1` slice, but also full 3D (`Nz>1`, see
 > `test_05_coax_tem.py`) — with CPML and PEC boundaries, Gaussian sources,
-> time/snapshot/energy monitors, and visualisation helpers.
+> time/snapshot/energy monitors, and visualisation helpers. It also documents the
+> v2 [`Simulation`](#simulation) / [`Source`](#sources) orchestration layer,
+> which runs the canonical loop for you on top of that same functional core.
 
 ---
 
@@ -21,8 +23,8 @@ wrong, and three complete worked examples drawn from the validated test suite.
 5. [Conventions you must know](#5-conventions-you-must-know)
 6. [API reference](#6-api-reference)
    - [grid](#grid) · [materials](#materials) · [sources](#sources) ·
-     [pml](#pml) · [pec](#pec) · [monitors](#monitors) · [viz](#viz) ·
-     [constants](#constants)
+     [pml](#pml) · [pec](#pec) · [monitors](#monitors) ·
+     [simulation](#simulation) · [viz](#viz) · [constants](#constants)
 7. [Worked examples](#7-worked-examples)
 8. [Troubleshooting](#8-troubleshooting)
 
@@ -32,7 +34,10 @@ wrong, and three complete worked examples drawn from the validated test suite.
 
 The engine is **functional**: there is one state object, `FDTDGrid`, and a set
 of pure-ish functions that take it and return it (mutating its arrays in place).
-There is **no `Simulation` class** — *you* write the time loop in your script.
+*You* can write the time loop in your script — and understanding that loop is the
+whole mental model. A thin **[`Simulation`](#simulation) class** (v2) can run the
+exact same loop for you once you know what it does; it orchestrates these same
+functions and changes no physics (see [§6 simulation](#simulation)).
 
 ```
 create_grid ──► set materials ──► init boundaries / sources / monitors
@@ -167,6 +172,11 @@ for n in range(N_STEPS):
 
 If you are **not** using CPML (e.g. a closed PEC cavity), simply drop steps 2
 and 4 and don't create a `cpml` object.
+
+> **Don't want to type this loop?** The [`Simulation`](#simulation) class runs
+> exactly these eight steps for you in this fixed order — `Simulation(grid,
+> cpml=...).run(n_steps)`. It is pure orchestration over the same functions
+> (bit-identical results), so reach for it once you understand the loop above.
 
 ---
 
@@ -315,13 +325,22 @@ grid = set_cylinder(grid, 0.05, 0.04, 0.005, 0, grid.dz, eps_r=1, pec=True)  # P
 
 ### sources
 
+Two layers live here: **waveforms** (the time part of an excitation) and
+**`Source` objects** (the v2 *where + when + which-component* injection
+abstraction). They compose; you can use either on its own.
+
+#### Waveforms (time part)
+
 ```python
 @dataclass
 class GaussianSource:
     t0: float          # pulse centre time (s)
     width: float       # std-dev (s); bandwidth ≈ 1/(2π·width)
     amplitude = 1.0
+    def __call__(self, t) -> float        # == gaussian_pulse(self, t)
 ```
+The built-in baseband pulse. It is **callable**, so an instance is itself a valid
+waveform (`f(t) -> float`) and can be passed straight to a `Source`.
 
 ```python
 gaussian_pulse(source, t) -> float
@@ -336,11 +355,58 @@ the pulse is fully contained in the window and carries energy up to ≈ `f_max`.
 
 ```python
 src = make_source_for_fmax(5e9)                 # content up to ~5 GHz
-grid.Ez[100, 100, 0] += gaussian_pulse(src, t)  # in the loop
+grid.Ez[100, 100, 0] += gaussian_pulse(src, t)  # functional, in the loop
 ```
 
-For a narrowband/CW excitation, modulate the envelope with a carrier yourself
-(see [Conventions](#5-conventions-you-must-know)).
+A waveform is **any** `callable(t) -> float`. For a narrowband/CW excitation,
+pass your own carrier-modulated lambda (see
+[Conventions](#5-conventions-you-must-know)):
+
+```python
+f0, tau, t0 = 9e9, 6/9e9, 3.5*(6/9e9)
+cw = lambda t: np.sin(2*np.pi*f0*(t-t0)) * np.exp(-0.5*((t-t0)/tau)**2)
+```
+
+#### Source objects (v2 injection abstraction)
+
+A `Source` bundles **which component** it drives, **where** (`spatial_profile`),
+and **when** (`time_function`), and exposes `inject(grid, t)` — the soft
+(additive) write the time loop calls. [`Simulation`](#simulation) injects every
+registered source each step; you can also call `inject` from a hand-written loop.
+
+```python
+class Source(ABC):
+    component: str                          # 'Ex'..'Hz'
+    time_function(self, t) -> float         # abstract
+    spatial_profile(self, grid) -> ndarray  # abstract; (Nx,Ny,Nz) weights
+    inject(self, grid, t) -> None           # grid.<component> += time*profile
+```
+Base class. Subclass it for a fully custom excitation; the profile is built once
+and cached. Two ready-made subclasses cover the common cases:
+
+```python
+PointSource(component, i, j, k, waveform)
+```
+Soft point excitation at one cell — the object form of
+`grid.<component>[i,j,k] += waveform(t)`. (`waveform` is any `callable(t)->float`,
+e.g. a `GaussianSource`.)
+
+```python
+ArraySource(component, profile, waveform)
+```
+Distributed excitation from a user-supplied `profile` array of shape
+`(Nx, Ny, Nz)`: the step adds `waveform(t) * profile`. Use it for line, shaped,
+annular or modal drives (a single nonzero z-plane gives a planar source, etc.).
+The profile shape is validated against the grid.
+
+```python
+from wavesim.sources import PointSource, ArraySource, make_source_for_fmax
+
+pt = PointSource('Ez', 100, 100, 0, make_source_for_fmax(10e9))
+
+prof = np.zeros((Nx, Ny, Nz)); prof[20, :, 0] = 1.0      # transverse line
+ln = ArraySource('Ez', prof, cw)                          # cw from above
+```
 
 ---
 
@@ -440,6 +506,64 @@ snap = SnapshotMonitor(component='Ez', k_slice=0, interval=20)
 # in the loop:
 record_field(fmon, grid); record_energy(emon, grid); record_snapshot(snap, grid)
 ```
+
+---
+
+### simulation
+
+A thin orchestration layer (v2) that runs the [canonical loop](#4-the-simulation-loop-canonical-pattern)
+for you. It **only orchestrates** the existing pure functions — same physics,
+bit-for-bit identical results (verified by `test_07_simulation_api.py`). Use it to
+drop the per-script loop boilerplate; keep writing the loop by hand whenever you
+want full control.
+
+```python
+Simulation(grid, cpml=None, sources=(), monitors=(), pec_faces=())
+```
+Wrap a grid and its components. `cpml=None` skips the CPML correction steps (for a
+closed, lossless cavity). `pec_faces` (e.g. `('y0','y1')`) are held as PEC walls
+each step; `apply_pec_mask` always runs too, so interior conductors from the
+material helpers are enforced automatically.
+
+```python
+sim.add_source(source) -> source        # register a Source; returns it
+sim.add_monitor(monitor) -> monitor      # any Field/Magnitude/Snapshot/Energy monitor
+```
+Build the simulation up incrementally; `add_monitor` returns the monitor so you
+can read its `.values` / `.snapshots` after the run.
+
+```python
+sim.step() -> grid                        # one timestep (the canonical loop body)
+sim.run(n_steps, callback=None) -> grid   # run n_steps; final grid in sim.grid
+```
+`run` executes the fixed order `update_H → update_H_pml → update_E → update_E_pml
+→ apply_pec_faces → apply_pec_mask → sources.inject → monitors.record →
+time_step += 1`. The optional `callback(sim, n)` runs after each step (progress,
+custom logic). Source time is `grid.time_step * grid.dt`, identical to the
+hand-written `t = n*dt`.
+
+```python
+from wavesim.simulation import Simulation
+from wavesim.sources import PointSource, make_source_for_fmax
+from wavesim.monitors import SnapshotMonitor
+
+grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)
+grid = set_vacuum(grid)
+cpml = init_cpml(grid, d_pml=10)
+
+sim  = Simulation(grid, cpml=cpml)
+sim.add_source(PointSource('Ez', 100, 100, 0, make_source_for_fmax(10e9)))
+snap = sim.add_monitor(SnapshotMonitor('Ez', k_slice=0, interval=20))
+sim.run(2000)                              # snap.snapshots holds the frames
+```
+
+A closed PEC cavity (no CPML, four PEC walls) is just:
+
+```python
+sim = Simulation(grid, cpml=None, pec_faces=('x0','x1','y0','y1'))
+```
+
+See `tests/test_07_simulation_api.py` for a fully commented tutorial.
 
 ---
 
