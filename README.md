@@ -121,7 +121,8 @@ regenerated on each run).
   reference with worked examples.
 - **[docs/HOW_TO_SET_UP.md](docs/HOW_TO_SET_UP.md)** — environment setup (conda
   + VS Code) and how to run the tests.
-- **[FDTD_engine_v1_plan.md](FDTD_engine_v1_plan.md)** — the v1 design/build plan.
+- **[ROADMAP.md](ROADMAP.md)** — what's planned next (full 3D, v2 `Simulation`
+  class, JAX, nonuniform grid, mode solver).
 - **[DEBUG_NOTES_test02_pml.md](DEBUG_NOTES_test02_pml.md)**,
   **[PML_NOTES_2026-06-12_independent_faces.md](PML_NOTES_2026-06-12_independent_faces.md)**
   — CPML implementation notes.
@@ -134,8 +135,8 @@ v1: a validated 2D-in-3D solver (CPML + PEC) through Test 04, plus Test 05 — t
 first full-3D run (`Nz > 1`), validating the coaxial TEM mode on the same code
 (the engine was already structured for 3D — search `# 3D-UPGRADE:`).
 
-## Todo
+## What's next
 
-1. Full 3D migration and testing using JAX.
-2. Nonuniform rectilinear grid.
-3. 2D waveguide-port mode solver + modal injection.
+See **[ROADMAP.md](ROADMAP.md)** — making full 3D first-class, a v2 `Simulation`
+class, a JAX performance backend, a nonuniform rectilinear grid, and a
+waveguide-port mode solver with modal injection.
