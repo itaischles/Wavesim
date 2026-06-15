@@ -184,10 +184,9 @@ def main():
     print(f"Memory split at N={rlast['N']}: "
           f"grid {rlast['grid_mb']:.1f} MB + CPML psi {rlast['cpml_mb']:.1f} MB "
           f"= {rlast['total_mb']:.1f} MB")
-    print(f"  CPML psi arrays (12 full-grid) are {frac:.0f}% of the footprint — "
-          f"allocated full-volume though they act only in boundary slabs.")
-    print(f"  -> slab-only psi allocation is the obvious memory win "
-          f"(flagged, not done).")
+    print(f"  CPML psi arrays are {frac:.0f}% of the footprint — now allocated as "
+          f"boundary slabs (compressed along each derivative axis to the active "
+          f"PML cells), not full volume.")
 
     _plot(rows)
     print("=" * 74)

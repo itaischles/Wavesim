@@ -45,9 +45,11 @@ Checklist (search the codebase for `# 3D-UPGRADE:`):
       the default path. **Deliberately kept for now**: the `Nz=1` fast path still
       benefits Tests 00–04 and quick iteration, and the JAX migration (§3) will
       rewrite these with `jax.lax.cond` regardless.
-- [ ] *(Memory win, flagged not done)* Allocate the CPML `psi` arrays as boundary
-      slabs instead of full volume — would roughly halve the footprint (they are
-      ~50% of total and act only within `d_pml` of each absorbing face).
+- [x] Allocate the CPML `psi` arrays as boundary slabs instead of full volume.
+      Each `psi` is now compressed along its derivative axis to just the active
+      PML cells (`sel_*` in `pml.py`), cutting their footprint to ~`2·d_pml/N` of
+      full volume — bit-identical to the old allocation since the dropped cells
+      held 0 forever (the recursion is local; `c=0`/`b·0=0` in the interior).
 
 ---
 

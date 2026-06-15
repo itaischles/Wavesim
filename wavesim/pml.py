@@ -14,6 +14,20 @@ field update in update.py already supplies the (1/kappa)*dF/ds part. This
 module's only job is to advance the psi arrays and ADD the psi correction
 on top of the field that update.py has already advanced.
 
+Boundary-slab psi storage
+-------------------------
+Each psi corrects a derivative along ONE axis, and its (b, c) profile is
+nonzero only within `d_pml` cells of that axis' absorbing faces. The recursion
+is purely local (psi[j] depends only on psi[j] and dF[j]), and where c = 0 the
+profile also has b = 1, so an interior psi cell initialised to 0 stays exactly
+0 forever and contributes 0.0 to the field. We therefore store each psi array
+compressed along its derivative axis to just those active boundary indices
+(`sel_*` below) — typically ~2*d_pml cells instead of the full axis length,
+which roughly halves the total solver footprint at large 3D sizes (the 12
+psi arrays were the dominant term; see tools/profile_3d.py). The result is
+bit-identical to a full-volume allocation because every cell we drop held an
+identical 0.0.
+
 CRITICAL — coefficient consistency with update.py
 --------------------------------------------------
 update.py advances the fields with PHYSICAL coefficients:
@@ -57,29 +71,48 @@ from wavesim.constants import EPS0, MU0, ETA0
 class CPMLArrays:
     # --- Auxiliary convolution variables for the H-field updates -------- #
     # (these correct E-derivatives that appear in the curl of E)
-    psi_Ez_y: np.ndarray   # correction to dEz/dy in the Hx update
-    psi_Ey_z: np.ndarray   # correction to dEy/dz in the Hx update
-    psi_Ex_z: np.ndarray   # correction to dEx/dz in the Hy update
-    psi_Ez_x: np.ndarray   # correction to dEz/dx in the Hy update
-    psi_Ey_x: np.ndarray   # correction to dEy/dx in the Hz update
-    psi_Ex_y: np.ndarray   # correction to dEx/dy in the Hz update
+    # Each array is compressed along its derivative axis to the active PML
+    # indices (sel_*H below): psi_Ez_y has shape (Nx, n_yH, Nz), etc.
+    psi_Ez_y: np.ndarray   # correction to dEz/dy in the Hx update  (y axis)
+    psi_Ey_z: np.ndarray   # correction to dEy/dz in the Hx update  (z axis)
+    psi_Ex_z: np.ndarray   # correction to dEx/dz in the Hy update  (z axis)
+    psi_Ez_x: np.ndarray   # correction to dEz/dx in the Hy update  (x axis)
+    psi_Ey_x: np.ndarray   # correction to dEy/dx in the Hz update  (x axis)
+    psi_Ex_y: np.ndarray   # correction to dEx/dy in the Hz update  (y axis)
 
     # --- Auxiliary convolution variables for the E-field updates -------- #
-    # (these correct H-derivatives that appear in the curl of H)
-    psi_Hz_y: np.ndarray   # correction to dHz/dy in the Ex update
-    psi_Hy_z: np.ndarray   # correction to dHy/dz in the Ex update
-    psi_Hx_z: np.ndarray   # correction to dHx/dz in the Ey update
-    psi_Hz_x: np.ndarray   # correction to dHz/dx in the Ey update
-    psi_Hy_x: np.ndarray   # correction to dHy/dx in the Ez update
-    psi_Hx_y: np.ndarray   # correction to dHx/dy in the Ez update
+    # (these correct H-derivatives that appear in the curl of H; compressed
+    #  along their derivative axis to the active PML indices sel_*E)
+    psi_Hz_y: np.ndarray   # correction to dHz/dy in the Ex update  (y axis)
+    psi_Hy_z: np.ndarray   # correction to dHy/dz in the Ex update  (z axis)
+    psi_Hx_z: np.ndarray   # correction to dHx/dz in the Ey update  (z axis)
+    psi_Hz_x: np.ndarray   # correction to dHz/dx in the Ey update  (x axis)
+    psi_Hy_x: np.ndarray   # correction to dHy/dx in the Ez update  (x axis)
+    psi_Hx_y: np.ndarray   # correction to dHx/dy in the Ez update  (y axis)
 
     # --- Precomputed (b, c) profiles, one 1D array per axis & grid ------ #
+    # Full-length profiles (cheap 1D arrays) kept for visualisation/inspection.
     bx_E: np.ndarray; cx_E: np.ndarray   # shape (Nx,)
     bx_H: np.ndarray; cx_H: np.ndarray
     by_E: np.ndarray; cy_E: np.ndarray   # shape (Ny,)
     by_H: np.ndarray; cy_H: np.ndarray
     bz_E: np.ndarray; cz_E: np.ndarray   # shape (Nz,)
     bz_H: np.ndarray; cz_H: np.ndarray
+
+    # --- Active boundary-slab indices along each (axis, grid) ----------- #
+    # sel_aG holds the indices along axis a (for the G in {E,H} grid) where the
+    # profile is nonzero — i.e. the two PML slabs. The psi arrays are stored at
+    # exactly these indices along their derivative axis.
+    sel_xH: np.ndarray; sel_yH: np.ndarray; sel_zH: np.ndarray
+    sel_xE: np.ndarray; sel_yE: np.ndarray; sel_zE: np.ndarray
+
+    # --- (b, c) sampled at sel_*, reshaped to broadcast along that axis -- #
+    bxH_s: np.ndarray; cxH_s: np.ndarray     # shape (n_xH, 1, 1)
+    byH_s: np.ndarray; cyH_s: np.ndarray     # shape (1, n_yH, 1)
+    bzH_s: np.ndarray; czH_s: np.ndarray     # shape (1, 1, n_zH)
+    bxE_s: np.ndarray; cxE_s: np.ndarray     # shape (n_xE, 1, 1)
+    byE_s: np.ndarray; cyE_s: np.ndarray     # shape (1, n_yE, 1)
+    bzE_s: np.ndarray; czE_s: np.ndarray     # shape (1, 1, n_zE)
 
     d_pml: int             # PML thickness in cells
 
@@ -166,6 +199,20 @@ def _calc_profile_1d(N, ds, dt, d_pml, staggered, low=True, high=True):
     return b, c
 
 
+def _slab_indices(c, grid_type):
+    """
+    Active boundary-slab indices along one axis: the positions where the
+    profile c is nonzero, within the index range that axis' updates actually
+    touch. H-grid updates use the region [0, N-1) (a trailing `[:-1]` slice);
+    E-grid updates use [1, N) (a leading `[1:]` slice). Indices outside the
+    nonzero-c set carry psi == 0 identically, so dropping them is exact.
+    """
+    N = len(c)
+    if grid_type == 'H':
+        return np.nonzero(c[:-1])[0].astype(np.intp)            # in [0, N-1)
+    return (np.nonzero(c[1:])[0] + 1).astype(np.intp)           # in [1, N)
+
+
 ALL_FACES = ('x0', 'x1', 'y0', 'y1', 'z0', 'z1')
 
 
@@ -174,6 +221,12 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
     """
     Allocate the psi convolution arrays and precompute the (b, c) profiles
     for every axis on both the E (staggered) and H (non-staggered) grids.
+
+    The psi arrays are stored as boundary slabs: each is full-size on the two
+    axes orthogonal to its derivative, and compressed along its derivative axis
+    to just the active PML indices (sel_*). This is bit-identical to a
+    full-volume allocation (the dropped cells hold 0 forever) but roughly halves
+    the solver's memory footprint at large 3D sizes.
 
     Parameters
     ----------
@@ -185,9 +238,11 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
         faces=('x0','x1')). Defaults to all six faces.
         'x0' = the face at i=0, 'x1' = the face at i=Nx-1, etc.
 
-    # 3D-UPGRADE: the z-axis profiles return (1, 0) when Nz <= 2*d_pml, so the
-    #             z-face PML is inert for Nz=1 slices and activates on its own
-    #             once Nz is large enough (subject to z0/z1 being in `faces`).
+    Notes
+    -----
+    The z-axis profiles return (1, 0) when Nz <= 2*d_pml, so the z-face PML is
+    inert for Nz=1 slices (sel_zE/sel_zH are empty) and activates on its own
+    once Nz is large enough (subject to z0/z1 being in `faces`).
     """
     bad = set(faces) - set(ALL_FACES)
     if bad:
@@ -199,24 +254,58 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
     y_lo, y_hi = 'y0' in faces, 'y1' in faces
     z_lo, z_hi = 'z0' in faces, 'z1' in faces
 
-    shape = (grid.Nx, grid.Ny, grid.Nz)
-    z = lambda: np.zeros(shape, dtype=np.float64)
+    Nx, Ny, Nz = grid.Nx, grid.Ny, grid.Nz
 
-    bx_E, cx_E = _calc_profile_1d(grid.Nx, grid.dx, grid.dt, d_pml, True,  x_lo, x_hi)
-    bx_H, cx_H = _calc_profile_1d(grid.Nx, grid.dx, grid.dt, d_pml, False, x_lo, x_hi)
-    by_E, cy_E = _calc_profile_1d(grid.Ny, grid.dy, grid.dt, d_pml, True,  y_lo, y_hi)
-    by_H, cy_H = _calc_profile_1d(grid.Ny, grid.dy, grid.dt, d_pml, False, y_lo, y_hi)
-    bz_E, cz_E = _calc_profile_1d(grid.Nz, grid.dz, grid.dt, d_pml, True,  z_lo, z_hi)
-    bz_H, cz_H = _calc_profile_1d(grid.Nz, grid.dz, grid.dt, d_pml, False, z_lo, z_hi)
+    bx_E, cx_E = _calc_profile_1d(Nx, grid.dx, grid.dt, d_pml, True,  x_lo, x_hi)
+    bx_H, cx_H = _calc_profile_1d(Nx, grid.dx, grid.dt, d_pml, False, x_lo, x_hi)
+    by_E, cy_E = _calc_profile_1d(Ny, grid.dy, grid.dt, d_pml, True,  y_lo, y_hi)
+    by_H, cy_H = _calc_profile_1d(Ny, grid.dy, grid.dt, d_pml, False, y_lo, y_hi)
+    bz_E, cz_E = _calc_profile_1d(Nz, grid.dz, grid.dt, d_pml, True,  z_lo, z_hi)
+    bz_H, cz_H = _calc_profile_1d(Nz, grid.dz, grid.dt, d_pml, False, z_lo, z_hi)
+
+    # Active boundary-slab indices along each (axis, grid).
+    sel_xH = _slab_indices(cx_H, 'H'); sel_xE = _slab_indices(cx_E, 'E')
+    sel_yH = _slab_indices(cy_H, 'H'); sel_yE = _slab_indices(cy_E, 'E')
+    sel_zH = _slab_indices(cz_H, 'H'); sel_zE = _slab_indices(cz_E, 'E')
+
+    # (b, c) sampled at the slab indices, reshaped to broadcast along the axis.
+    def _rs(arr, sel, axis):
+        shape = [1, 1, 1]; shape[axis] = -1
+        return arr[sel].reshape(shape)
+
+    bxH_s, cxH_s = _rs(bx_H, sel_xH, 0), _rs(cx_H, sel_xH, 0)
+    byH_s, cyH_s = _rs(by_H, sel_yH, 1), _rs(cy_H, sel_yH, 1)
+    bzH_s, czH_s = _rs(bz_H, sel_zH, 2), _rs(cz_H, sel_zH, 2)
+    bxE_s, cxE_s = _rs(bx_E, sel_xE, 0), _rs(cx_E, sel_xE, 0)
+    byE_s, cyE_s = _rs(by_E, sel_yE, 1), _rs(cy_E, sel_yE, 1)
+    bzE_s, czE_s = _rs(bz_E, sel_zE, 2), _rs(cz_E, sel_zE, 2)
+
+    # Allocate each psi slab: full on the two orthogonal axes, len(sel) on the
+    # derivative axis.
+    nxH, nyH, nzH = len(sel_xH), len(sel_yH), len(sel_zH)
+    nxE, nyE, nzE = len(sel_xE), len(sel_yE), len(sel_zE)
+    z = lambda shape: np.zeros(shape, dtype=np.float64)
 
     return CPMLArrays(
-        psi_Ez_y=z(), psi_Ey_z=z(), psi_Ex_z=z(),
-        psi_Ez_x=z(), psi_Ey_x=z(), psi_Ex_y=z(),
-        psi_Hz_y=z(), psi_Hy_z=z(), psi_Hx_z=z(),
-        psi_Hz_x=z(), psi_Hy_x=z(), psi_Hx_y=z(),
+        # H-update psi (E-derivative corrections), compressed on their axis
+        psi_Ez_y=z((Nx, nyH, Nz)), psi_Ey_z=z((Nx, Ny, nzH)),
+        psi_Ex_z=z((Nx, Ny, nzH)), psi_Ez_x=z((nxH, Ny, Nz)),
+        psi_Ey_x=z((nxH, Ny, Nz)), psi_Ex_y=z((Nx, nyH, Nz)),
+        # E-update psi (H-derivative corrections)
+        psi_Hz_y=z((Nx, nyE, Nz)), psi_Hy_z=z((Nx, Ny, nzE)),
+        psi_Hx_z=z((Nx, Ny, nzE)), psi_Hz_x=z((nxE, Ny, Nz)),
+        psi_Hy_x=z((nxE, Ny, Nz)), psi_Hx_y=z((Nx, nyE, Nz)),
+        # Full 1D profiles
         bx_E=bx_E, cx_E=cx_E, bx_H=bx_H, cx_H=cx_H,
         by_E=by_E, cy_E=cy_E, by_H=by_H, cy_H=cy_H,
         bz_E=bz_E, cz_E=cz_E, bz_H=bz_H, cz_H=cz_H,
+        # Slab indices and sampled coefficients
+        sel_xH=sel_xH, sel_yH=sel_yH, sel_zH=sel_zH,
+        sel_xE=sel_xE, sel_yE=sel_yE, sel_zE=sel_zE,
+        bxH_s=bxH_s, cxH_s=cxH_s, byH_s=byH_s, cyH_s=cyH_s,
+        bzH_s=bzH_s, czH_s=czH_s,
+        bxE_s=bxE_s, cxE_s=cxE_s, byE_s=byE_s, cyE_s=cyE_s,
+        bzE_s=bzE_s, czE_s=czE_s,
         d_pml=d_pml,
     )
 
@@ -229,72 +318,61 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     Advance the E-derivative psi arrays and add their correction onto the H
     fields that update_H has already advanced. Coefficient is dt/(MU0*mu) to
     match update.py exactly.
+
+    psi arrays are boundary slabs (see module docstring): the derivative axis
+    carries only the active PML indices sel_*H, so the recursion and correction
+    are restricted to those indices via fancy indexing — bit-identical to the
+    full-volume formulation since every dropped cell held 0.
     """
     dt = grid.dt
     dx, dy, dz = grid.dx, grid.dy, grid.dz
     Nz = grid.Nz
+    sx, sy, sz = cpml.sel_xH, cpml.sel_yH, cpml.sel_zH
 
-    # ---------- Hx  (curl term: dEz/dy - dEy/dz), region Hx[:, :-1, :-1 or :] ----------
+    # ---------- Hx  (curl term: dEz/dy - dEy/dz) ----------
     # dEz/dy lives at the Hx location -> non-staggered (H) profile along y.
-    dEz_dy = (grid.Ez[:, 1:, :] - grid.Ez[:, :-1, :]) / dy            # (Nx, Ny-1, Nz)
-    cpml.psi_Ez_y[:, :-1, :] = (
-        cpml.by_H[:-1].reshape(1, -1, 1) * cpml.psi_Ez_y[:, :-1, :]
-        + cpml.cy_H[:-1].reshape(1, -1, 1) * dEz_dy
-    )
+    dEz_dy = (grid.Ez[:, sy + 1, :] - grid.Ez[:, sy, :]) / dy         # (Nx, n_yH, Nz)
+    cpml.psi_Ez_y = cpml.byH_s * cpml.psi_Ez_y + cpml.cyH_s * dEz_dy
 
     if Nz > 1:
-        coef = dt / (MU0 * grid.mu_x[:, :-1, :-1])
-        grid.Hx[:, :-1, :-1] -= coef * cpml.psi_Ez_y[:, :-1, :-1]
+        grid.Hx[:, sy, :-1] -= (dt / (MU0 * grid.mu_x[:, sy, :-1])) \
+            * cpml.psi_Ez_y[:, :, :-1]
 
-        dEy_dz = (grid.Ey[:, :, 1:] - grid.Ey[:, :, :-1]) / dz        # (Nx, Ny, Nz-1)
-        cpml.psi_Ey_z[:, :, :-1] = (
-            cpml.bz_H[:-1].reshape(1, 1, -1) * cpml.psi_Ey_z[:, :, :-1]
-            + cpml.cz_H[:-1].reshape(1, 1, -1) * dEy_dz
-        )
-        grid.Hx[:, :-1, :-1] += coef * cpml.psi_Ey_z[:, :-1, :-1]
+        dEy_dz = (grid.Ey[:, :, sz + 1] - grid.Ey[:, :, sz]) / dz     # (Nx, Ny, n_zH)
+        cpml.psi_Ey_z = cpml.bzH_s * cpml.psi_Ey_z + cpml.czH_s * dEy_dz
+        grid.Hx[:, :-1, sz] += (dt / (MU0 * grid.mu_x[:, :-1, sz])) \
+            * cpml.psi_Ey_z[:, :-1, :]
     else:
-        coef = dt / (MU0 * grid.mu_x[:, :-1, :])
-        grid.Hx[:, :-1, :] -= coef * cpml.psi_Ez_y[:, :-1, :]
+        grid.Hx[:, sy, :] -= (dt / (MU0 * grid.mu_x[:, sy, :])) * cpml.psi_Ez_y
 
-    # ---------- Hy  (curl term: dEx/dz - dEz/dx), region Hy[:-1, :, :-1 or :] ----------
+    # ---------- Hy  (curl term: dEx/dz - dEz/dx) ----------
     # dEz/dx lives at the Hy location -> non-staggered (H) profile along x.
-    dEz_dx = (grid.Ez[1:, :, :] - grid.Ez[:-1, :, :]) / dx            # (Nx-1, Ny, Nz)
-    cpml.psi_Ez_x[:-1, :, :] = (
-        cpml.bx_H[:-1].reshape(-1, 1, 1) * cpml.psi_Ez_x[:-1, :, :]
-        + cpml.cx_H[:-1].reshape(-1, 1, 1) * dEz_dx
-    )
+    dEz_dx = (grid.Ez[sx + 1, :, :] - grid.Ez[sx, :, :]) / dx         # (n_xH, Ny, Nz)
+    cpml.psi_Ez_x = cpml.bxH_s * cpml.psi_Ez_x + cpml.cxH_s * dEz_dx
 
     if Nz > 1:
-        coef = dt / (MU0 * grid.mu_y[:-1, :, :-1])
-        grid.Hy[:-1, :, :-1] += coef * cpml.psi_Ez_x[:-1, :, :-1]
+        grid.Hy[sx, :, :-1] += (dt / (MU0 * grid.mu_y[sx, :, :-1])) \
+            * cpml.psi_Ez_x[:, :, :-1]
 
-        dEx_dz = (grid.Ex[:, :, 1:] - grid.Ex[:, :, :-1]) / dz        # (Nx, Ny, Nz-1)
-        cpml.psi_Ex_z[:, :, :-1] = (
-            cpml.bz_H[:-1].reshape(1, 1, -1) * cpml.psi_Ex_z[:, :, :-1]
-            + cpml.cz_H[:-1].reshape(1, 1, -1) * dEx_dz
-        )
-        grid.Hy[:-1, :, :-1] -= coef * cpml.psi_Ex_z[:-1, :, :-1]
+        dEx_dz = (grid.Ex[:, :, sz + 1] - grid.Ex[:, :, sz]) / dz     # (Nx, Ny, n_zH)
+        cpml.psi_Ex_z = cpml.bzH_s * cpml.psi_Ex_z + cpml.czH_s * dEx_dz
+        grid.Hy[:-1, :, sz] -= (dt / (MU0 * grid.mu_y[:-1, :, sz])) \
+            * cpml.psi_Ex_z[:-1, :, :]
     else:
-        coef = dt / (MU0 * grid.mu_y[:-1, :, :])
-        grid.Hy[:-1, :, :] += coef * cpml.psi_Ez_x[:-1, :, :]
+        grid.Hy[sx, :, :] += (dt / (MU0 * grid.mu_y[sx, :, :])) * cpml.psi_Ez_x
 
-    # ---------- Hz  (curl term: dEy/dx - dEx/dy), region Hz[:-1, :-1, :] ----------
+    # ---------- Hz  (curl term: dEy/dx - dEx/dy) ----------
     # dEy/dx lives at the Hz location -> non-staggered (H) profile along x.
-    dEy_dx = (grid.Ey[1:, :, :] - grid.Ey[:-1, :, :]) / dx            # (Nx-1, Ny, Nz)
-    cpml.psi_Ey_x[:-1, :, :] = (
-        cpml.bx_H[:-1].reshape(-1, 1, 1) * cpml.psi_Ey_x[:-1, :, :]
-        + cpml.cx_H[:-1].reshape(-1, 1, 1) * dEy_dx
-    )
-    coef_z = dt / (MU0 * grid.mu_z[:-1, :-1, :])
-    grid.Hz[:-1, :-1, :] -= coef_z * cpml.psi_Ey_x[:-1, :-1, :]
+    dEy_dx = (grid.Ey[sx + 1, :, :] - grid.Ey[sx, :, :]) / dx         # (n_xH, Ny, Nz)
+    cpml.psi_Ey_x = cpml.bxH_s * cpml.psi_Ey_x + cpml.cxH_s * dEy_dx
+    grid.Hz[sx, :-1, :] -= (dt / (MU0 * grid.mu_z[sx, :-1, :])) \
+        * cpml.psi_Ey_x[:, :-1, :]
 
     # dEx/dy lives at the Hz location -> non-staggered (H) profile along y.
-    dEx_dy = (grid.Ex[:, 1:, :] - grid.Ex[:, :-1, :]) / dy            # (Nx, Ny-1, Nz)
-    cpml.psi_Ex_y[:, :-1, :] = (
-        cpml.by_H[:-1].reshape(1, -1, 1) * cpml.psi_Ex_y[:, :-1, :]
-        + cpml.cy_H[:-1].reshape(1, -1, 1) * dEx_dy
-    )
-    grid.Hz[:-1, :-1, :] += coef_z * cpml.psi_Ex_y[:-1, :-1, :]
+    dEx_dy = (grid.Ex[:, sy + 1, :] - grid.Ex[:, sy, :]) / dy         # (Nx, n_yH, Nz)
+    cpml.psi_Ex_y = cpml.byH_s * cpml.psi_Ex_y + cpml.cyH_s * dEx_dy
+    grid.Hz[:-1, sy, :] += (dt / (MU0 * grid.mu_z[:-1, sy, :])) \
+        * cpml.psi_Ex_y[:-1, :, :]
 
     return grid, cpml
 
@@ -307,71 +385,60 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     Advance the H-derivative psi arrays and add their correction onto the E
     fields that update_E has already advanced. Coefficient is dt/(EPS0*eps) to
     match update.py exactly.
+
+    psi arrays are boundary slabs (see module docstring): the derivative axis
+    carries only the active PML indices sel_*E. Each slab index j holds the
+    derivative centred between samples j-1 and j (the staggered [1:] region),
+    so the differences below read (F[sel] - F[sel-1]).
     """
     dt = grid.dt
     dx, dy, dz = grid.dx, grid.dy, grid.dz
     Nz = grid.Nz
+    sx, sy, sz = cpml.sel_xE, cpml.sel_yE, cpml.sel_zE
 
-    # ---------- Ex  (curl term: dHz/dy - dHy/dz), region Ex[:, 1:, 1: or :] ----------
+    # ---------- Ex  (curl term: dHz/dy - dHy/dz) ----------
     # dHz/dy lives at the Ex location -> staggered (E) profile along y.
-    dHz_dy = (grid.Hz[:, 1:, :] - grid.Hz[:, :-1, :]) / dy            # (Nx, Ny-1, Nz)
-    cpml.psi_Hz_y[:, 1:, :] = (
-        cpml.by_E[1:].reshape(1, -1, 1) * cpml.psi_Hz_y[:, 1:, :]
-        + cpml.cy_E[1:].reshape(1, -1, 1) * dHz_dy
-    )
+    dHz_dy = (grid.Hz[:, sy, :] - grid.Hz[:, sy - 1, :]) / dy         # (Nx, n_yE, Nz)
+    cpml.psi_Hz_y = cpml.byE_s * cpml.psi_Hz_y + cpml.cyE_s * dHz_dy
 
     if Nz > 1:
-        coef = dt / (EPS0 * grid.eps_x[:, 1:, 1:])
-        grid.Ex[:, 1:, 1:] += coef * cpml.psi_Hz_y[:, 1:, 1:]
+        grid.Ex[:, sy, 1:] += (dt / (EPS0 * grid.eps_x[:, sy, 1:])) \
+            * cpml.psi_Hz_y[:, :, 1:]
 
-        dHy_dz = (grid.Hy[:, :, 1:] - grid.Hy[:, :, :-1]) / dz        # (Nx, Ny, Nz-1)
-        cpml.psi_Hy_z[:, :, 1:] = (
-            cpml.bz_E[1:].reshape(1, 1, -1) * cpml.psi_Hy_z[:, :, 1:]
-            + cpml.cz_E[1:].reshape(1, 1, -1) * dHy_dz
-        )
-        grid.Ex[:, 1:, 1:] -= coef * cpml.psi_Hy_z[:, 1:, 1:]
+        dHy_dz = (grid.Hy[:, :, sz] - grid.Hy[:, :, sz - 1]) / dz     # (Nx, Ny, n_zE)
+        cpml.psi_Hy_z = cpml.bzE_s * cpml.psi_Hy_z + cpml.czE_s * dHy_dz
+        grid.Ex[:, 1:, sz] -= (dt / (EPS0 * grid.eps_x[:, 1:, sz])) \
+            * cpml.psi_Hy_z[:, 1:, :]
     else:
-        coef = dt / (EPS0 * grid.eps_x[:, 1:, :])
-        grid.Ex[:, 1:, :] += coef * cpml.psi_Hz_y[:, 1:, :]
+        grid.Ex[:, sy, :] += (dt / (EPS0 * grid.eps_x[:, sy, :])) * cpml.psi_Hz_y
 
-    # ---------- Ey  (curl term: dHx/dz - dHz/dx), region Ey[1:, :, 1: or :] ----------
+    # ---------- Ey  (curl term: dHx/dz - dHz/dx) ----------
     # dHz/dx lives at the Ey location -> staggered (E) profile along x.
-    dHz_dx = (grid.Hz[1:, :, :] - grid.Hz[:-1, :, :]) / dx            # (Nx-1, Ny, Nz)
-    cpml.psi_Hz_x[1:, :, :] = (
-        cpml.bx_E[1:].reshape(-1, 1, 1) * cpml.psi_Hz_x[1:, :, :]
-        + cpml.cx_E[1:].reshape(-1, 1, 1) * dHz_dx
-    )
+    dHz_dx = (grid.Hz[sx, :, :] - grid.Hz[sx - 1, :, :]) / dx         # (n_xE, Ny, Nz)
+    cpml.psi_Hz_x = cpml.bxE_s * cpml.psi_Hz_x + cpml.cxE_s * dHz_dx
 
     if Nz > 1:
-        coef = dt / (EPS0 * grid.eps_y[1:, :, 1:])
-        grid.Ey[1:, :, 1:] -= coef * cpml.psi_Hz_x[1:, :, 1:]
+        grid.Ey[sx, :, 1:] -= (dt / (EPS0 * grid.eps_y[sx, :, 1:])) \
+            * cpml.psi_Hz_x[:, :, 1:]
 
-        dHx_dz = (grid.Hx[:, :, 1:] - grid.Hx[:, :, :-1]) / dz        # (Nx, Ny, Nz-1)
-        cpml.psi_Hx_z[:, :, 1:] = (
-            cpml.bz_E[1:].reshape(1, 1, -1) * cpml.psi_Hx_z[:, :, 1:]
-            + cpml.cz_E[1:].reshape(1, 1, -1) * dHx_dz
-        )
-        grid.Ey[1:, :, 1:] += coef * cpml.psi_Hx_z[1:, :, 1:]
+        dHx_dz = (grid.Hx[:, :, sz] - grid.Hx[:, :, sz - 1]) / dz     # (Nx, Ny, n_zE)
+        cpml.psi_Hx_z = cpml.bzE_s * cpml.psi_Hx_z + cpml.czE_s * dHx_dz
+        grid.Ey[1:, :, sz] += (dt / (EPS0 * grid.eps_y[1:, :, sz])) \
+            * cpml.psi_Hx_z[1:, :, :]
     else:
-        coef = dt / (EPS0 * grid.eps_y[1:, :, :])
-        grid.Ey[1:, :, :] -= coef * cpml.psi_Hz_x[1:, :, :]
+        grid.Ey[sx, :, :] -= (dt / (EPS0 * grid.eps_y[sx, :, :])) * cpml.psi_Hz_x
 
-    # ---------- Ez  (curl term: dHy/dx - dHx/dy), region Ez[1:, 1:, :] ----------
+    # ---------- Ez  (curl term: dHy/dx - dHx/dy) ----------
     # dHy/dx lives at the Ez location -> staggered (E) profile along x.
-    dHy_dx = (grid.Hy[1:, :, :] - grid.Hy[:-1, :, :]) / dx            # (Nx-1, Ny, Nz)
-    cpml.psi_Hy_x[1:, :, :] = (
-        cpml.bx_E[1:].reshape(-1, 1, 1) * cpml.psi_Hy_x[1:, :, :]
-        + cpml.cx_E[1:].reshape(-1, 1, 1) * dHy_dx
-    )
-    coef_z = dt / (EPS0 * grid.eps_z[1:, 1:, :])
-    grid.Ez[1:, 1:, :] += coef_z * cpml.psi_Hy_x[1:, 1:, :]
+    dHy_dx = (grid.Hy[sx, :, :] - grid.Hy[sx - 1, :, :]) / dx         # (n_xE, Ny, Nz)
+    cpml.psi_Hy_x = cpml.bxE_s * cpml.psi_Hy_x + cpml.cxE_s * dHy_dx
+    grid.Ez[sx, 1:, :] += (dt / (EPS0 * grid.eps_z[sx, 1:, :])) \
+        * cpml.psi_Hy_x[:, 1:, :]
 
     # dHx/dy lives at the Ez location -> staggered (E) profile along y.
-    dHx_dy = (grid.Hx[:, 1:, :] - grid.Hx[:, :-1, :]) / dy            # (Nx, Ny-1, Nz)
-    cpml.psi_Hx_y[:, 1:, :] = (
-        cpml.by_E[1:].reshape(1, -1, 1) * cpml.psi_Hx_y[:, 1:, :]
-        + cpml.cy_E[1:].reshape(1, -1, 1) * dHx_dy
-    )
-    grid.Ez[1:, 1:, :] -= coef_z * cpml.psi_Hx_y[1:, 1:, :]
+    dHx_dy = (grid.Hx[:, sy, :] - grid.Hx[:, sy - 1, :]) / dy         # (Nx, n_yE, Nz)
+    cpml.psi_Hx_y = cpml.byE_s * cpml.psi_Hx_y + cpml.cyE_s * dHx_dy
+    grid.Ez[1:, sy, :] -= (dt / (EPS0 * grid.eps_z[1:, sy, :])) \
+        * cpml.psi_Hx_y[1:, :, :]
 
     return grid, cpml

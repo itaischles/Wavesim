@@ -72,7 +72,8 @@ def test_00_grid_viz():
 
     print(f"\nCPML initialised:")
     print(f"  d_pml = {cpml.d_pml} cells")
-    print(f"  psi_Hz_x_lo shape: {cpml.psi_Hz_x_lo.shape}")
+    print(f"  psi_Hz_x slab shape: {cpml.psi_Hz_x.shape} "
+          f"(x-axis compressed to {len(cpml.sel_xE)} PML cells)")
     print(f"  bx_E (first 3): {cpml.bx_E[:3]}")
     print(f"  cx_E (first 3): {cpml.cx_E[:3]}")
 
