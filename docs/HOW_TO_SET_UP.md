@@ -65,7 +65,7 @@ Wavesim\
 │   ├── test_02_free_space.py
 │   ├── test_03_pec_cavity.py
 │   ├── test_04_waveguide.py
-│   └── test_05_coax_tem.py          ← planned, not yet implemented
+│   └── test_05_coax_tem.py          ← first full 3D run (Nz>1)
 └── docs\                 ← API_GUIDE.md, this file, design notes
 ```
 
@@ -84,9 +84,11 @@ python tests\test_01_source_viz.py
 python tests\test_02_free_space.py
 python tests\test_03_pec_cavity.py
 python tests\test_04_waveguide.py
+python tests\test_05_coax_tem.py
 ```
 
-Tests 00–04 are implemented and passing; `test_05_coax_tem.py` is planned.
+Tests 00–05 are implemented and passing. `test_05_coax_tem.py` is the first run
+with `Nz > 1` (full 3D); it takes ~3 minutes, the others are quick.
 
 Each test prints a `PASSED` / `FAILED` summary to stdout and saves a PNG (and,
 for tests 02–04, an animated GIF) next to the test script. These artifacts are

@@ -3,10 +3,11 @@
 A compact, validated **FDTD electromagnetic solver** in Python + NumPy.
 
 Wavesim integrates Maxwell's equations on a Yee grid with a functional design:
-one `FDTDGrid` state object and a set of pure functions that advance it. It runs
-full 3D arrays as a thin 2D slice (`Nz = 1`) today, with a clean upgrade path to
-full 3D. Boundaries are **CPML** (convolutional perfect matched layer) and
-**PEC** (perfect electric conductor); sources are soft-injected Gaussian pulses.
+one `FDTDGrid` state object and a set of pure functions that advance it. Tests
+00–04 run the full 3D arrays as a thin 2D slice (`Nz = 1`); Test 05 is the first
+true 3D run (`Nz > 1`), exercising the 3D curl and z-face CPML on the same code.
+Boundaries are **CPML** (convolutional perfect matched layer) and **PEC**
+(perfect electric conductor); sources are soft-injected Gaussian pulses.
 
 The import package is named `wavesim`.
 
@@ -107,9 +108,9 @@ Run from the project root, in order — each validates one subsystem.
 | `test_02_free_space.py` | Pulse propagation + CPML absorption + symmetry | ✅ |
 | `test_03_pec_cavity.py` | PEC cavity resonances vs analytic TM modes (<0.04%) | ✅ |
 | `test_04_waveguide.py`  | Waveguide cutoff: evanescence below, phase velocity above | ✅ |
-| `test_05_coax_tem.py`   | Coaxial TEM mode vs reference | ⬜ planned |
+| `test_05_coax_tem.py`   | Coaxial TEM mode (first full 3D run, `Nz>1`): 1/r profile, `Z=η₀`, `v=c` | ✅ |
 
-Tests 02–04 also save an animated GIF alongside their PNG (both git-ignored,
+Tests 02–05 also save an animated GIF alongside their PNG (both git-ignored,
 regenerated on each run).
 
 ---
@@ -129,6 +130,12 @@ regenerated on each run).
 
 ## Status
 
-v1: a validated 2D-in-3D solver (CPML + PEC) through Test 04. Planned next:
-the coaxial TEM test, then the `Nz > 1` full-3D upgrade (the code is already
-structured for it — search `# 3D-UPGRADE:`).
+v1: a validated 2D-in-3D solver (CPML + PEC) through Test 04, plus Test 05 — the
+first full-3D run (`Nz > 1`), validating the coaxial TEM mode on the same code
+(the engine was already structured for 3D — search `# 3D-UPGRADE:`).
+
+## Todo
+
+1. Full 3D migration and testing using JAX.
+2. Nonuniform rectilinear grid.
+3. 2D waveguide-port mode solver + modal injection.

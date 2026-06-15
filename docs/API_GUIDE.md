@@ -5,9 +5,10 @@ simulations with this engine. It documents every public function you need,
 the canonical simulation loop, the conventions that bite if you get them
 wrong, and three complete worked examples drawn from the validated test suite.
 
-> **Scope.** This covers the current v1 API: a functional NumPy solver running
-> 3D arrays as a thin `Nz=1` slice, with CPML and PEC boundaries, Gaussian
-> sources, time/snapshot/energy monitors, and visualisation helpers.
+> **Scope.** This covers the current v1 API: a functional NumPy solver on full
+> 3D arrays — usually run as a thin `Nz=1` slice, but also full 3D (`Nz>1`, see
+> `test_05_coax_tem.py`) — with CPML and PEC boundaries, Gaussian sources,
+> time/snapshot/energy monitors, and visualisation helpers.
 
 ---
 
@@ -48,11 +49,13 @@ create_grid ──► set materials ──► init boundaries / sources / monito
                               plot / animate results
 ```
 
-Everything operates on full 3D arrays of shape `(Nx, Ny, Nz)`. For v1 you keep
-`Nz = 1`; the third dimension is carried so the same code becomes full 3D later
-without restructuring. With `Nz=1` and an `Ez` source you are simulating the
-**TM_z** polarisation: the live fields are `Ez`, `Hx`, `Hy` (all z-derivatives
-vanish automatically).
+Everything operates on full 3D arrays of shape `(Nx, Ny, Nz)`. Most v1 tests keep
+`Nz = 1`; the third dimension is carried so the same code runs full 3D simply by
+setting `Nz > 1` (no restructuring) — `test_05_coax_tem.py` does exactly that.
+With `Nz=1` and an `Ez` source you are simulating the **TM_z** polarisation: the
+live fields are `Ez`, `Hx`, `Hy` (all z-derivatives vanish automatically). With
+`Nz > 1` all six components and all three curl terms are live, and the z-faces
+can carry CPML (`init_cpml(..., faces=(...,'z0','z1'))`).
 
 ---
 

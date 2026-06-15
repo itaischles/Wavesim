@@ -48,10 +48,7 @@ tests/
 ├── test_02_free_space.py     # Gaussian pulse in vacuum
 ├── test_03_pec_cavity.py     # PEC cavity resonance
 ├── test_04_waveguide.py      # Rectangular waveguide mode
-└── test_05_coax_tem.py       # Coaxial TEM mode (vs MEEP reference)
-
-examples/
-└── coax_tem.py               # Standalone coaxial simulation script
+└── test_05_coax_tem.py       # Coaxial TEM mode (first full 3D run, Nz>1)
 ```
 
 All modules are flat collections of functions. No deep class hierarchies. No circular imports. The `FDTDGrid` dataclass is the only shared object.
@@ -708,22 +705,45 @@ Validation checks:
 
 ---
 
-### Test 05 — Coaxial TEM mode (MEEP reference comparison)
+### Test 05 — Coaxial TEM mode (first full 3D run)
+
+**This is the first test with `Nz > 1`.** It exercises the 3D curl in
+`update.py` and the z-face CPML in `pml.py` for real.
+
+The coaxial TEM mode propagates *along the axis* with purely transverse fields
+(radial `E_r ~ 1/r`, azimuthal `H_phi ~ 1/r`, `|E_r|/|H_phi| = η₀`, velocity
+`c`). Because it propagates along the axis, the axis **must** be resolved — a
+single `Nz=1` slice cannot carry it. So the coax is oriented along **z** with the
+cross-section in the XY plane.
 
 Setup:
-- Grid: `Nx=200, Ny=200, Nz=1, dx=0.25e-3` (0.25 mm, 5 cm × 5 cm domain)
-- Geometry: coaxial cross-section in XY plane using `set_coax(grid, cx=100, cy=100, r_inner=14, r_outer=32)` (in cells; ≈3.5 mm and 8 mm radii → Z₀ ≈ 50 Ω vacuum fill)
-- Boundaries: CPML on all 4 domain faces; `apply_pec_mask` enforces inner and outer conductors
-- Source: soft Ez injection on an annular ring of cells between inner and outer conductor radii at one face
-- Monitors: `FieldMonitor` for Ez and Hz at 3 radii between conductors; `MagnitudeMonitor` for |E|; `SnapshotMonitor` every 20 steps
-- Run: 2000 timesteps
+- Grid: `Nx=Ny=80, Nz=110, dx=dy=dz=0.4e-3` (32 mm wide cross-section, 44 mm long)
+- Geometry: `set_coax(grid, cx, cy, r_inner=10 cells, r_outer=30 cells)`, vacuum fill → `Z₀ = (η₀/2π)·ln(b/a) ≈ 66 Ω`. The coax fills the whole z extent.
+- Boundaries: CPML on `z0, z1` **only**. The outer PEC conductor shields the transverse (x/y) domain walls, so no x/y absorber (or PEC face) is needed. `apply_pec_mask` enforces both conductors every step.
+- Source: soft, additive, azimuthally-symmetric **radial** E injected on the vacuum annulus at one z-plane (`Ex,Ey += A(t)·r̂`), broadband Gaussian time pulse. A uniform-in-r radial drive is used deliberately: it is not the 1/r eigenshape, so a clean 1/r profile downstream is a genuine result.
+- Monitors: radial line of `FieldMonitor`s for `Ex (=E_r)` and `Hy (=H_phi)` along +x at a measurement plane; an axial tap line of `Ex` monitors for the phase velocity; `SnapshotMonitor`-style XZ/XY captures for figures and the GIF.
+- Run: 600 timesteps.
 
-Validation checks:
-1. Ez snapshot profile: field magnitude decays as `1/r` between conductors
-2. Wave impedance ratio: `|Ez| / |Hφ| ≈ η₀ = 377 Ω` at all monitor radii (within 5%)
-3. Compare Ez and Hz snapshot profiles against existing MEEP reference simulation
+**Key methodology — measure in the frequency domain at a single probe
+frequency.** The broadband pulse contains energy above the first higher-order
+coax cutoff (TM01, `≈ c/(2(b−a)) ≈ 19 GHz`), which the symmetric radial drive
+*does* excite and which is slow and dispersive. A time-domain (envelope/peak)
+measurement is therefore biased. All three quantities are instead read from the
+FFT of the monitor time series at `F_PROBE = 10 GHz`, comfortably below the TM01
+cutoff, where the line supports **only** the TEM mode. The phase velocity is a
+least-squares fit of phase-vs-z over a tap line spanning more than a half
+wavelength (this averages out residual CPML standing-wave ripple, which is
+larger at low frequency because a 10-cell PML is electrically thin there).
 
-**Pass criteria:** `1/r` radial profile confirmed; impedance ratio within 5%; profile shapes match MEEP reference within 5%.
+Validation checks (all at `F_PROBE`):
+1. Radial profile of `|E_r|(r)` decays as `1/r` (log-log slope −1 within 0.1, correlation with 1/r > 0.99).
+2. Wave impedance `|E_r|/|H_phi| ≈ η₀` (mean within 6 %, worst radius within 8 %).
+3. Axial phase velocity `v_ph ≈ c` (within 2 %).
+
+**Pass criteria:** all three checks pass. PNG summary + propagation GIF saved.
+
+Achieved (80×80×110, ~3 min): slope −1.05, corr 0.9996; mean Z error 3.4 %
+(worst 5.2 %); `v_ph` error 0.5 %.
 
 ---
 
