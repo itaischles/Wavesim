@@ -34,6 +34,8 @@ Example
     # snap.snapshots now holds the recorded frames; sim.grid is the final state.
 """
 
+import sys
+import time
 from typing import Callable, Iterable
 
 from wavesim.grid import FDTDGrid
@@ -182,7 +184,8 @@ class Simulation:
         return grid
 
     def run(self, n_steps: int,
-            callback: Callable[["Simulation", int], None] = None) -> FDTDGrid:
+            callback: Callable[["Simulation", int], None] = None,
+            verbose: int = 0) -> FDTDGrid:
         """
         Run ``n_steps`` timesteps.
 
@@ -191,16 +194,87 @@ class Simulation:
         n_steps : int
             Number of steps to advance.
         callback : callable, optional
-            Called as ``callback(sim, n)`` after each step — handy for progress
-            printing or custom per-step logic without unrolling the loop.
+            Called as ``callback(sim, n)`` after each step — handy for custom
+            per-step logic without unrolling the loop.
+        verbose : int, optional
+            Console verbosity (default ``0``):
+
+            * ``0`` — silent (the original behaviour).
+            * ``1`` — print a rolling one-line status to stderr,
+              ``step n/N (pct) | steps/s | sim-time | ETA``, updated in place and
+              throttled to ~10 Hz so it adds negligible overhead to the loop.
+
+            Higher levels are reserved for future, more detailed output.
 
         Returns
         -------
         FDTDGrid
             The final grid state (also available as ``self.grid``).
         """
+        report = self._make_progress_reporter(n_steps) if verbose >= 1 else None
         for n in range(n_steps):
             self.step()
             if callback is not None:
                 callback(self, n)
+            if report is not None:
+                report(n)
         return self.grid
+
+    # ------------------------------------------------------------------ #
+    # Progress reporting
+    # ------------------------------------------------------------------ #
+    def _make_progress_reporter(self, n_steps: int):
+        """Build a throttled rolling-progress printer for a ``run`` of length
+        ``n_steps``. Returns a ``report(n)`` closure to call after each step
+        (``n`` is the 0-based step index), or ``None`` if there is nothing to
+        report. The first/last steps are always drawn; in between it updates at
+        most every ~0.1 s so the print cost stays off the hot path."""
+        if n_steps <= 0:
+            return None
+
+        stream = sys.stderr
+        t0 = time.perf_counter()
+        last_drawn = [0.0]
+        dt = self.grid.dt
+
+        def report(n):
+            now = time.perf_counter()
+            done = n + 1
+            is_last = done == n_steps
+            # Throttle: skip unless ~0.1 s elapsed since the last redraw, but
+            # always draw the final step so the line ends on 100%.
+            if not is_last and (now - last_drawn[0]) < 0.1:
+                return
+            last_drawn[0] = now
+
+            elapsed = now - t0
+            rate = done / elapsed if elapsed > 0 else 0.0
+            pct = 100.0 * done / n_steps
+            sim_t = self.grid.time_step * dt          # physical time reached
+            eta = (n_steps - done) / rate if rate > 0 else 0.0
+
+            line = (f"\r  {self.backend} | step {done}/{n_steps} ({pct:5.1f}%)"
+                    f" | {rate:7.0f} steps/s | t={_fmt_time(sim_t)}"
+                    f" | ETA {_fmt_dur(eta)}")
+            stream.write(line)
+            if is_last:
+                stream.write(f"   done in {_fmt_dur(elapsed)}\n")
+            stream.flush()
+
+        return report
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format a physical simulation time with an SI prefix (ns/µs/ms/s)."""
+    for scale, unit in ((1e-12, "ps"), (1e-9, "ns"), (1e-6, "us"), (1e-3, "ms")):
+        if abs(seconds) < scale * 1000:
+            return f"{seconds / scale:6.2f} {unit}"
+    return f"{seconds:6.2f} s"
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Format a wall-clock duration compactly (e.g. ``3.4s`` or ``1m02s``)."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s"
