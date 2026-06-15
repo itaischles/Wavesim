@@ -10,7 +10,8 @@ wrong, and three complete worked examples drawn from the validated test suite.
 > `test_05_coax_tem.py`) — with CPML and PEC boundaries, Gaussian sources,
 > time/snapshot/energy monitors, and visualisation helpers. It also documents the
 > v2 [`Simulation`](#simulation) / [`Source`](#sources) orchestration layer,
-> which runs the canonical loop for you on top of that same functional core.
+> which runs the canonical loop for you on top of that same functional core, and
+> the optional ~10–12× [Numba backend](#simulation) (`backend='numba'`).
 
 ---
 
@@ -67,7 +68,8 @@ can carry CPML (`init_cpml(..., faces=(...,'z0','z1'))`).
 ## 2. Setup & running
 
 The engine needs **NumPy**, **Matplotlib**, and (for some analysis in the tests)
-**SciPy**. Use the dedicated conda environment:
+**SciPy**. **Numba** is optional — install it (`pip install numba`) only if you
+want the faster `backend='numba'`. Use the dedicated conda environment:
 
 ```bash
 # the env that has the dependencies
@@ -518,12 +520,24 @@ drop the per-script loop boilerplate; keep writing the loop by hand whenever you
 want full control.
 
 ```python
-Simulation(grid, cpml=None, sources=(), monitors=(), pec_faces=())
+Simulation(grid, cpml=None, sources=(), monitors=(), pec_faces=(), backend='numpy')
 ```
 Wrap a grid and its components. `cpml=None` skips the CPML correction steps (for a
 closed, lossless cavity). `pec_faces` (e.g. `('y0','y1')`) are held as PEC walls
 each step; `apply_pec_mask` always runs too, so interior conductors from the
 material helpers are enforced automatically.
+
+`backend` selects the implementation of the four hot update functions:
+`'numpy'` (default, the validated reference in `update.py`/`pml.py`) or `'numba'`
+(multithreaded JIT kernels in `wavesim/backend_numba.py`, requires `pip install
+numba`). The two are **bit-for-bit identical** (verified by
+`test_08_numba_parity.py`); `'numba'` is ~10–12× faster at 3D sizes and only
+worth it there — the first step pays a one-time JIT compile. PEC, sources, and
+monitors are backend-independent. The stencil is memory-bandwidth-bound, so
+`numba.set_num_threads(4)` (≈4–6 threads) is typically the sweet spot; using all
+cores can be slightly slower. To swap a backend into a hand-written loop instead,
+just import the four functions from `wavesim.backend_numba` in place of
+`wavesim.update` / `wavesim.pml`.
 
 ```python
 sim.add_source(source) -> source        # register a Source; returns it

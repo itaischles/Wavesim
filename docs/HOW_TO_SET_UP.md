@@ -21,9 +21,11 @@ You'll need to run `conda activate wavesim` at the start of every session, or se
 
 ```bat
 conda install -n wavesim numpy matplotlib scipy pillow -y
+pip install numba             :: optional — only for the faster backend='numba'
 ```
 
-All four packages are in the default Anaconda channel — no `conda-forge` needed.
+The four conda packages are in the default Anaconda channel — no `conda-forge`
+needed. `numba` is optional (PyPI wheel; works with the current numpy).
 
 **What each package is for:**
 
@@ -33,6 +35,7 @@ All four packages are in the default Anaconda channel — no `conda-forge` neede
 | `matplotlib` | All visualisation (`viz.py`), animation output |
 | `scipy` | FFT analysis in test_03 (cavity resonance), test_04 (waveguide) |
 | `Pillow` | Saving animated GIFs from `anim.save('out.gif', writer='pillow')` |
+| `numba` *(optional)* | The ~10–12× multithreaded `Simulation(backend='numba')` / `wavesim/backend_numba.py` and `tools/benchmark_numba.py` |
 
 ---
 
@@ -125,6 +128,11 @@ from wavesim.pml import init_cpml
 grid = create_grid(Nx=10, Ny=10, Nz=1, dx=1e-3)
 cpml = init_cpml(grid, d_pml=3)
 print('wavesim package: OK')
+try:
+    import numba
+    print(f'numba      {numba.__version__}  (threads {numba.config.NUMBA_NUM_THREADS}) — backend=numba available')
+except ImportError:
+    print('numba      not installed (optional — backend=numba unavailable)')
 "
 ```
 
@@ -136,6 +144,7 @@ matplotlib 3.x.x
 scipy      1.x.x
 Pillow     10.x.x
 wavesim package: OK
+numba      0.6x.x  (threads 12) — backend=numba available
 ```
 
 ---

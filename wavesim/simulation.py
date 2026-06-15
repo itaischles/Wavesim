@@ -37,8 +37,7 @@ Example
 from typing import Callable, Iterable
 
 from wavesim.grid import FDTDGrid
-from wavesim.pml import CPMLArrays, update_H_pml, update_E_pml
-from wavesim.update import update_H, update_E
+from wavesim.pml import CPMLArrays
 from wavesim.pec import apply_pec_faces, apply_pec_mask
 from wavesim.sources import Source
 from wavesim.monitors import (
@@ -55,6 +54,25 @@ _RECORDERS = {
     SnapshotMonitor:  record_snapshot,
     EnergyMonitor:    record_energy,
 }
+
+
+def _load_backend(backend: str):
+    """Return ``(update_H, update_E, update_H_pml, update_E_pml)`` for a backend.
+
+    Importing the numba backend is deferred to here so that ``numba`` is only a
+    dependency when ``backend='numba'`` is actually requested — the default numpy
+    path has no extra imports.
+    """
+    if backend == 'numpy':
+        from wavesim.update import update_H, update_E
+        from wavesim.pml import update_H_pml, update_E_pml
+    elif backend == 'numba':
+        from wavesim.backend_numba import (
+            update_H, update_E, update_H_pml, update_E_pml)
+    else:
+        raise ValueError(
+            f"Unknown backend {backend!r}. Expected 'numpy' or 'numba'.")
+    return update_H, update_E, update_H_pml, update_E_pml
 
 
 class Simulation:
@@ -78,6 +96,14 @@ class Simulation:
         ``apply_pec_mask`` always runs as well (it is a no-op when the grid has
         no ``pec_mask``), so interior conductors placed by the material helpers
         are enforced automatically.
+    backend : {'numpy', 'numba'}, optional
+        Which implementation of the four hot update functions to call. ``'numpy'``
+        (default) uses the validated reference in :mod:`wavesim.update` /
+        :mod:`wavesim.pml`; ``'numba'`` uses the multithreaded JIT kernels in
+        :mod:`wavesim.backend_numba`, which are bit-for-bit identical (no parallel
+        reductions) but parallelised across cores for large 3D grids. The first
+        ``'numba'`` step pays a one-time JIT compile cost. PEC, sources, and
+        monitors are backend-independent and run identically either way.
 
     Notes
     -----
@@ -90,12 +116,16 @@ class Simulation:
                  cpml: CPMLArrays = None,
                  sources: Iterable[Source] = (),
                  monitors: Iterable = (),
-                 pec_faces: tuple = ()) -> None:
+                 pec_faces: tuple = (),
+                 backend: str = 'numpy') -> None:
         self.grid = grid
         self.cpml = cpml
         self.sources = list(sources)
         self.monitors = list(monitors)
         self.pec_faces = tuple(pec_faces)
+        self.backend = backend
+        self._update_H, self._update_E, self._update_H_pml, self._update_E_pml = \
+            _load_backend(backend)
 
     # ------------------------------------------------------------------ #
     # Building up the simulation
@@ -123,14 +153,14 @@ class Simulation:
         t = grid.time_step * grid.dt
 
         # 1-2. H update (+ CPML correction)
-        grid = update_H(grid)
+        grid = self._update_H(grid)
         if self.cpml is not None:
-            grid, self.cpml = update_H_pml(grid, self.cpml)
+            grid, self.cpml = self._update_H_pml(grid, self.cpml)
 
         # 3-4. E update (+ CPML correction)
-        grid = update_E(grid)
+        grid = self._update_E(grid)
         if self.cpml is not None:
-            grid, self.cpml = update_E_pml(grid, self.cpml)
+            grid, self.cpml = self._update_E_pml(grid, self.cpml)
 
         # 5. PEC — always after the E update (+ CPML)
         if self.pec_faces:

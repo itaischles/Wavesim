@@ -1,6 +1,7 @@
 # Wavesim
 
-A compact, validated **FDTD electromagnetic solver** in Python + NumPy.
+A compact, validated **FDTD electromagnetic solver** in Python + NumPy, with an
+optional multithreaded **Numba** backend (~10–12× faster, same results).
 
 Wavesim integrates Maxwell's equations on a Yee grid with a functional design:
 one `FDTDGrid` state object and a set of pure functions that advance it. Tests
@@ -20,6 +21,10 @@ The import package is named `wavesim`.
   runs the canonical loop for you (same physics, bit-identical results) when you
   want to skip the boilerplate.
 - **Full 3D Yee curl** operators, vectorised with NumPy slicing (no cell loops).
+- **Optional Numba backend** — JIT, multithreaded drop-in kernels for the hot
+  update functions (`Simulation(backend='numba')`), **~10–12× faster** than NumPy
+  at 3D sizes and **bit-identical** to it. NumPy stays the default and the
+  reference; Numba is opt-in.
 - **CPML boundaries** (Roden–Gedney) selectable **per face**, so PEC walls and
   symmetry planes are easy to combine with absorbing ends.
 - **PEC** domain faces and interior conductor masks (boxes, cylinders, coax).
@@ -40,6 +45,7 @@ The import package is named `wavesim`.
 conda create -n wavesim python=3.11 -y
 conda activate wavesim
 conda install -n wavesim numpy matplotlib scipy pillow -y
+pip install numba          # optional — only for the faster backend='numba'
 
 # 2. clone & run
 git clone https://github.com/itaischles/Wavesim.git
@@ -81,11 +87,16 @@ Prefer to skip the loop? The same run via the v2 orchestration layer:
 from wavesim.simulation import Simulation
 from wavesim.sources import PointSource, make_source_for_fmax
 
-sim  = Simulation(grid, cpml=cpml)
+sim  = Simulation(grid, cpml=cpml)                     # backend='numba' for ~10× speed
 sim.add_source(PointSource('Ez', 100, 100, 0, make_source_for_fmax(10e9)))
 snap = sim.add_monitor(SnapshotMonitor('Ez', k_slice=0, interval=20))
 sim.run(2000)                                          # bit-identical to the loop
 ```
+
+For large 3D runs, pass `backend='numba'` to `Simulation` (requires `pip install
+numba`) — multithreaded JIT kernels that are bit-identical to the NumPy default.
+The stencil is memory-bandwidth-bound, so ~4–6 threads is the sweet spot
+(`numba.set_num_threads(4)`). See [ROADMAP.md](ROADMAP.md) §3.
 
 See the **[API Guide](docs/API_GUIDE.md)** for the full reference, the canonical
 loop, and the conventions worth committing to memory.
@@ -100,16 +111,17 @@ Wavesim/
 ├── wavesim/             # solver package
 │   ├── grid.py       # FDTDGrid dataclass + create_grid
 │   ├── materials.py  # vacuum / box / cylinder / coax / raw-array builders
-│   ├── update.py     # E and H field updates (3D curl)
-│   ├── pml.py        # CPML init + corrections (per-face selectable)
-│   ├── pec.py        # PEC faces and interior conductor mask
-│   ├── sources.py    # Gaussian waveform + Source / PointSource / ArraySource
-│   ├── monitors.py   # field / magnitude / snapshot / energy monitors
-│   ├── simulation.py # Simulation class — runs the canonical time loop for you
-│   ├── viz.py        # all plotting and animation (2D + full-3D helpers)
-│   └── constants.py  # C0, EPS0, MU0, ETA0
+│   ├── update.py        # E and H field updates (3D curl) — NumPy reference
+│   ├── pml.py           # CPML init + corrections (per-face selectable)
+│   ├── pec.py           # PEC faces and interior conductor mask
+│   ├── backend_numba.py # optional Numba JIT/multithreaded drop-in for update.py + pml.py
+│   ├── sources.py       # Gaussian waveform + Source / PointSource / ArraySource
+│   ├── monitors.py      # field / magnitude / snapshot / energy monitors
+│   ├── simulation.py    # Simulation class — runs the canonical loop (backend='numpy'|'numba')
+│   ├── viz.py           # all plotting and animation (2D + full-3D helpers)
+│   └── constants.py     # C0, EPS0, MU0, ETA0
 ├── tests/            # validated example simulations (run in order)
-├── tools/            # profile_3d.py — memory & runtime profiling harness
+├── tools/            # profile_3d.py (NumPy profiling) + benchmark_numba.py (NumPy vs Numba)
 └── docs/             # API_GUIDE.md, HOW_TO_SET_UP.md, design/dev notes
 ```
 
@@ -129,13 +141,16 @@ Run from the project root, in order — each validates one subsystem.
 | `test_05_coax_tem.py`   | Coaxial TEM mode (first full 3D run, `Nz>1`): 1/r profile, `Z=η₀`, `v=c` | ✅ |
 | `test_06_box_cavity_3d.py` | Volumetric 3D PEC cavity: 14 analytic resonances within 1.5% (10 with `p≥1`, a half-wave along `z`) | ✅ |
 | `test_07_simulation_api.py` | v2 `Simulation`/`Source` API tutorial: open-boundary absorption + symmetry, bit-identical to the manual loop | ✅ |
+| `test_08_numba_parity.py` | Numba backend reproduces the NumPy solver bit-for-bit (`max\|diff\|=0`) on both the 2D-slice and full-3D paths | ✅ |
 
 Tests 02–07 also save an animated GIF alongside their PNG (both git-ignored,
 regenerated on each run).
 
-A profiling harness, `tools/profile_3d.py`, sweeps cube sizes and reports
-throughput (µs per cell-step) and memory (bytes per cell) for the pure-NumPy
-backend — see [ROADMAP.md](ROADMAP.md) §1/§3 for the headline numbers.
+Two profiling harnesses live in `tools/`: `profile_3d.py` sweeps cube sizes and
+reports throughput (µs per cell-step) and memory (bytes per cell) for the NumPy
+backend; `benchmark_numba.py` compares NumPy vs Numba throughput and multicore
+scaling (~10–12× at 3D sizes). See [ROADMAP.md](ROADMAP.md) §1/§3 for the
+headline numbers.
 
 ---
 
@@ -145,8 +160,8 @@ backend — see [ROADMAP.md](ROADMAP.md) §1/§3 for the headline numbers.
   reference with worked examples.
 - **[docs/HOW_TO_SET_UP.md](docs/HOW_TO_SET_UP.md)** — environment setup (conda
   + VS Code) and how to run the tests.
-- **[ROADMAP.md](ROADMAP.md)** — what's planned next (full 3D, JAX, nonuniform
-  grid, mode solver) and what's landed (v2 `Simulation`/`Source` layer).
+- **[ROADMAP.md](ROADMAP.md)** — what's planned next (nonuniform grid, mode
+  solver) and what's landed (v2 `Simulation`/`Source` layer, the Numba backend).
 - **[DEBUG_NOTES_test02_pml.md](DEBUG_NOTES_test02_pml.md)**,
   **[PML_NOTES_2026-06-12_independent_faces.md](PML_NOTES_2026-06-12_independent_faces.md)**
   — CPML implementation notes.
@@ -163,7 +178,7 @@ dedicated orthogonal-slice helpers in `viz.py`.
 
 ## What's next
 
-See **[ROADMAP.md](ROADMAP.md)** — making full 3D first-class, a JAX performance
-backend, a nonuniform rectilinear grid, and a waveguide-port mode solver with
-modal injection. (The v2 `Simulation`/`Source` orchestration layer has landed —
-see `test_07_simulation_api.py`.)
+See **[ROADMAP.md](ROADMAP.md)** — making full 3D first-class, a nonuniform
+rectilinear grid, and a waveguide-port mode solver with modal injection. (The v2
+`Simulation`/`Source` orchestration layer and the optional ~10–12× Numba backend
+have landed — see `test_07_simulation_api.py` and `test_08_numba_parity.py`.)

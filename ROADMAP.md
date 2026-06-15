@@ -39,12 +39,13 @@ Checklist (search the codebase for `# 3D-UPGRADE:`):
 - [x] Profile memory and runtime at representative 3D sizes — `tools/profile_3d.py`.
       Findings: **~0.33 µs/cell-step**, **192 bytes/cell** (half of it the 12
       full-grid CPML `psi` arrays). Practical pure-NumPy ceiling for runs in the
-      3–5 min budget is ≈100³ (e.g. 96³ fits ~600 steps in 3 min), which is
-      exactly the JAX trigger point in §3. See §3.
+      3–5 min budget is ≈100³ (e.g. 96³ fits ~600 steps in 3 min) — the
+      acceleration trigger point addressed by the Numba backend in §3. See §3.
 - [ ] Remove / simplify the `Nz>1` z-derivative guards in `update.py` once 3D is
       the default path. **Deliberately kept for now**: the `Nz=1` fast path still
-      benefits Tests 00–04 and quick iteration, and the JAX migration (§3) will
-      rewrite these with `jax.lax.cond` regardless.
+      benefits Tests 00–04 and quick iteration. Note the Numba backend (§3)
+      already collapses both paths into one 3D kernel guarded by a plain `if Nz>1`,
+      so this NumPy duplication can be retired when Numba becomes the default.
 - [x] Allocate the CPML `psi` arrays as boundary slabs instead of full volume.
       Each `psi` is now compressed along its derivative axis to just the active
       PML cells (`sel_*` in `pml.py`), cutting their footprint to ~`2·d_pml/N` of
@@ -75,27 +76,40 @@ without hiding the physics. Lives in `wavesim/simulation.py` and
 
 ---
 
-## 3. Performance — JAX migration
+## 3. Performance — Numba acceleration — **done** (was: JAX)
 
-NumPy is sufficient for v1. Beyond roughly **100³ cells** the per-step array work
-dominates; that is the point to evaluate a JAX backend. This threshold is now
-measured, not guessed — `tools/profile_3d.py` reports ~0.33 µs/cell-step, so a
-96³ grid fits only ~600 steps in a 3-minute budget. The functional design was
-chosen to make this migration mechanical:
+NumPy is sufficient for v1 but single-threaded: at representative 3D sizes the
+solver ran at <10% CPU utilisation (~1 of 12 cores), ~0.33 µs/cell-step
+(`tools/profile_3d.py`), so a 96³ grid fit only ~600 steps in a 3-minute budget.
 
-1. Register `FDTDGrid` and `CPMLArrays` as JAX pytrees via
-   `jax.tree_util.register_pytree_node`.
-2. Swap `import numpy as np` → `import jax.numpy as jnp` in `update.py` and
-   `pml.py` (the hot modules only).
-3. Replace in-place mutation with returned new arrays — already the design
-   (pure functions returning the grid).
-4. Wrap the time-loop body in `@jax.jit`.
-5. Rewrite the `Nz>1` z-derivative guards in `update.py` with `jax.lax.cond`
-   (flag these with `# JAX-UPGRADE:`).
+**JAX was the original plan but rejected for this machine.** Native-Windows JAX
+is CPU-only (GPU needs WSL2), and the "mechanical swap" premise was false: the
+update functions *mutate arrays in place* (`grid.Hx[...] -= …`), which JAX forbids
+— a full `.at[].set()` rewrite of the whole pipeline. The real, measured problem
+(single-thread NumPy) is better solved by **Numba**.
 
-The one structural obstacle is the CPML auxiliary-array state carried across
-timesteps. In JAX this is handled by `jax.lax.scan` over the time loop, passing
-the full `(grid, cpml)` tuple as the carry.
+Delivered (`wavesim/backend_numba.py`):
+
+- The four hot functions (`update_H/E`, `update_H_pml/E_pml`) reimplemented as
+  explicit-loop `@njit(parallel=True, cache=True)` kernels that mutate the same
+  NumPy arrays in place — **signature-compatible** drop-ins. A single 3D kernel
+  subsumes the `Nz=1` fast path via an `if Nz>1` branch, so the parallel NumPy
+  twin in `update.py`/`pml.py` is no longer the only correct path.
+- Selected per-run via `Simulation(backend='numba')` (default `'numpy'`); the
+  NumPy reference is untouched and serves as the validation oracle.
+- **Parity**: `tests/test_08_numba_parity.py` — bit-identical to NumPy
+  (`max|diff| == 0`) on both the 2D-slice and full-3D paths (no parallel
+  reductions, identical float64 arithmetic).
+- **Speedup** (`tools/benchmark_numba.py`, GTX-1660 box, 12 cores):
+  **~10–12.5× over NumPy** across 48³–128³. The win is dominated by op-fusion
+  (single-thread already ~9×, no NumPy temporaries); the stencil is
+  memory-bandwidth-bound, so threading adds only ~1.4–1.5× and **peaks at 4–6
+  threads** (12 threads is slightly *slower* than 6 — prefer
+  `numba.set_num_threads(4..6)`).
+
+Follow-ups: optional `numba.cuda` GPU kernels for the GTX 1660 (native Windows,
+no WSL2); migrating monitors into the kernels. The slab-compressed CPML `psi`
+layout from §1 carried over unchanged.
 
 ---
 

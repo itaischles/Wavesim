@@ -27,8 +27,9 @@ The `if grid.Nz > 1` branches below are the full-3D path; the `else` branches ar
 a deliberate `Nz=1` fast path that drops the z-derivative entirely (used by the
 2D-slice Tests 00–04 and quick iteration). Both paths are validated — full 3D by
 Tests 05 (coax) and 06 (cavity). They are kept rather than collapsed because the
-fast path is genuinely cheaper for slice runs; the JAX migration (ROADMAP §3)
-will replace each guard with `jax.lax.cond` — search `# JAX-UPGRADE:`.
+fast path is genuinely cheaper for slice runs. The optional Numba backend
+(`wavesim/backend_numba.py`, ROADMAP §3) collapses both into a single 3D kernel
+guarded by a plain `if Nz > 1`, and is bit-identical to this reference.
 """
 
 import numpy as np
@@ -48,7 +49,7 @@ def update_H(grid: FDTDGrid) -> FDTDGrid:
     # ------------------------------------------------------------------
     dEz_dy = (grid.Ez[:, 1:, :] - grid.Ez[:, :-1, :]) / dy
 
-    if grid.Nz > 1:                           # JAX-UPGRADE: -> jax.lax.cond
+    if grid.Nz > 1:
         dEy_dz = (grid.Ey[:, :, 1:] - grid.Ey[:, :, :-1]) / dz
         grid.Hx[:, :-1, :-1] -= (dt / (MU0 * grid.mu_x[:, :-1, :-1])) * (
             dEz_dy[:, :, :-1] - dEy_dz[:, :-1, :]
@@ -61,7 +62,7 @@ def update_H(grid: FDTDGrid) -> FDTDGrid:
     # ------------------------------------------------------------------
     dEz_dx = (grid.Ez[1:, :, :] - grid.Ez[:-1, :, :]) / dx
 
-    if grid.Nz > 1:                           # JAX-UPGRADE: -> jax.lax.cond
+    if grid.Nz > 1:
         dEx_dz = (grid.Ex[:, :, 1:] - grid.Ex[:, :, :-1]) / dz
         grid.Hy[:-1, :, :-1] -= (dt / (MU0 * grid.mu_y[:-1, :, :-1])) * (
             dEx_dz[:-1, :, :] - dEz_dx[:, :, :-1]
@@ -88,7 +89,7 @@ def update_E(grid: FDTDGrid) -> FDTDGrid:
 
     # Ex: dHz/dy - dHy/dz
     dHz_dy = (grid.Hz[:, 1:, :] - grid.Hz[:, :-1, :]) / dy
-    if grid.Nz > 1:                           # JAX-UPGRADE: -> jax.lax.cond
+    if grid.Nz > 1:
         dHy_dz = (grid.Hy[:, :, 1:] - grid.Hy[:, :, :-1]) / dz
         grid.Ex[:, 1:, 1:] += (dt / (EPS0 * grid.eps_x[:, 1:, 1:])) * (
             dHz_dy[:, :, 1:] - dHy_dz[:, 1:, :]
@@ -98,7 +99,7 @@ def update_E(grid: FDTDGrid) -> FDTDGrid:
 
     # Ey: dHx/dz - dHz/dx
     dHz_dx = (grid.Hz[1:, :, :] - grid.Hz[:-1, :, :]) / dx
-    if grid.Nz > 1:                           # JAX-UPGRADE: -> jax.lax.cond
+    if grid.Nz > 1:
         dHx_dz = (grid.Hx[:, :, 1:] - grid.Hx[:, :, :-1]) / dz
         grid.Ey[1:, :, 1:] += (dt / (EPS0 * grid.eps_y[1:, :, 1:])) * (
             dHx_dz[1:, :, :] - dHz_dx[:, :, 1:]
