@@ -24,7 +24,8 @@ The import package is named `wavesim`.
 - **Gaussian sources** (baseband envelope + narrowband/CW recipe).
 - **Diagnostics** — point field, `|E|`/`|H|` magnitude, 2D snapshots, and total
   energy monitors.
-- **Visualisation** — grid/material/PML plots, field snapshots, animations.
+- **Visualisation** — grid/material/PML plots, field snapshots, animations, and
+  full-3D helpers (orthogonal XY/XZ/YZ slice triptych + multi-plane animation).
 - **Validated** — each subsystem is checked against analytic results.
 
 ---
@@ -89,9 +90,10 @@ Wavesim/
 │   ├── pec.py        # PEC faces and interior conductor mask
 │   ├── sources.py    # Gaussian source + pulse evaluation
 │   ├── monitors.py   # field / magnitude / snapshot / energy monitors
-│   ├── viz.py        # all plotting and animation
+│   ├── viz.py        # all plotting and animation (2D + full-3D helpers)
 │   └── constants.py  # C0, EPS0, MU0, ETA0
 ├── tests/            # validated example simulations (run in order)
+├── tools/            # profile_3d.py — memory & runtime profiling harness
 └── docs/             # API_GUIDE.md, HOW_TO_SET_UP.md, design/dev notes
 ```
 
@@ -109,9 +111,14 @@ Run from the project root, in order — each validates one subsystem.
 | `test_03_pec_cavity.py` | PEC cavity resonances vs analytic TM modes (<0.04%) | ✅ |
 | `test_04_waveguide.py`  | Waveguide cutoff: evanescence below, phase velocity above | ✅ |
 | `test_05_coax_tem.py`   | Coaxial TEM mode (first full 3D run, `Nz>1`): 1/r profile, `Z=η₀`, `v=c` | ✅ |
+| `test_06_box_cavity_3d.py` | Volumetric 3D PEC cavity: 14 analytic resonances within 1.5% (10 with `p≥1`, a half-wave along `z`) | ✅ |
 
-Tests 02–05 also save an animated GIF alongside their PNG (both git-ignored,
+Tests 02–06 also save an animated GIF alongside their PNG (both git-ignored,
 regenerated on each run).
+
+A profiling harness, `tools/profile_3d.py`, sweeps cube sizes and reports
+throughput (µs per cell-step) and memory (bytes per cell) for the pure-NumPy
+backend — see [ROADMAP.md](ROADMAP.md) §1/§3 for the headline numbers.
 
 ---
 
@@ -131,9 +138,11 @@ regenerated on each run).
 
 ## Status
 
-v1: a validated 2D-in-3D solver (CPML + PEC) through Test 04, plus Test 05 — the
-first full-3D run (`Nz > 1`), validating the coaxial TEM mode on the same code
-(the engine was already structured for 3D — search `# 3D-UPGRADE:`).
+v1: a validated 2D-in-3D solver (CPML + PEC) through Test 04, plus full 3D —
+Test 05 (coaxial TEM, axial propagation) and Test 06 (rectangular PEC cavity, a
+genuinely volumetric mode varying in all three axes). 3D is validated against
+analytic ground truth, profiled (`tools/profile_3d.py`), and visualised with
+dedicated orthogonal-slice helpers in `viz.py`.
 
 ## What's next
 

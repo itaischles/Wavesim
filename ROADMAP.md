@@ -28,15 +28,26 @@ Checklist (search the codebase for `# 3D-UPGRADE:`):
 
 - [x] z-face CPML allocated and active for `Nz>1` (`pml.py`) — exercised by Test 05.
 - [x] z-face PEC supported (`pec.py` is already parametrised over all six faces).
+- [x] Add a genuinely volumetric 3D validation test — **Test 06** (rectangular
+      PEC cavity) matches 14 analytic resonances within 1.5%, 10 of them with a
+      half-wave along `z` (`p>=1`), so 3D correctness no longer rests on the
+      coax's extruded TEM mode alone.
+- [x] 3D visualisation helpers in `viz.py` — `plot_field_slices_3d`
+      (orthogonal XY/XZ/YZ triptych) and `animate_field_slices_3d` (general
+      multi-plane time animation). Tests 05 and 06 both render through them.
+      (Isosurfaces deferred — slice views cover current needs.)
+- [x] Profile memory and runtime at representative 3D sizes — `tools/profile_3d.py`.
+      Findings: **~0.33 µs/cell-step**, **192 bytes/cell** (half of it the 12
+      full-grid CPML `psi` arrays). Practical pure-NumPy ceiling for runs in the
+      3–5 min budget is ≈100³ (e.g. 96³ fits ~600 steps in 3 min), which is
+      exactly the JAX trigger point in §3. See §3.
 - [ ] Remove / simplify the `Nz>1` z-derivative guards in `update.py` once 3D is
-      the default path (keep them only if the 2D-slice fast path stays valuable).
-- [ ] Add a genuinely volumetric 3D validation test (e.g. a rectangular cavity
-      with at least one `z`-varying mode, or a 3D dipole radiation pattern) so 3D
-      correctness does not rest on the coax alone.
-- [ ] 3D visualisation helpers in `viz.py` (orthogonal slice views / isosurfaces);
-      the current plot helpers assume a single `k`-slice.
-- [ ] Profile memory and runtime at representative 3D sizes; document practical
-      grid-size limits for pure NumPy (see §3).
+      the default path. **Deliberately kept for now**: the `Nz=1` fast path still
+      benefits Tests 00–04 and quick iteration, and the JAX migration (§3) will
+      rewrite these with `jax.lax.cond` regardless.
+- [ ] *(Memory win, flagged not done)* Allocate the CPML `psi` arrays as boundary
+      slabs instead of full volume — would roughly halve the footprint (they are
+      ~50% of total and act only within `d_pml` of each absorbing face).
 
 ---
 
@@ -59,7 +70,9 @@ layer would remove that boilerplate without hiding the physics:
 ## 3. Performance — JAX migration
 
 NumPy is sufficient for v1. Beyond roughly **100³ cells** the per-step array work
-dominates; that is the point to evaluate a JAX backend. The functional design was
+dominates; that is the point to evaluate a JAX backend. This threshold is now
+measured, not guessed — `tools/profile_3d.py` reports ~0.33 µs/cell-step, so a
+96³ grid fits only ~600 steps in a 3-minute budget. The functional design was
 chosen to make this migration mechanical:
 
 1. Register `FDTDGrid` and `CPMLArrays` as JAX pytrees via

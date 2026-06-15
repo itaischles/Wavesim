@@ -490,6 +490,35 @@ fig, ax = plot_materials_xy(grid, component='eps_z', cpml=cpml)
 plt.savefig('materials.png', dpi=120)
 ```
 
+**Full-3D helpers.** The functions above show a single XY (`k`) slice. For an
+`Nz>1` run use the orthogonal-slice triptych and the multi-plane animator. Both
+accept either a component name (`'Ex'..'Hz'`, resolved against the grid) or a raw
+`(Nx,Ny,Nz)` array — e.g. an `|E|` envelope or a temporal-DFT mode shape.
+
+```python
+plot_field_slices_3d(data, grid, component='', i=None, j=None, k=None,
+                     cmap=None, symmetric=None, fig=None, axes=None) -> (fig, axes)
+```
+XY/XZ/YZ slices through `(i, j, k)` (default: domain centre), one shared colour
+scale, crosshairs marking the other cuts. `cmap`/`symmetric` auto-pick a diverging
+or sequential map from the data's sign. Pass `axes=(ax_xy, ax_xz, ax_yz)` to embed
+the triptych in a larger figure (as Test 06 does under its spectrum panel).
+
+```python
+animate_field_slices_3d(panels, times=None, interval_ms=60) -> FuncAnimation
+```
+Animate one or more oriented 2D-plane sequences side by side. Each `panel` is a
+dict: `frames` (list of pre-oriented 2D arrays), `extent` (mm), `xlabel`,
+`ylabel`, `title`, `cmap`, `symmetric`, `aspect`, and optional `vlines`/`hlines`
+markers. Generalises `animate_snapshots` to arbitrary orthogonal cuts; Tests 05
+and 06 build their GIFs with it.
+
+```python
+# Inspect a 3D field component through the domain centre:
+fig, axes = plot_field_slices_3d('Ez', grid)
+plt.savefig('slices.png', dpi=120)
+```
+
 ---
 
 ### constants

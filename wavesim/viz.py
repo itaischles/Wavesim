@@ -8,11 +8,15 @@ INFRASTRUCTURE (no physics required):
     plot_materials_xy()    — 2D colour map of eps/mu + PML overlay + PEC hatch
     plot_source_waveform() — Gaussian pulse time function
 
-FIELD DIAGNOSTICS:
+FIELD DIAGNOSTICS (2D / single slice):
     plot_field_snapshot()  — single 2D field snapshot
     animate_snapshots()    — animation of SnapshotMonitor data
     plot_monitor_time_series() — FieldMonitor or MagnitudeMonitor time series
     plot_energy()          — total energy vs time (log scale)
+
+FIELD DIAGNOSTICS (full 3D):
+    plot_field_slices_3d()    — orthogonal XY/XZ/YZ slice triptych
+    animate_field_slices_3d() — multi-plane time animation (general)
 """
 
 import numpy as np
@@ -360,6 +364,205 @@ def plot_monitor_time_series(monitor, dt: float, ax=None):
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig, ax
+
+
+# ======================================================================= #
+# 3D FIELD VISUALISATIONS
+# ======================================================================= #
+#
+# The helpers above assume a single XY (k) slice — fine for the Nz=1 era and
+# for one transverse plane of a 3D run. The two functions below are the genuine
+# 3D workhorses: an orthogonal-slice triptych through a full (Nx,Ny,Nz) array,
+# and a general multi-plane time animator. Both accept either a field-component
+# name (resolved against the grid) or a raw 3D NumPy array (e.g. a |E| envelope),
+# so derived quantities plot through the same path as raw components.
+
+def _as_3d_array(data, grid: FDTDGrid) -> np.ndarray:
+    """Resolve `data` to a 3D array: a component name -> grid array, else asarray."""
+    if isinstance(data, str):
+        return getattr(grid, data)
+    arr = np.asarray(data)
+    if arr.ndim != 3:
+        raise ValueError(f"expected a 3D array, got shape {arr.shape}")
+    return arr
+
+
+def plot_field_slices_3d(data, grid: FDTDGrid, component: str = '',
+                         i: int = None, j: int = None, k: int = None,
+                         cmap: str = None, symmetric: bool = None,
+                         fig=None, axes=None):
+    """
+    Orthogonal-slice triptych (XY, XZ, YZ) through a 3D field.
+
+    Draws three panels sharing one colour scale, with crosshairs marking where
+    the other two cut planes intersect each view. This is the canonical way to
+    inspect a full 3D run; the existing 2D helpers only see one k-slice.
+
+    Parameters
+    ----------
+    data : str or np.ndarray
+        A field-component name ('Ex'..'Hz') resolved against `grid`, or a raw
+        (Nx,Ny,Nz) array such as a |E| envelope.
+    component : str
+        Label for the colour bar / titles (defaults to `data` when it is a name).
+    i, j, k : int, optional
+        Cut indices for the YZ, XZ, XY planes. Default to the domain centre.
+    cmap : str, optional
+        Colormap. Defaults to 'RdBu_r' for signed data, 'inferno' otherwise.
+    symmetric : bool, optional
+        Force a zero-centred (diverging) scale. Auto-detected from the sign of
+        the data when omitted.
+    fig : matplotlib Figure, optional
+        Figure to draw into (a fresh 1x3 row of axes is created on it). Ignored
+        when `axes` is given.
+    axes : tuple of 3 Axes, optional
+        Pre-existing (ax_xy, ax_xz, ax_yz) to draw into — use this to embed the
+        triptych in a larger multi-panel figure. The caller owns the suptitle.
+
+    Returns
+    -------
+    (fig, (ax_xy, ax_xz, ax_yz))
+    """
+    arr = _as_3d_array(data, grid)
+    label = component or (data if isinstance(data, str) else 'field')
+    Nx, Ny, Nz = arr.shape
+    if i is None: i = Nx // 2
+    if j is None: j = Ny // 2
+    if k is None: k = Nz // 2
+
+    vmax = float(np.max(np.abs(arr)))
+    if vmax < 1e-30:
+        vmax = 1.0
+    if symmetric is None:
+        symmetric = bool(np.any(arr < 0.0))
+    if cmap is None:
+        cmap = 'RdBu_r' if symmetric else 'inferno'
+    vmin = -vmax if symmetric else 0.0
+
+    mm = 1e3
+    Lx, Ly, Lz = Nx * grid.dx * mm, Ny * grid.dy * mm, Nz * grid.dz * mm
+    xi, yj = i * grid.dx * mm, j * grid.dy * mm
+    zk = k * grid.dz * mm
+
+    own_fig = axes is None
+    if own_fig:
+        if fig is None:
+            fig = plt.figure(figsize=(15, 4.6))
+        ax_xy = fig.add_subplot(1, 3, 1)
+        ax_xz = fig.add_subplot(1, 3, 2)
+        ax_yz = fig.add_subplot(1, 3, 3)
+    else:
+        ax_xy, ax_xz, ax_yz = axes
+        fig = ax_xy.figure
+    cross_kw = dict(color='limegreen', lw=0.8, ls='--', alpha=0.8)
+
+    # XY plane at k (transverse cross-section: keep it physically square)
+    im = ax_xy.imshow(arr[:, :, k].T, origin='lower', extent=[0, Lx, 0, Ly],
+                      cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal')
+    ax_xy.axvline(xi, **cross_kw); ax_xy.axhline(yj, **cross_kw)
+    ax_xy.set_xlabel('x (mm)'); ax_xy.set_ylabel('y (mm)')
+    ax_xy.set_title(f'XY plane  (k={k}, z={zk:.1f} mm)')
+
+    # XZ plane at j (z horizontal — usually the long axis)
+    ax_xz.imshow(arr[:, j, :], origin='lower', extent=[0, Lz, 0, Lx],
+                 cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
+    ax_xz.axvline(zk, **cross_kw); ax_xz.axhline(xi, **cross_kw)
+    ax_xz.set_xlabel('z (mm)'); ax_xz.set_ylabel('x (mm)')
+    ax_xz.set_title(f'XZ plane  (j={j}, y={yj:.1f} mm)')
+
+    # YZ plane at i (z horizontal)
+    ax_yz.imshow(arr[i, :, :], origin='lower', extent=[0, Lz, 0, Ly],
+                 cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
+    ax_yz.axvline(zk, **cross_kw); ax_yz.axhline(yj, **cross_kw)
+    ax_yz.set_xlabel('z (mm)'); ax_yz.set_ylabel('y (mm)')
+    ax_yz.set_title(f'YZ plane  (i={i}, x={xi:.1f} mm)')
+
+    cbar = fig.colorbar(im, ax=[ax_xy, ax_xz, ax_yz], pad=0.02, fraction=0.04)
+    cbar.set_label(label, fontsize=10)
+    if own_fig:
+        fig.suptitle(f'{label} — orthogonal slices', fontsize=13)
+    return fig, (ax_xy, ax_xz, ax_yz)
+
+
+def animate_field_slices_3d(panels, times=None, interval_ms: int = 60,
+                            suptitle: str = ''):
+    """
+    Animate one or more oriented 2D-plane time series side by side.
+
+    A general multi-panel imshow animator: each panel is a pre-oriented sequence
+    of 2D frames (already arranged for origin='lower' imshow) plus its physical
+    extent and labels. This generalises `animate_snapshots` (single XY plane) to
+    arbitrary orthogonal cuts of a 3D run — e.g. an XZ propagation view next to a
+    transverse |E| pattern.
+
+    Parameters
+    ----------
+    panels : list of dict, each with keys
+        frames    : list of 2D np.ndarray   (required; already oriented)
+        extent    : [x0, x1, y0, y1] in mm  (required)
+        xlabel, ylabel, title : str
+        cmap      : str   (default 'RdBu_r')
+        symmetric : bool  (default True -> vmin=-vmax; else 0..vmax)
+        aspect    : 'equal' | 'auto'        (default 'auto')
+        vlines    : list of (pos_mm, color) (optional vertical markers)
+        hlines    : list of (pos_mm, color) (optional horizontal markers)
+    times : sequence, optional
+        Per-frame time in seconds; shown (in ns) in the suptitle.
+    interval_ms : int
+        Frame interval passed to FuncAnimation.
+
+    Returns
+    -------
+    matplotlib.animation.FuncAnimation
+        Save with:  anim.save('out.gif', writer='pillow', fps=18)
+    """
+    if not panels:
+        raise ValueError("animate_field_slices_3d needs at least one panel.")
+    nframes = min(len(p['frames']) for p in panels)
+    if nframes == 0:
+        raise ValueError("a panel has no frames.")
+
+    fig, axes = plt.subplots(1, len(panels),
+                             figsize=(6.5 * len(panels), 4.6), squeeze=False)
+    axes = axes[0]
+
+    ims = []
+    for ax, p in zip(axes, panels):
+        frames = p['frames']
+        sym = p.get('symmetric', True)
+        vmax = max((float(np.max(np.abs(f))) for f in frames), default=1e-30)
+        if vmax < 1e-30:
+            vmax = 1.0
+        vmin = -vmax if sym else 0.0
+        im = ax.imshow(frames[0], origin='lower', extent=p['extent'],
+                       cmap=p.get('cmap', 'RdBu_r'),
+                       vmin=vmin, vmax=vmax,
+                       aspect=p.get('aspect', 'auto'), animated=True)
+        for pos, col in p.get('vlines', []):
+            ax.axvline(pos, color=col, ls=':', lw=1)
+        for pos, col in p.get('hlines', []):
+            ax.axhline(pos, color=col, ls=':', lw=1)
+        ax.set_xlabel(p.get('xlabel', '')); ax.set_ylabel(p.get('ylabel', ''))
+        ax.set_title(p.get('title', ''))
+        fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
+        ims.append(im)
+
+    sup = fig.suptitle('')
+
+    def _update(fr):
+        for im, p in zip(ims, panels):
+            im.set_data(p['frames'][fr])
+        txt = suptitle
+        if times is not None and fr < len(times):
+            txt = (f'{suptitle}   ' if suptitle else '') + \
+                  f't = {times[fr]*1e9:.3f} ns  (frame {fr+1}/{nframes})'
+        sup.set_text(txt)
+        return (*ims, sup)
+
+    anim = animation.FuncAnimation(fig, _update, frames=nframes,
+                                   interval=interval_ms, blit=False)
+    plt.tight_layout()
+    return anim
 
 
 def plot_energy(monitor, dt: float, ax=None):

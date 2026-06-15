@@ -60,6 +60,7 @@ from wavesim.pec import apply_pec_mask
 from wavesim.sources import GaussianSource, gaussian_pulse
 from wavesim.monitors import FieldMonitor, record_field
 from wavesim.constants import C0, ETA0
+from wavesim import viz
 
 # ---------------------------------------------------------------------- #
 # Geometry / problem constants (all lengths in metres unless _C suffix)
@@ -388,48 +389,31 @@ def _make_figure(res, slope, corr_invr, r_m, e_r, model,
 
 
 def _make_animation(res, dt):
+    """Axial-propagation (XZ) + transverse-pattern (XY) animation.
+
+    Built with the shared wavesim.viz.animate_field_slices_3d helper (the same
+    multi-plane animator Test 06 uses), instead of a bespoke FuncAnimation.
+    """
     print("Saving animation...")
-    import matplotlib.animation as animation
     mm = 1e3
-
-    xz = res['xz_snaps']
-    xy = res['xy_snaps']
-    nframes = min(len(xz), len(xy))
-    vmax_xz = max((np.max(np.abs(s)) for s in xz), default=1e-30)
-    vmax_xy = max((np.max(s) for s in xy), default=1e-30)
-
-    ext_xz = [0, NZ * DX * mm, 0, NX * DX * mm]
-    ext_xy = [0, NX * DX * mm, 0, NY * DX * mm]
-
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 4.5))
-    imL = axL.imshow(xz[0], origin='lower', extent=ext_xz, cmap='RdBu_r',
-                     aspect='auto', vmin=-vmax_xz, vmax=vmax_xz, animated=True)
-    axL.set_xlabel('z (mm)'); axL.set_ylabel('x (mm)')
-    axL.set_title('Ex — axial propagation (XZ slice)')
-    for kk, c in [(K_SRC, 'k'), (K_MEAS, 'm')]:
-        axL.axvline(kk * DX * mm, color=c, ls=':', lw=1)
-    plt.colorbar(imL, ax=axL, pad=0.02, fraction=0.046)
-
-    imR = axR.imshow(xy[0].T, origin='lower', extent=ext_xy, cmap='inferno',
-                     aspect='equal', vmin=0, vmax=vmax_xy, animated=True)
-    _conductor_circles(axR, mm, lw=1.0)
-    axR.set_xlabel('x (mm)'); axR.set_ylabel('y (mm)')
-    axR.set_title(f'|E| transverse pattern (k={K_MEAS})')
-    plt.colorbar(imR, ax=axR, pad=0.02, fraction=0.046)
-    sup = fig.suptitle('')
-
-    def _update(fr):
-        imL.set_data(xz[fr])
-        imR.set_data(xy[fr].T)
-        sup.set_text(f't = {res["xz_times"][fr]*1e9:.3f} ns  '
-                     f'(frame {fr+1}/{nframes})')
-        return imL, imR, sup
-
-    anim = animation.FuncAnimation(fig, _update, frames=nframes,
-                                   interval=60, blit=False)
+    panels = [
+        dict(frames=res['xz_snaps'],                      # Ex on XZ centre slice
+             extent=[0, NZ * DX * mm, 0, NX * DX * mm],
+             xlabel='z (mm)', ylabel='x (mm)',
+             title='Ex — axial propagation (XZ slice)',
+             cmap='RdBu_r', symmetric=True, aspect='auto',
+             vlines=[(K_SRC * DX * mm, 'k'), (K_MEAS * DX * mm, 'm')]),
+        dict(frames=[s.T for s in res['xy_snaps']],       # |E_t| transverse
+             extent=[0, NX * DX * mm, 0, NY * DX * mm],
+             xlabel='x (mm)', ylabel='y (mm)',
+             title=f'|E| transverse pattern (k={K_MEAS})',
+             cmap='inferno', symmetric=False, aspect='equal'),
+    ]
+    anim = viz.animate_field_slices_3d(panels, times=res['xz_times'],
+                                       interval_ms=60)
     gif = os.path.join(os.path.dirname(__file__), 'test_05_animation.gif')
     anim.save(gif, writer='pillow', fps=18)
-    plt.close(fig)
+    plt.close('all')
     print(f"Animation saved to: {gif}")
 
 
