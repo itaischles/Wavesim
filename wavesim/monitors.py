@@ -80,18 +80,18 @@ def record_magnitude(monitor: MagnitudeMonitor, grid: FDTDGrid) -> MagnitudeMoni
 @dataclass
 class SnapshotMonitor:
     """Capture a 2D slice of a field component at regular intervals."""
-    component: str
-    k_slice: int        # which z-index to capture (use 0 for Nz=1)
-    interval: int       # record every N timesteps
+    component: str      # 'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'
+    at_z_index: int     # which z-index to capture (use 0 for Nz=1)
+    every_N_steps: int  # record every N timesteps
     snapshots:   list = field(default_factory=list)
     snap_times:  list = field(default_factory=list)
 
 
 def record_snapshot(monitor: SnapshotMonitor, grid: FDTDGrid) -> SnapshotMonitor:
     """Append a 2D slice to the snapshot list if this is a recording timestep."""
-    if grid.time_step % monitor.interval == 0:
+    if grid.time_step % monitor.every_N_steps == 0:
         arr = getattr(grid, monitor.component)
-        monitor.snapshots.append(arr[:, :, monitor.k_slice].copy())
+        monitor.snapshots.append(arr[:, :, monitor.at_z_index].copy())
         monitor.snap_times.append(grid.time_step * _get_dt(grid))
     return monitor
 

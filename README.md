@@ -4,11 +4,11 @@ A compact, validated **FDTD electromagnetic solver** in Python + NumPy, with an
 optional multithreaded **Numba** backend (~10–12× faster, same results).
 
 Wavesim integrates Maxwell's equations on a Yee grid with a functional design:
-one `FDTDGrid` state object and a set of pure functions that advance it. Tests
-00–04 run the full 3D arrays as a thin 2D slice (`Nz = 1`); Test 05 is the first
-true 3D run (`Nz > 1`), exercising the 3D curl and z-face CPML on the same code.
-Boundaries are **CPML** (convolutional perfect matched layer) and **PEC**
-(perfect electric conductor); sources are soft-injected Gaussian pulses.
+one `FDTDGrid` state object and a set of pure functions that advance it. The full
+3D arrays can run as a thin 2D slice (`Nz = 1`) or as a true 3D domain (`Nz > 1`)
+on the same code. Boundaries are **CPML** (convolutional perfect matched layer)
+and **PEC** (perfect electric conductor); sources are soft-injected Gaussian
+pulses.
 
 The import package is named `wavesim`.
 
@@ -47,10 +47,9 @@ conda activate wavesim
 conda install -n wavesim numpy matplotlib scipy pillow -y
 pip install numba          # optional — only for the faster backend='numba'
 
-# 2. clone & run
+# 2. clone
 git clone https://github.com/itaischles/Wavesim.git
 cd Wavesim
-python tests/test_02_free_space.py
 ```
 
 A minimal free-space pulse:
@@ -120,37 +119,8 @@ Wavesim/
 │   ├── simulation.py    # Simulation class — runs the canonical loop (backend='numpy'|'numba')
 │   ├── viz.py           # all plotting and animation (2D + full-3D helpers)
 │   └── constants.py     # C0, EPS0, MU0, ETA0
-├── tests/            # validated example simulations (run in order)
-├── tools/            # profile_3d.py (NumPy profiling) + benchmark_numba.py (NumPy vs Numba)
 └── docs/             # API_GUIDE.md, HOW_TO_SET_UP.md, design/dev notes
 ```
-
----
-
-## Tests
-
-Run from the project root, in order — each validates one subsystem.
-
-| Test | What it validates | Status |
-|------|-------------------|--------|
-| `test_00_grid_viz.py`   | Yee grid / material / PML visualisation (no physics) | ✅ |
-| `test_01_source_viz.py` | Gaussian source waveform & bandwidth | ✅ |
-| `test_02_free_space.py` | Pulse propagation + CPML absorption + symmetry | ✅ |
-| `test_03_pec_cavity.py` | PEC cavity resonances vs analytic TM modes (<0.04%) | ✅ |
-| `test_04_waveguide.py`  | Waveguide cutoff: evanescence below, phase velocity above | ✅ |
-| `test_05_coax_tem.py`   | Coaxial TEM mode (first full 3D run, `Nz>1`): 1/r profile, `Z=η₀`, `v=c` | ✅ |
-| `test_06_box_cavity_3d.py` | Volumetric 3D PEC cavity: 14 analytic resonances within 1.5% (10 with `p≥1`, a half-wave along `z`) | ✅ |
-| `test_07_simulation_api.py` | v2 `Simulation`/`Source` API tutorial: open-boundary absorption + symmetry, bit-identical to the manual loop | ✅ |
-| `test_08_numba_parity.py` | Numba backend reproduces the NumPy solver bit-for-bit (`max\|diff\|=0`) on both the 2D-slice and full-3D paths | ✅ |
-
-Tests 02–07 also save an animated GIF alongside their PNG (both git-ignored,
-regenerated on each run).
-
-Two profiling harnesses live in `tools/`: `profile_3d.py` sweeps cube sizes and
-reports throughput (µs per cell-step) and memory (bytes per cell) for the NumPy
-backend; `benchmark_numba.py` compares NumPy vs Numba throughput and multicore
-scaling (~10–12× at 3D sizes). See [ROADMAP.md](ROADMAP.md) §1/§3 for the
-headline numbers.
 
 ---
 
@@ -159,26 +129,22 @@ headline numbers.
 - **[docs/API_GUIDE.md](docs/API_GUIDE.md)** — comprehensive user-facing API
   reference with worked examples.
 - **[docs/HOW_TO_SET_UP.md](docs/HOW_TO_SET_UP.md)** — environment setup (conda
-  + VS Code) and how to run the tests.
+  + VS Code) and how to run a simulation.
 - **[ROADMAP.md](ROADMAP.md)** — what's planned next (nonuniform grid, mode
   solver) and what's landed (v2 `Simulation`/`Source` layer, the Numba backend).
-- **[DEBUG_NOTES_test02_pml.md](DEBUG_NOTES_test02_pml.md)**,
-  **[PML_NOTES_2026-06-12_independent_faces.md](PML_NOTES_2026-06-12_independent_faces.md)**
-  — CPML implementation notes.
 
 ---
 
 ## Status
 
-v1: a validated 2D-in-3D solver (CPML + PEC) through Test 04, plus full 3D —
-Test 05 (coaxial TEM, axial propagation) and Test 06 (rectangular PEC cavity, a
-genuinely volumetric mode varying in all three axes). 3D is validated against
-analytic ground truth, profiled (`tools/profile_3d.py`), and visualised with
-dedicated orthogonal-slice helpers in `viz.py`.
+v1: a validated 2D-in-3D solver (CPML + PEC), plus full 3D — coaxial TEM (axial
+propagation) and a rectangular PEC cavity (a genuinely volumetric mode varying in
+all three axes). 3D is validated against analytic ground truth, profiled, and
+visualised with dedicated orthogonal-slice helpers in `viz.py`.
 
 ## What's next
 
 See **[ROADMAP.md](ROADMAP.md)** — making full 3D first-class, a nonuniform
 rectilinear grid, and a waveguide-port mode solver with modal injection. (The v2
 `Simulation`/`Source` orchestration layer and the optional ~10–12× Numba backend
-have landed — see `test_07_simulation_api.py` and `test_08_numba_parity.py`.)
+have landed.)

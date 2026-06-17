@@ -36,8 +36,6 @@ def apply_pec_faces(grid: FDTDGrid,
     - x-face: tangential = Ey, Ez
     - y-face: tangential = Ex, Ez
     - z-face: tangential = Ex, Ey
-
-    # 3D-UPGRADE: z faces already supported — no changes needed.
     """
     for face in faces:
         if face == 'x0':
@@ -76,8 +74,6 @@ def apply_pec_mask(grid: FDTDGrid) -> FDTDGrid:
     For v1, all E components where pec_mask[i,j,k] == True are zeroed.
     This is sufficient for most geometries. A more accurate surface treatment
     (zeroing only tangential components at the exact Yee face) can be added in v2.
-
-    # 3D-UPGRADE: no changes needed — operates on full 3D mask.
     """
     if grid.pec_mask is None:
         return grid

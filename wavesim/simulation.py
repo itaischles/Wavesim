@@ -1,5 +1,5 @@
 """
-simulation.py — Simulation orchestration class (v2 API, ROADMAP §2).
+simulation.py — Simulation orchestration class.
 
 A thin wrapper that runs the canonical FDTD time loop so scripts don't have to
 re-type it. It *orchestrates* the existing pure functions — it does not replace
@@ -8,28 +8,20 @@ them or hide the physics. Anything you can do by hand you can still do by hand;
 monitors, and the PEC-face list, and steps them in the fixed order:
 
     update_H → update_H_pml → update_E → update_E_pml
-             → apply_pec_faces → apply_pec_mask
-             → sources.inject → monitors.record → time_step += 1
-
-This is exactly the order documented in docs/API_GUIDE.md §4; see that section
-for why it must not be reordered.
+    → apply_pec_faces → apply_pec_mask
+    → sources.inject → monitors.record → time_step += 1
 
 Example
 -------
-    from wavesim.grid import create_grid
-    from wavesim.materials import set_vacuum
-    from wavesim.pml import init_cpml
-    from wavesim.sources import PointSource, make_source_for_fmax
-    from wavesim.monitors import SnapshotMonitor
-    from wavesim.simulation import Simulation
+    import wavesim as ws
 
-    grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)
-    grid = set_vacuum(grid)
-    cpml = init_cpml(grid, d_pml=10)
+    grid = ws.create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)
+    grid = ws.set_vacuum(grid)
+    cpml = ws.init_cpml(grid, d_pml=10)
 
-    sim = Simulation(grid, cpml=cpml)
-    sim.add_source(PointSource('Ez', 100, 100, 0, make_source_for_fmax(10e9)))
-    snap = sim.add_monitor(SnapshotMonitor('Ez', k_slice=0, interval=20))
+    sim = ws.Simulation(grid, cpml=cpml)
+    sim.add_source(ws.PointSource('Ez', 100, 100, 0, ws.GaussianPulse.for_fmax(10e9)))
+    snap = sim.add_monitor(ws.SnapshotMonitor('Ez', k_slice=0, interval=20))
     sim.run(2000)
     # snap.snapshots now holds the recorded frames; sim.grid is the final state.
 """
@@ -49,7 +41,7 @@ from wavesim.monitors import (
 
 
 # Map each monitor type to its recorder. Keeps the monitors as plain data
-# (the functional v1 design) while letting the loop dispatch uniformly.
+# while letting the loop dispatch uniformly.
 _RECORDERS = {
     FieldMonitor:     record_field,
     MagnitudeMonitor: record_magnitude,
@@ -203,8 +195,6 @@ class Simulation:
             * ``1`` — print a rolling one-line status to stderr,
               ``step n/N (pct) | steps/s | sim-time | ETA``, updated in place and
               throttled to ~10 Hz so it adds negligible overhead to the loop.
-
-            Higher levels are reserved for future, more detailed output.
 
         Returns
         -------

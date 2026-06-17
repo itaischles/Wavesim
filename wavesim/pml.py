@@ -24,9 +24,8 @@ profile also has b = 1, so an interior psi cell initialised to 0 stays exactly
 compressed along its derivative axis to just those active boundary indices
 (`sel_*` below) — typically ~2*d_pml cells instead of the full axis length,
 which roughly halves the total solver footprint at large 3D sizes (the 12
-psi arrays were the dominant term; see tools/profile_3d.py). The result is
-bit-identical to a full-volume allocation because every cell we drop held an
-identical 0.0.
+psi arrays were the dominant term). The result is bit-identical to a
+full-volume allocation because every cell we drop held an identical 0.0.
 
 CRITICAL — coefficient consistency with update.py
 --------------------------------------------------

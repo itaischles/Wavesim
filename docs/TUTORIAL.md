@@ -4,7 +4,7 @@ This is a **build-along** tutorial. By the end you will have written, from a bla
 file, a handful of complete FDTD scripts of your own and you will understand
 *what* each line does, *why* it is there, and *how* it fits the whole. It exists
 so you (and anyone new to the codebase) can take ownership of the engine instead
-of copy-pasting from the tests.
+of copy-pasting from examples.
 
 > **How this differs from the other docs.** [`API_GUIDE.md`](API_GUIDE.md) is the
 > *reference* — every function, every argument, terse and exhaustive. This file is
@@ -112,7 +112,7 @@ from wavesim.materials import set_vacuum
 from wavesim.update import update_H, update_E
 from wavesim.pml import init_cpml, update_H_pml, update_E_pml
 from wavesim.pec import apply_pec_mask
-from wavesim.sources import make_source_for_fmax, gaussian_pulse
+from wavesim.sources import GaussianPulse
 from wavesim.monitors import SnapshotMonitor, record_snapshot
 
 grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)
@@ -170,17 +170,17 @@ subset — crucial when some faces are real walls (we'll do that in §5).
 ### 1.3 The source waveform
 
 ```python
-src = make_source_for_fmax(10e9)        # a Gaussian pulse with energy up to ~10 GHz
+src = GaussianPulse.for_fmax(10e9)      # a Gaussian pulse with energy up to ~10 GHz
 ```
 
 **What:** a time waveform — the shape of the "kick" we inject each step. A
-`GaussianSource` is a smooth bump in time; its Fourier transform is a smooth bump in
+`GaussianPulse` is a smooth bump in time; its Fourier transform is a smooth bump in
 frequency, so it excites a band of frequencies up to roughly `f_max`.
 
-**Why `make_source_for_fmax`:** it picks the pulse `width` and centre time `t0` for
+**Why `GaussianPulse.for_fmax`:** it picks the pulse `width` and centre time `t0` for
 you so the pulse (i) carries energy up to `f_max` and (ii) starts from ~zero at
 `t=0` (a pulse that's already half-on at `t=0` injects a nasty step). You *can*
-build `GaussianSource(t0=..., width=...)` by hand, but let the helper do it.
+build `GaussianPulse(t0=..., width=...)` by hand, but let the helper do it.
 
 A waveform is just **any callable `f(t) -> float`**. For a single-frequency
 (narrowband) experiment you supply your own carrier-modulated lambda — we do that
@@ -215,7 +215,7 @@ for n in range(N_STEPS):
 
     grid = apply_pec_mask(grid)                 # 5. enforce conductors (no-op here)
 
-    grid.Ez[i_src, j_src, 0] += gaussian_pulse(src, t)   # 6. SOFT injection (+=)
+    grid.Ez[i_src, j_src, 0] += src(t)                   # 6. SOFT injection (+=)
 
     record_snapshot(snap, grid)                 # 7. record
     grid.time_step += 1                         # 8. advance the clock
@@ -290,7 +290,7 @@ from wavesim.materials import set_vacuum
 from wavesim.update import update_H, update_E
 from wavesim.pml import init_cpml, update_H_pml, update_E_pml
 from wavesim.pec import apply_pec_mask
-from wavesim.sources import make_source_for_fmax, gaussian_pulse
+from wavesim.sources import GaussianPulse
 from wavesim.monitors import SnapshotMonitor, record_snapshot
 from wavesim.viz import plot_field_snapshot, animate_snapshots
 
@@ -298,7 +298,7 @@ grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)
 grid = set_vacuum(grid)
 cpml = init_cpml(grid, d_pml=10)
 
-src  = make_source_for_fmax(10e9)
+src  = GaussianPulse.for_fmax(10e9)
 snap = SnapshotMonitor(component='Ez', k_slice=0, interval=20)
 
 N_STEPS = 2000
@@ -308,7 +308,7 @@ for n in range(N_STEPS):
     grid = update_H(grid);  grid, cpml = update_H_pml(grid, cpml)
     grid = update_E(grid);  grid, cpml = update_E_pml(grid, cpml)
     grid = apply_pec_mask(grid)
-    grid.Ez[i_src, j_src, 0] += gaussian_pulse(src, t)
+    grid.Ez[i_src, j_src, 0] += src(t)
     record_snapshot(snap, grid)
     grid.time_step += 1
 
@@ -337,7 +337,7 @@ import matplotlib.pyplot as plt
 from wavesim.grid import create_grid
 from wavesim.materials import set_vacuum
 from wavesim.pml import init_cpml
-from wavesim.sources import PointSource, make_source_for_fmax
+from wavesim.sources import PointSource, GaussianPulse
 from wavesim.monitors import SnapshotMonitor
 from wavesim.simulation import Simulation
 from wavesim.viz import animate_snapshots
@@ -347,7 +347,7 @@ grid = set_vacuum(grid)
 cpml = init_cpml(grid, d_pml=10)
 
 sim  = Simulation(grid, cpml=cpml)
-sim.add_source(PointSource('Ez', 100, 100, 0, make_source_for_fmax(10e9)))
+sim.add_source(PointSource('Ez', 100, 100, 0, GaussianPulse.for_fmax(10e9)))
 snap = sim.add_monitor(SnapshotMonitor('Ez', k_slice=0, interval=20))
 
 sim.run(2000, verbose=1)             # verbose=1 prints a live progress line
@@ -414,13 +414,13 @@ Two built-in options plus "roll your own":
 a whole spectrum, or watch a wavefront:
 
 ```python
-from wavesim.sources import make_source_for_fmax, GaussianSource
+from wavesim.sources import GaussianPulse
 
-wf = make_source_for_fmax(10e9)                     # auto width & t0 up to 10 GHz
-wf = GaussianSource(t0=0.5e-9, width=0.05e-9)       # or set them by hand
+wf = GaussianPulse.for_fmax(10e9)                   # auto width & t0 up to 10 GHz
+wf = GaussianPulse(t0=0.5e-9, width=0.05e-9)        # or set them by hand
 ```
 
-`GaussianSource` is **callable** — `wf(t)` gives the value — so it plugs straight into
+`GaussianPulse` is **callable** — `wf(t)` gives the value — so it plugs straight into
 any source object.
 
 **Narrowband / single-frequency** (a tone) — use this to excite one waveguide mode or
@@ -433,16 +433,18 @@ f0, tau, t0 = 9e9, 6/9e9, 3.5*(6/9e9)
 cw = lambda t: np.sin(2*np.pi*f0*(t - t0)) * np.exp(-0.5*((t - t0)/tau)**2)
 ```
 
-**Why the distinction matters:** a bare `gaussian_pulse` is a *baseband* pulse
+**Why the distinction matters:** a bare `GaussianPulse` is a *baseband* pulse
 centred at DC. If you wanted "9 GHz only" and used a bare Gaussian, you'd inject a
 huge band from DC upward and your result would be a smear. Multiplying by
 `sin(2π f0 t)` shifts the energy up to `f0`.
 
-You can preview any waveform before committing to a long run:
+A waveform is just a callable, so you can sample it directly to inspect it before
+committing to a long run:
 
 ```python
-from wavesim.viz import plot_source_waveform
-plot_source_waveform(wf, grid.dt, n_steps=2000)     # also prints estimated bandwidth
+import numpy as np
+t = np.arange(2000) * grid.dt
+values = np.array([wf(ti) for ti in t])             # sample the pulse to plot / check
 ```
 
 ### 3.2 The placement (the "where" + "which field")
@@ -458,15 +460,16 @@ from wavesim.sources import PointSource, ArraySource
 pt = PointSource('Ez', 100, 100, 0, wf)
 ```
 
-**`ArraySource(component, profile, waveform)`** — a *distributed* drive. You supply a
-`(Nx, Ny, Nz)` array of weights; each step adds `waveform(t) * profile`. This is how
-you make line sources, planar sources, shaped beams, or modal drives:
+**`ArraySource(profiles, waveform)`** — a *distributed* drive. You supply a
+`{component: (Nx, Ny, Nz)}` mapping of weights (or a single `(component, array)`
+pair); each step adds `waveform(t) * weights` to every named component. This is how
+you make line sources, planar sources, shaped beams, modal or multi-component drives:
 
 ```python
 import numpy as np
 profile = np.zeros((grid.Nx, grid.Ny, grid.Nz))
 profile[20, :, 0] = 1.0                  # a transverse LINE at i=20 (a waveguide feed)
-line = ArraySource('Ez', profile, cw)
+line = ArraySource({'Ez': profile}, cw)
 ```
 
 ```
@@ -483,14 +486,17 @@ line = ArraySource('Ez', profile, cw)
 
 **Which component?** `'Ez'` for a 2D TMz slice is the natural choice (it's the live E
 component). In full 3D you might drive `'Ex'`/`'Ey'`/`'Ez'` to set polarisation, or
-even an H component. The string must name a real field array on the grid.
+even an H component. Each key must name a real field array on the grid — and an
+`ArraySource` can name **several at once** (e.g. `{'Ex': wx, 'Ey': wy}`) to drive a
+vector mode like a coaxial TEM feed.
 
 ### 3.3 Fully custom sources
 
-If neither point nor array fits, subclass `Source` and implement `time_function(t)`
-and `spatial_profile(grid)`. The base class caches the profile and does the soft add
-for you. You rarely need this — `ArraySource` covers most "shaped" cases — but it's
-there when you want the geometry computed from the grid itself.
+If neither point nor array fits, subclass `Source` and implement
+`spatial_profiles(grid)` — a `{component: weights}` mapping computed from the grid.
+The base class caches the profiles, multiplies by `waveform(t)`, and does the soft
+add for you. You rarely need this — `ArraySource` covers most "shaped" cases — but
+it's there when you want the geometry computed from the grid itself.
 
 ---
 
@@ -702,13 +708,13 @@ plots** (after).
 ```python
 viz.plot_grid_xy(grid, cpml=cpml)                 # Yee cell layout; shades the PML
 viz.plot_materials_xy(grid, component='eps_z', cpml=cpml)  # geometry + PEC hatch
-viz.plot_source_waveform(wf, grid.dt, n_steps=2000)        # does the pulse fit? bandwidth?
 plt.savefig('setup.png', dpi=120)
 ```
 
 If `plot_materials_xy` doesn't show your slab where you expect, you saved the run.
-`plot_source_waveform` prints the estimated bandwidth and the residual amplitude at
-both ends of the window — a fat residual means the pulse is clipped.
+To check the pulse fits the window, sample the waveform yourself — `wf(0.0)` and
+`wf(n_steps*grid.dt)` should both be a small fraction of the peak (a fat residual
+means the pulse is clipped).
 
 ### 7.2 Result plots — 2D
 
@@ -738,7 +744,7 @@ and accept either a component name (`'Ez'`) or a raw `(Nx,Ny,Nz)` array:
 
 ```python
 viz.plot_field_slices_3d('Ez', grid)              # XY / XZ / YZ triptych through centre
-# or an oriented multi-panel animation — see §8 and tests 05/06
+# or an oriented multi-panel animation — see §8
 ```
 
 ---
@@ -756,7 +762,7 @@ grid = set_vacuum(grid)
 cpml = init_cpml(grid, d_pml=10, faces=ALL_FACES)     # z-faces now matter too
 
 sim = Simulation(grid, cpml=cpml)
-sim.add_source(PointSource('Ez', 30, 30, 30, make_source_for_fmax(20e9)))
+sim.add_source(PointSource('Ez', 30, 30, 30, GaussianPulse.for_fmax(20e9)))
 snap = ...                                            # see below
 sim.run(400, verbose=1)
 ```
@@ -785,8 +791,8 @@ plt.savefig('slices3d.png', dpi=120)
    └──────────┘   └──────────┘   └──────────┘
 ```
 
-`test_05_coax_tem.py` and `test_06_box_cavity_3d.py` are full worked 3D examples
-(including building animations with `animate_field_slices_3d`) — read them once you've
+A coaxial TEM line and a rectangular PEC box cavity are natural full 3D examples
+(including building animations with `animate_field_slices_3d`) — try one once you've
 done your own small 3D run.
 
 ---
@@ -803,8 +809,8 @@ sim = Simulation(grid, cpml=cpml, backend='numba')   # ~10–12× faster on 3D s
 
 **What you need to know:**
 
-- It is **bit-for-bit identical** to `'numpy'` (verified by `test_08_numba_parity.py`)
-  — same physics, just faster. PEC, sources, and monitors are backend-independent.
+- It is **bit-for-bit identical** to `'numpy'` — same physics, just faster.
+  PEC, sources, and monitors are backend-independent.
 - The **first step pays a one-time JIT compile** (a few seconds). Don't benchmark step 1.
 - It's only worth it for 3D / large grids. For a 2D `200²` slice, NumPy is fine and
   the compile overhead isn't worth paying.
@@ -836,7 +842,7 @@ The recipe:
 3. `init_cpml` on all faces (it's open free space).
 4. An `ArraySource` driving a **vertical line** of `Ez` near the left edge — that
    launches a roughly planar wavefront travelling in +x.
-5. A broadband `make_source_for_fmax` waveform.
+5. A broadband `GaussianPulse.for_fmax` waveform.
 6. A `SnapshotMonitor` and an `EnergyMonitor`.
 7. `plot_materials_xy` to confirm geometry, then `sim.run`, then a GIF.
 
@@ -852,7 +858,7 @@ import matplotlib.pyplot as plt
 from wavesim.grid import create_grid
 from wavesim.materials import set_vacuum, set_cylinder
 from wavesim.pml import init_cpml
-from wavesim.sources import ArraySource, make_source_for_fmax
+from wavesim.sources import ArraySource, GaussianPulse
 from wavesim.monitors import SnapshotMonitor, EnergyMonitor
 from wavesim.simulation import Simulation
 import wavesim.viz as viz
@@ -869,8 +875,8 @@ cpml = init_cpml(grid, d_pml=12)
 # 4–5. a transverse line source near the left edge -> a quasi-plane wave in +x
 profile = np.zeros((grid.Nx, grid.Ny, grid.Nz))
 profile[15, :, 0] = 1.0
-wave = make_source_for_fmax(12e9)
-plane = ArraySource('Ez', profile, wave)
+wave = GaussianPulse.for_fmax(12e9)
+plane = ArraySource({'Ez': profile}, wave)
 
 # confirm geometry BEFORE running
 viz.plot_materials_xy(grid, component='eps_z', cpml=cpml)
@@ -919,7 +925,5 @@ Before every `run`, walk this list — it catches almost every "wrong physics" b
       **`time_step += 1`** every step.
 
 For the exhaustive argument-by-argument reference, see [`API_GUIDE.md`](API_GUIDE.md).
-For installation, [`HOW_TO_SET_UP.md`](HOW_TO_SET_UP.md). The `tests/` directory is the
-other great teacher — each `test_0N_*.py` is a validated, commented worked example,
-and they're numbered in increasing order of difficulty.
+For installation, [`HOW_TO_SET_UP.md`](HOW_TO_SET_UP.md).
 ```

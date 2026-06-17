@@ -10,7 +10,7 @@ This top-level package re-exports the public API so a script needs only::
     cpml = ws.init_cpml(grid, d_pml=10)
 
     sim = ws.Simulation(grid, cpml=cpml)
-    sim.add_source(ws.PointSource('Ez', 100, 100, 0, ws.make_source_for_fmax(10e9)))
+    sim.add_source(ws.PointSource('Ez', 100, 100, 0, ws.GaussianPulse.for_fmax(10e9)))
     snap = sim.add_monitor(ws.SnapshotMonitor('Ez', k_slice=0, interval=20))
     sim.run(2000)
 
@@ -38,8 +38,8 @@ from wavesim.pml import (
 )
 from wavesim.pec import apply_pec_faces, apply_pec_mask
 from wavesim.sources import (
-    GaussianSource, gaussian_pulse, make_source_for_fmax,
-    Source, PointSource, ArraySource,
+    Waveform, GaussianPulse,
+    Source, PointSource, ArraySource, PlaneSource, LineSource, VolumeSource,
 )
 from wavesim.monitors import (
     FieldMonitor, MagnitudeMonitor, SnapshotMonitor, EnergyMonitor,
@@ -55,7 +55,7 @@ __version__ = "0.2.0"
 # importing matplotlib at package-import time.
 _LAZY = {
     name: "wavesim.viz" for name in (
-        "plot_grid_xy", "plot_materials_xy", "plot_source_waveform",
+        "plot_grid_xy", "plot_materials_xy",
         "plot_field_snapshot", "animate_snapshots", "plot_monitor_time_series",
         "plot_field_slices_3d", "animate_field_slices_3d", "plot_energy",
     )
@@ -88,8 +88,8 @@ __all__ = [
     # pec
     "apply_pec_faces", "apply_pec_mask",
     # sources
-    "GaussianSource", "gaussian_pulse", "make_source_for_fmax",
-    "Source", "PointSource", "ArraySource",
+    "Waveform", "GaussianPulse",
+    "Source", "PointSource", "ArraySource", "PlaneSource", "LineSource", "VolumeSource",
     # monitors
     "FieldMonitor", "MagnitudeMonitor", "SnapshotMonitor", "EnergyMonitor",
     "record_field", "record_magnitude", "record_snapshot", "record_energy",

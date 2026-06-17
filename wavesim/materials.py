@@ -38,6 +38,24 @@ def set_vacuum(grid: FDTDGrid) -> FDTDGrid:
     grid.mu_z[:]  = 1.0
     return grid
 
+def set_dielectric(grid: FDTDGrid,
+                   EPS_X: float, EPS_Y: float = None, EPS_Z: float = None) -> FDTDGrid:
+    """
+    Set entire domain to uniform dielectric with specified epsilon values.
+    If EPS_Y or EPS_Z are not provided, they default to EPS_X.
+    """
+    if EPS_Y is None:
+        EPS_Y = EPS_X
+    if EPS_Z is None:
+        EPS_Z = EPS_X
+
+    grid.eps_x[:] = EPS_X
+    grid.eps_y[:] = EPS_Y
+    grid.eps_z[:] = EPS_Z
+    grid.mu_x[:]  = 1.0
+    grid.mu_y[:]  = 1.0
+    grid.mu_z[:]  = 1.0
+    return grid
 
 def set_material_arrays(grid: FDTDGrid,
                         eps_x: np.ndarray, eps_y: np.ndarray, eps_z: np.ndarray,
@@ -100,8 +118,6 @@ def set_box(grid: FDTDGrid,
     pec : bool
         If True, mark the region as PEC in grid.pec_mask instead of
         writing eps/mu values.
-
-    # 3D-UPGRADE: z0/z1 range is already honoured — no changes needed.
     """
     i0 = _metre_to_cell(x0, grid.dx)
     i1 = _metre_to_cell(x1, grid.dx)
@@ -153,8 +169,6 @@ def set_cylinder(grid: FDTDGrid,
         Material properties (ignored when pec=True).
     pec : bool
         If True, mark the cylinder as PEC.
-
-    # 3D-UPGRADE: z0/z1 range is already honoured — no changes needed.
     """
     k0 = max(0, _metre_to_cell(z0, grid.dz))
     k1 = min(grid.Nz, _metre_to_cell(z1, grid.dz))

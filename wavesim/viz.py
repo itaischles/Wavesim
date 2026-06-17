@@ -26,7 +26,6 @@ import matplotlib.patches as mpatches
 import matplotlib.animation as animation
 from matplotlib.patches import Rectangle
 from wavesim.grid import FDTDGrid
-from wavesim.sources import GaussianSource, gaussian_pulse
 
 
 # ======================================================================= #
@@ -180,55 +179,6 @@ def plot_materials_xy(grid: FDTDGrid, component: str = 'eps_z',
     ax.set_ylabel('y (mm)')
     ax.set_title(f'Material map: {component} (k=0 slice)\n'
                  f'Domain: {Nx*dx*1e3:.1f} mm × {Ny*dy*1e3:.1f} mm')
-
-    plt.tight_layout()
-    return fig, ax
-
-
-def plot_source_waveform(source: GaussianSource, dt: float, n_steps: int, ax=None):
-    """
-    1D plot of the Gaussian pulse time function over the simulation duration.
-
-    X-axis: time in nanoseconds. Y-axis: normalised amplitude.
-    Marks t0 and the ±2σ width. Prints estimated bandwidth to stdout.
-
-    Parameters
-    ----------
-    source  : GaussianSource
-    dt      : float   timestep (seconds)
-    n_steps : int     total number of timesteps to plot
-    """
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(9, 4))
-    else:
-        fig = ax.figure
-
-    t = np.arange(n_steps) * dt
-    t_ns = t * 1e9
-    values = np.array([gaussian_pulse(source, ti) for ti in t])
-    values_norm = values / (values.max() + 1e-30)
-
-    ax.plot(t_ns, values_norm, color='steelblue', lw=1.5, label='Gaussian pulse')
-    ax.axvline(source.t0 * 1e9, color='orange', lw=1.2, ls='--', label=f't₀ = {source.t0*1e9:.2f} ns')
-    ax.axvline((source.t0 - 2*source.width) * 1e9, color='green', lw=1.0, ls=':',
-               label=f'±2σ = ±{2*source.width*1e9:.2f} ns')
-    ax.axvline((source.t0 + 2*source.width) * 1e9, color='green', lw=1.0, ls=':')
-    ax.axhline(0.01, color='gray', lw=0.8, ls='--', alpha=0.5, label='1% level')
-
-    ax.set_xlabel('Time (ns)')
-    ax.set_ylabel('Normalised amplitude')
-    ax.set_title('Gaussian Source Waveform')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(0, t_ns[-1])
-
-    # Report bandwidth
-    bw_hz = 1.0 / (2.0 * np.pi * source.width)
-    bw_ghz = bw_hz / 1e9
-    print(f"Source bandwidth (-3 dB): {bw_ghz:.2f} GHz  (f_max ≈ {bw_ghz:.2f} GHz)")
-    print(f"Pulse window check: "
-          f"amplitude at t=0 = {abs(gaussian_pulse(source, 0.0)):.2e}, "
-          f"at t_end = {abs(gaussian_pulse(source, n_steps*dt)):.2e}")
 
     plt.tight_layout()
     return fig, ax

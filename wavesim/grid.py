@@ -45,7 +45,7 @@ class FDTDGrid:
     # ------------------------------------------------------------------ #
     dx: float
     dy: float
-    dz: float           # 3D-UPGRADE: set dz = dx for uniform 3D; for Nz=1 dz=dx is fine
+    dz: float
     dt: float           # Computed from CFL condition — do not set manually
 
     # ------------------------------------------------------------------ #
@@ -53,7 +53,7 @@ class FDTDGrid:
     # ------------------------------------------------------------------ #
     Nx: int
     Ny: int
-    Nz: int             # 3D-UPGRADE: set Nz > 1 for full 3D
+    Nz: int
 
     # ------------------------------------------------------------------ #
     # PEC body mask — shape (Nx, Ny, Nz), dtype bool
@@ -92,9 +92,7 @@ def create_grid(Nx: int, Ny: int, Nz: int,
     -----
     dt is computed from the conservative 3D CFL condition:
         dt = CFL / (c * sqrt(1/dx² + 1/dy² + 1/dz²))
-    with CFL = 0.99. This formula is already correct for full 3D — no
-    changes needed when Nz is later increased.
-    # 3D-UPGRADE: CFL formula is already correct — no changes needed.
+    with CFL = 0.99.
     """
     if dy is None:
         dy = dx

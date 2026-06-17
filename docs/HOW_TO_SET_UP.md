@@ -33,9 +33,9 @@ needed. `numba` is optional (PyPI wheel; works with the current numpy).
 |---|---|
 | `numpy` | All field arrays, curl operators, CPML coefficients |
 | `matplotlib` | All visualisation (`viz.py`), animation output |
-| `scipy` | FFT analysis in test_03 (cavity resonance), test_04 (waveguide) |
+| `scipy` | FFT analysis (e.g. cavity resonance, waveguide dispersion) |
 | `Pillow` | Saving animated GIFs from `anim.save('out.gif', writer='pillow')` |
-| `numba` *(optional)* | The ~10–12× multithreaded `Simulation(backend='numba')` / `wavesim/backend_numba.py` and `tools/benchmark_numba.py` |
+| `numba` *(optional)* | The ~10–12× multithreaded `Simulation(backend='numba')` / `wavesim/backend_numba.py` |
 
 ---
 
@@ -62,40 +62,25 @@ Wavesim\
 │   ├── sources.py
 │   ├── monitors.py
 │   └── viz.py
-├── tests\
-│   ├── test_00_grid_viz.py
-│   ├── test_01_source_viz.py
-│   ├── test_02_free_space.py
-│   ├── test_03_pec_cavity.py
-│   ├── test_04_waveguide.py
-│   └── test_05_coax_tem.py          ← first full 3D run (Nz>1)
 └── docs\                 ← API_GUIDE.md, this file, design notes
 ```
 
 ---
 
-## 4. Run the tests
+## 4. Run a simulation
 
-Tests must be run **from the project root** and **in order** — each is a prerequisite for the next.
+Run scripts **from the project root** (or add the repo to `sys.path`) with the
+`wavesim` env active:
 
 ```bat
 cd Wavesim
 conda activate wavesim
-
-python tests\test_00_grid_viz.py
-python tests\test_01_source_viz.py
-python tests\test_02_free_space.py
-python tests\test_03_pec_cavity.py
-python tests\test_04_waveguide.py
-python tests\test_05_coax_tem.py
+python your_script.py
 ```
 
-Tests 00–05 are implemented and passing. `test_05_coax_tem.py` is the first run
-with `Nz > 1` (full 3D); it takes ~3 minutes, the others are quick.
-
-Each test prints a `PASSED` / `FAILED` summary to stdout and saves a PNG (and,
-for tests 02–04, an animated GIF) next to the test script. These artifacts are
-git-ignored and regenerated on each run.
+[`TUTORIAL.md`](TUTORIAL.md) and [`API_GUIDE.md`](API_GUIDE.md) contain
+copy-pasteable runnable examples. Section 6 below is a quick import smoke test
+that confirms the install works.
 
 ---
 
@@ -103,9 +88,9 @@ git-ignored and regenerated on each run.
 
 1. Open the `Wavesim` folder: **File → Open Folder**
 2. Select the interpreter: `Ctrl+Shift+P` → **Python: Select Interpreter** → choose the `wavesim` conda env (it will show the path ending in `\envs\wavesim\python.exe`)
-3. Open any test file and press **F5** to run, or use the integrated terminal with `conda activate wavesim` already active
+3. Open any script and press **F5** to run, or use the integrated terminal with `conda activate wavesim` already active
 
-The tests use `matplotlib.use('Agg')` so they run without a pop-up window and save PNG output to disk. To get interactive plots while working in VS Code, comment out that line at the top of the test file.
+A script that calls `matplotlib.use('Agg')` runs without a pop-up window and saves PNG output to disk. To get interactive plots while working in VS Code, comment out that line.
 
 ---
 

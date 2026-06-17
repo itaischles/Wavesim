@@ -11,7 +11,7 @@ cores (<10% utilisation). This module reimplements the four hot functions
 `@njit(parallel=True)` kernels that:
 
   * keep the exact Yee staggering, signs, and physical coefficients of the NumPy
-    reference (it remains the validation oracle — see tests/test_08_numba_parity),
+    reference (it remains the validation oracle),
   * mutate the SAME NumPy arrays in place, so the wrappers are signature-compatible
     with their numpy.py / pml.py counterparts and `Simulation(backend='numba')`
     swaps them in transparently,
