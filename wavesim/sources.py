@@ -146,26 +146,29 @@ class PointSource(Source):
     ----------
     component : str
         Field component to drive ('Ex'..'Hz').
-    i, j, k : int
-        Cell indices of the injection point (use k=0 for an Nz=1 slice).
+    x, y, z : float
+        Physical position of the injection point in metres, snapped to the
+        nearest cell against the grid (use z=0 for an Nz=1 slice).
     waveform : Callable[[float], float]
         Time function, e.g. a :class:`GaussianPulse` instance or a custom lambda.
     """
 
-    def __init__(self, component: str, i: int, j: int, k: int,
+    def __init__(self, component: str, x: float, y: float, z: float,
                  waveform: Callable[[float], float]) -> None:
         super().__init__(waveform)
         self.component = component
-        self.i, self.j, self.k = i, j, k
+        self.x, self.y, self.z = x, y, z
 
     def spatial_profiles(self, grid: FDTDGrid) -> Dict[str, np.ndarray]:
-        """Full-grid profile with a single 1.0 at (i, j, k) — for inspection."""
+        """Full-grid profile with a single 1.0 at the source cell — for inspection."""
+        i, j, k = grid.position_to_index(self.x, self.y, self.z)
         prof = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=np.float64)
-        prof[self.i, self.j, self.k] = 1.0
+        prof[i, j, k] = 1.0
         return {self.component: prof}
 
     def inject(self, grid: FDTDGrid, t: float) -> None:
-        getattr(grid, self.component)[self.i, self.j, self.k] += self.waveform(t)
+        i, j, k = grid.position_to_index(self.x, self.y, self.z)
+        getattr(grid, self.component)[i, j, k] += self.waveform(t)
 
 
 class ArraySource(Source):
@@ -233,18 +236,19 @@ class PlaneSource(Source):
         Shared time function.
     axis : str
         Slice normal, one of 'x', 'y', 'z'.
-    index : int
-        Index along ``axis`` where the slice sits.
+    position : float
+        Physical position (metres) along ``axis`` where the slice sits, snapped
+        to the nearest cell against the grid.
     profiles : mapping, optional
         ``{component: 2D-array}`` transverse mode profiles; ``None`` ⇒ uniform.
     """
 
     def __init__(self, waveform: Callable[[float], float], *,
-                 axis: str, index: int,
+                 axis: str, position: float,
                  profiles: Mapping[str, np.ndarray] | None = None) -> None:
         super().__init__(waveform)
         self.axis = axis
-        self.index = index
+        self.position = position
         self.profiles = profiles
 
     def spatial_profiles(self, grid: FDTDGrid) -> Dict[str, np.ndarray]:
@@ -264,14 +268,15 @@ class LineSource(Source):
     ----------
     waveform : Callable[[float], float]
         Open-circuit drive (Thevenin source voltage) as a function of time.
-    p0, p1 : tuple of int
-        Endpoint cell indices (i, j, k) of the line.
+    p0, p1 : tuple of float
+        Endpoint positions ``(x, y, z)`` of the line in metres, each snapped to
+        the nearest cell against the grid.
     impedance : float, optional
         Series source impedance Z (ohms); ``None`` ⇒ ideal voltage source.
     """
 
     def __init__(self, waveform: Callable[[float], float], *,
-                 p0: Tuple[int, int, int], p1: Tuple[int, int, int],
+                 p0: Tuple[float, float, float], p1: Tuple[float, float, float],
                  impedance: float | None = None) -> None:
         super().__init__(waveform)
         self.p0 = p0
@@ -296,17 +301,18 @@ class VolumeSource(Source):
     ----------
     waveform : Callable[[float], float]
         Shared time function.
-    region : tuple of slice
-        ``(slice_x, slice_y, slice_z)`` selecting the box of cells to drive.
+    bounds : tuple of float
+        Box extent in metres ``(x0, x1, y0, y1, z0, z1)``, snapped to the
+        nearest cells against the grid.
     profiles : mapping, optional
         ``{component: array}`` weights over the region; ``None`` ⇒ uniform.
     """
 
     def __init__(self, waveform: Callable[[float], float], *,
-                 region: Tuple[slice, slice, slice],
+                 bounds: Tuple[float, float, float, float, float, float],
                  profiles: Mapping[str, np.ndarray] | None = None) -> None:
         super().__init__(waveform)
-        self.region = region
+        self.bounds = bounds
         self.profiles = profiles
 
     def spatial_profiles(self, grid: FDTDGrid) -> Dict[str, np.ndarray]:

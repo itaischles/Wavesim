@@ -6,9 +6,12 @@ All monitors follow the same pattern:
     - A record_*() function that appends current values to the monitor
 
 Usage:
-    mon = FieldMonitor(component='Ez', i=100, j=100, k=0)
+    mon = FieldMonitor(component='Ez', x=50e-3, y=50e-3, z=0.0)
     # In time loop:
     mon = record_field(mon, grid)
+
+All monitor locations are given in metres and snapped to the nearest cell
+against the grid inside the record_* functions.
 """
 
 from dataclasses import dataclass, field
@@ -23,20 +26,21 @@ from wavesim.constants import EPS0, MU0
 
 @dataclass
 class FieldMonitor:
-    """Record a single field component at a fixed cell location."""
+    """Record a single field component at a fixed location given in metres."""
     component: str      # 'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'
-    i: int
-    j: int
-    k: int
+    x: float
+    y: float
+    z: float
     times:  list = field(default_factory=list)
     values: list = field(default_factory=list)
 
 
 def record_field(monitor: FieldMonitor, grid: FDTDGrid) -> FieldMonitor:
     """Append current field value and timestep time to the monitor."""
+    i, j, k = grid.position_to_index(monitor.x, monitor.y, monitor.z)
     arr = getattr(grid, monitor.component)
     monitor.times.append(grid.time_step * _get_dt(grid))
-    monitor.values.append(float(arr[monitor.i, monitor.j, monitor.k]))
+    monitor.values.append(float(arr[i, j, k]))
     return monitor
 
 
@@ -47,21 +51,21 @@ def record_field(monitor: FieldMonitor, grid: FDTDGrid) -> FieldMonitor:
 @dataclass
 class MagnitudeMonitor:
     """
-    Record |E| or |H| magnitude at a fixed cell location.
+    Record |E| or |H| magnitude at a fixed location given in metres.
     |E| = sqrt(Ex² + Ey² + Ez²)
     |H| = sqrt(Hx² + Hy² + Hz²)
     """
     field: str          # 'E' or 'H'
-    i: int
-    j: int
-    k: int
+    x: float
+    y: float
+    z: float
     times:  list = field(default_factory=list)
     values: list = field(default_factory=list)
 
 
 def record_magnitude(monitor: MagnitudeMonitor, grid: FDTDGrid) -> MagnitudeMonitor:
     """Compute and append |E| or |H| at the monitor location."""
-    i, j, k = monitor.i, monitor.j, monitor.k
+    i, j, k = grid.position_to_index(monitor.x, monitor.y, monitor.z)
     if monitor.field == 'E':
         mag = np.sqrt(grid.Ex[i,j,k]**2 + grid.Ey[i,j,k]**2 + grid.Ez[i,j,k]**2)
     elif monitor.field == 'H':
@@ -79,9 +83,9 @@ def record_magnitude(monitor: MagnitudeMonitor, grid: FDTDGrid) -> MagnitudeMoni
 
 @dataclass
 class SnapshotMonitor:
-    """Capture a 2D slice of a field component at regular intervals."""
+    """Capture a 2D XY slice of a field component at regular intervals."""
     component: str      # 'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'
-    at_z_index: int     # which z-index to capture (use 0 for Nz=1)
+    at_z: float         # z position (metres) of the XY slice (use 0 for Nz=1)
     every_N_steps: int  # record every N timesteps
     snapshots:   list = field(default_factory=list)
     snap_times:  list = field(default_factory=list)
@@ -90,8 +94,9 @@ class SnapshotMonitor:
 def record_snapshot(monitor: SnapshotMonitor, grid: FDTDGrid) -> SnapshotMonitor:
     """Append a 2D slice to the snapshot list if this is a recording timestep."""
     if grid.time_step % monitor.every_N_steps == 0:
+        k = grid.axis_index('z', monitor.at_z)
         arr = getattr(grid, monitor.component)
-        monitor.snapshots.append(arr[:, :, monitor.at_z_index].copy())
+        monitor.snapshots.append(arr[:, :, k].copy())
         monitor.snap_times.append(grid.time_step * _get_dt(grid))
     return monitor
 

@@ -68,7 +68,7 @@ grid = create_grid(Nx=200, Ny=200, Nz=1, dx=0.5e-3)   # dt set automatically
 grid = set_vacuum(grid)
 cpml = init_cpml(grid, d_pml=10)                       # absorb on all 4 faces
 src  = GaussianSource(t0=4/(2*np.pi*10e9), width=1/(2*np.pi*10e9))
-snap = SnapshotMonitor(component='Ez', k_slice=0, interval=20)
+snap = SnapshotMonitor(component='Ez', at_z=0.0, every_N_steps=20)
 
 for n in range(2000):
     t = n * grid.dt
@@ -87,8 +87,8 @@ from wavesim.simulation import Simulation
 from wavesim.sources import PointSource, make_source_for_fmax
 
 sim  = Simulation(grid, cpml=cpml)                     # backend='numba' for ~10× speed
-sim.add_source(PointSource('Ez', 100, 100, 0, make_source_for_fmax(10e9)))
-snap = sim.add_monitor(SnapshotMonitor('Ez', k_slice=0, interval=20))
+sim.add_source(PointSource('Ez', 50e-3, 50e-3, 0.0, make_source_for_fmax(10e9)))
+snap = sim.add_monitor(SnapshotMonitor('Ez', at_z=0.0, every_N_steps=20))
 sim.run(2000)                                          # bit-identical to the loop
 ```
 

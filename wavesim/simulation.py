@@ -20,8 +20,8 @@ Example
     cpml = ws.init_cpml(grid, d_pml=10)
 
     sim = ws.Simulation(grid, cpml=cpml)
-    sim.add_source(ws.PointSource('Ez', 100, 100, 0, ws.GaussianPulse.for_fmax(10e9)))
-    snap = sim.add_monitor(ws.SnapshotMonitor('Ez', k_slice=0, interval=20))
+    sim.add_source(ws.PointSource('Ez', 50e-3, 50e-3, 0.0, ws.GaussianPulse.for_fmax(10e9)))
+    snap = sim.add_monitor(ws.SnapshotMonitor('Ez', at_z=0.0, every_N_steps=20))
     sim.run(2000)
     # snap.snapshots now holds the recorded frames; sim.grid is the final state.
 """

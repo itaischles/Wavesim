@@ -68,6 +68,26 @@ class FDTDGrid:
     # ------------------------------------------------------------------ #
     time_step: int = 0
 
+    # ------------------------------------------------------------------ #
+    # Coordinate conversion — metres -> cell index
+    # ------------------------------------------------------------------ #
+    # Every public API speaks metres; these helpers are the single place
+    # physical positions are snapped to the Yee grid. Sources, monitors, and
+    # viz all route through them so the rounding convention is consistent.
+    # ------------------------------------------------------------------ #
+    def axis_index(self, axis: str, pos: float) -> int:
+        """Nearest cell index along ``axis`` ('x'/'y'/'z') for ``pos`` (metres)."""
+        ds = {'x': self.dx, 'y': self.dy, 'z': self.dz}.get(axis)
+        if ds is None:
+            raise ValueError(f"axis must be 'x', 'y' or 'z', got {axis!r}")
+        return int(round(pos / ds))
+
+    def position_to_index(self, x: float, y: float, z: float) -> tuple:
+        """Nearest cell index ``(i, j, k)`` for a physical ``(x, y, z)`` in metres."""
+        return (int(round(x / self.dx)),
+                int(round(y / self.dy)),
+                int(round(z / self.dz)))
+
 
 def create_grid(Nx: int, Ny: int, Nz: int,
                 dx: float, dy: float = None, dz: float = None) -> FDTDGrid:

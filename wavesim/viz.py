@@ -63,9 +63,9 @@ def plot_grid_xy(grid: FDTDGrid, cpml=None, ax=None):
     # Draw cell grid lines
     step = 1
     for i in range(0, Nx + 1, step):
-        ax.axvline(i * dx * 1e3, color='lightgray', lw=0.5, zorder=1)
+        ax.axvline(i * dx, color='lightgray', lw=0.5, zorder=1)
     for j in range(0, Ny + 1, step):
-        ax.axhline(j * dy * 1e3, color='lightgray', lw=0.5, zorder=1)
+        ax.axhline(j * dy, color='lightgray', lw=0.5, zorder=1)
 
     # Plot staggered field positions for a small representative patch
     # Show a 4x4 block in the interior (away from PML)
@@ -79,8 +79,8 @@ def plot_grid_xy(grid: FDTDGrid, cpml=None, ax=None):
         for dj in range(n_show):
             i = i0 + di
             j = j0 + dj
-            x0, y0 = i * dx * 1e3, j * dy * 1e3
-            hx, hy = dx * 1e3, dy * 1e3
+            x0, y0 = i * dx, j * dy
+            hx, hy = dx, dy
 
             # Ez at cell centre
             ax.scatter(x0 + 0.5*hx, y0 + 0.5*hy, marker='o',
@@ -103,15 +103,15 @@ def plot_grid_xy(grid: FDTDGrid, cpml=None, ax=None):
 
     # PML overlay
     if cpml is not None:
-        _draw_pml_overlay(ax, grid, cpml.d_pml, units='mm')
+        _draw_pml_overlay(ax, grid, cpml.d_pml)
 
-    ax.set_xlim(0, Nx * dx * 1e3)
-    ax.set_ylim(0, Ny * dy * 1e3)
-    ax.set_xlabel('x (mm)')
-    ax.set_ylabel('y (mm)')
+    ax.set_xlim(0, Nx * dx)
+    ax.set_ylim(0, Ny * dy)
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
     ax.set_title(f'Yee Grid — XY plane\n'
-                 f'Nx={Nx}, Ny={Ny}, dx={dx*1e3:.2f} mm, dy={dy*1e3:.2f} mm\n'
-                 f'Domain: {Nx*dx*1e3:.1f} mm × {Ny*dy*1e3:.1f} mm')
+                 f'Nx={Nx}, Ny={Ny}, dx={dx:.4g} m, dy={dy:.4g} m\n'
+                 f'Domain: {Nx*dx:.4g} m × {Ny*dy:.4g} m')
     ax.set_aspect('equal')
 
     # Deduplicated legend
@@ -151,8 +151,8 @@ def plot_materials_xy(grid: FDTDGrid, component: str = 'eps_z',
 
     arr = getattr(grid, component)[:, :, 0]   # 2D slice at k=0
 
-    # Physical extent for imshow
-    extent = [0, Nx * dx * 1e3, 0, Ny * dy * 1e3]  # mm
+    # Physical extent for imshow (metres)
+    extent = [0, Nx * dx, 0, Ny * dy]
 
     im = ax.imshow(arr.T, origin='lower', extent=extent,
                    cmap='plasma', aspect='equal',
@@ -173,12 +173,12 @@ def plot_materials_xy(grid: FDTDGrid, component: str = 'eps_z',
 
     # PML overlay
     if cpml is not None:
-        _draw_pml_overlay(ax, grid, cpml.d_pml, units='mm')
+        _draw_pml_overlay(ax, grid, cpml.d_pml)
 
-    ax.set_xlabel('x (mm)')
-    ax.set_ylabel('y (mm)')
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
     ax.set_title(f'Material map: {component} (k=0 slice)\n'
-                 f'Domain: {Nx*dx*1e3:.1f} mm × {Ny*dy*1e3:.1f} mm')
+                 f'Domain: {Nx*dx:.4g} m × {Ny*dy:.4g} m')
 
     plt.tight_layout()
     return fig, ax
@@ -209,7 +209,7 @@ def plot_field_snapshot(snapshot_array: np.ndarray, grid: FDTDGrid,
         fig = ax.figure
 
     Nx, Ny = grid.Nx, grid.Ny
-    extent = [0, Nx * grid.dx * 1e3, 0, Ny * grid.dy * 1e3]
+    extent = [0, Nx * grid.dx, 0, Ny * grid.dy]
 
     vmax = np.max(np.abs(snapshot_array))
     if vmax < 1e-30:
@@ -221,8 +221,8 @@ def plot_field_snapshot(snapshot_array: np.ndarray, grid: FDTDGrid,
     cbar = plt.colorbar(im, ax=ax, pad=0.02)
     cbar.set_label(f'{component} (V/m or A/m)', fontsize=9)
 
-    ax.set_xlabel('x (mm)')
-    ax.set_ylabel('y (mm)')
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
     ax.set_title(f'{component} snapshot — timestep {timestep}\n'
                  f't = {timestep * grid.dt * 1e9:.3f} ns')
     plt.tight_layout()
@@ -253,15 +253,15 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50):
         vmax = 1.0
 
     Nx, Ny = grid.Nx, grid.Ny
-    extent = [0, Nx * grid.dx * 1e3, 0, Ny * grid.dy * 1e3]
+    extent = [0, Nx * grid.dx, 0, Ny * grid.dy]
 
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(snaps[0].T, origin='lower', extent=extent,
                    cmap='RdBu_r', aspect='equal',
                    vmin=-vmax, vmax=vmax, animated=True)
     plt.colorbar(im, ax=ax)
-    ax.set_xlabel('x (mm)')
-    ax.set_ylabel('y (mm)')
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
     title = ax.set_title('')
 
     def _update(frame):
@@ -298,12 +298,13 @@ def plot_monitor_time_series(monitor, dt: float, ax=None):
     t_ns = np.array(monitor.times) * 1e9
     vals = np.array(monitor.values)
 
-    # Determine label
+    # Determine label (monitor location is stored and shown in metres)
+    pos_m = f"({monitor.x:.4g}, {monitor.y:.4g}, {monitor.z:.4g}) m"
     if hasattr(monitor, 'component'):
-        label = f"{monitor.component} at ({monitor.i},{monitor.j},{monitor.k})"
+        label = f"{monitor.component} at {pos_m}"
         ylabel = 'Field value (V/m or A/m)'
     else:
-        label = f"|{monitor.field}| at ({monitor.i},{monitor.j},{monitor.k})"
+        label = f"|{monitor.field}| at {pos_m}"
         ylabel = '|Field| magnitude (V/m or A/m)'
 
     ax.plot(t_ns, vals, lw=1.2, label=label)
@@ -338,7 +339,7 @@ def _as_3d_array(data, grid: FDTDGrid) -> np.ndarray:
 
 
 def plot_field_slices_3d(data, grid: FDTDGrid, component: str = '',
-                         i: int = None, j: int = None, k: int = None,
+                         x: float = None, y: float = None, z: float = None,
                          cmap: str = None, symmetric: bool = None,
                          fig=None, axes=None):
     """
@@ -355,8 +356,9 @@ def plot_field_slices_3d(data, grid: FDTDGrid, component: str = '',
         (Nx,Ny,Nz) array such as a |E| envelope.
     component : str
         Label for the colour bar / titles (defaults to `data` when it is a name).
-    i, j, k : int, optional
-        Cut indices for the YZ, XZ, XY planes. Default to the domain centre.
+    x, y, z : float, optional
+        Cut positions in metres for the YZ, XZ, XY planes, each snapped to the
+        nearest cell. Default to the domain centre.
     cmap : str, optional
         Colormap. Defaults to 'RdBu_r' for signed data, 'inferno' otherwise.
     symmetric : bool, optional
@@ -376,9 +378,10 @@ def plot_field_slices_3d(data, grid: FDTDGrid, component: str = '',
     arr = _as_3d_array(data, grid)
     label = component or (data if isinstance(data, str) else 'field')
     Nx, Ny, Nz = arr.shape
-    if i is None: i = Nx // 2
-    if j is None: j = Ny // 2
-    if k is None: k = Nz // 2
+    # Cut planes are given in metres -> snap to cell indices (centre by default).
+    i = Nx // 2 if x is None else grid.axis_index('x', x)
+    j = Ny // 2 if y is None else grid.axis_index('y', y)
+    k = Nz // 2 if z is None else grid.axis_index('z', z)
 
     vmax = float(np.max(np.abs(arr)))
     if vmax < 1e-30:
@@ -389,10 +392,9 @@ def plot_field_slices_3d(data, grid: FDTDGrid, component: str = '',
         cmap = 'RdBu_r' if symmetric else 'inferno'
     vmin = -vmax if symmetric else 0.0
 
-    mm = 1e3
-    Lx, Ly, Lz = Nx * grid.dx * mm, Ny * grid.dy * mm, Nz * grid.dz * mm
-    xi, yj = i * grid.dx * mm, j * grid.dy * mm
-    zk = k * grid.dz * mm
+    Lx, Ly, Lz = Nx * grid.dx, Ny * grid.dy, Nz * grid.dz
+    xi, yj = i * grid.dx, j * grid.dy
+    zk = k * grid.dz
 
     own_fig = axes is None
     if own_fig:
@@ -410,22 +412,22 @@ def plot_field_slices_3d(data, grid: FDTDGrid, component: str = '',
     im = ax_xy.imshow(arr[:, :, k].T, origin='lower', extent=[0, Lx, 0, Ly],
                       cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal')
     ax_xy.axvline(xi, **cross_kw); ax_xy.axhline(yj, **cross_kw)
-    ax_xy.set_xlabel('x (mm)'); ax_xy.set_ylabel('y (mm)')
-    ax_xy.set_title(f'XY plane  (k={k}, z={zk:.1f} mm)')
+    ax_xy.set_xlabel('x (m)'); ax_xy.set_ylabel('y (m)')
+    ax_xy.set_title(f'XY plane  (k={k}, z={zk:.4g} m)')
 
     # XZ plane at j (z horizontal — usually the long axis)
     ax_xz.imshow(arr[:, j, :], origin='lower', extent=[0, Lz, 0, Lx],
                  cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
     ax_xz.axvline(zk, **cross_kw); ax_xz.axhline(xi, **cross_kw)
-    ax_xz.set_xlabel('z (mm)'); ax_xz.set_ylabel('x (mm)')
-    ax_xz.set_title(f'XZ plane  (j={j}, y={yj:.1f} mm)')
+    ax_xz.set_xlabel('z (m)'); ax_xz.set_ylabel('x (m)')
+    ax_xz.set_title(f'XZ plane  (j={j}, y={yj:.4g} m)')
 
     # YZ plane at i (z horizontal)
     ax_yz.imshow(arr[i, :, :], origin='lower', extent=[0, Lz, 0, Ly],
                  cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
     ax_yz.axvline(zk, **cross_kw); ax_yz.axhline(yj, **cross_kw)
-    ax_yz.set_xlabel('z (mm)'); ax_yz.set_ylabel('y (mm)')
-    ax_yz.set_title(f'YZ plane  (i={i}, x={xi:.1f} mm)')
+    ax_yz.set_xlabel('z (m)'); ax_yz.set_ylabel('y (m)')
+    ax_yz.set_title(f'YZ plane  (i={i}, x={xi:.4g} m)')
 
     cbar = fig.colorbar(im, ax=[ax_xy, ax_xz, ax_yz], pad=0.02, fraction=0.04)
     cbar.set_label(label, fontsize=10)
@@ -449,13 +451,13 @@ def animate_field_slices_3d(panels, times=None, interval_ms: int = 60,
     ----------
     panels : list of dict, each with keys
         frames    : list of 2D np.ndarray   (required; already oriented)
-        extent    : [x0, x1, y0, y1] in mm  (required)
+        extent    : [x0, x1, y0, y1] in m   (required)
         xlabel, ylabel, title : str
         cmap      : str   (default 'RdBu_r')
         symmetric : bool  (default True -> vmin=-vmax; else 0..vmax)
         aspect    : 'equal' | 'auto'        (default 'auto')
-        vlines    : list of (pos_mm, color) (optional vertical markers)
-        hlines    : list of (pos_mm, color) (optional horizontal markers)
+        vlines    : list of (pos_m, color)  (optional vertical markers, metres)
+        hlines    : list of (pos_m, color)  (optional horizontal markers, metres)
     times : sequence, optional
         Per-frame time in seconds; shown (in ns) in the suptitle.
     interval_ms : int
@@ -553,20 +555,19 @@ def plot_energy(monitor, dt: float, ax=None):
 # Internal helper
 # ======================================================================= #
 
-def _draw_pml_overlay(ax, grid: FDTDGrid, d_pml: int, units: str = 'mm'):
+def _draw_pml_overlay(ax, grid: FDTDGrid, d_pml: int):
     """
-    Shade the PML region as a semi-transparent border overlay.
+    Shade the PML region as a semi-transparent border overlay (metres).
 
     Called internally by plot_grid_xy and plot_materials_xy.
     """
     Nx, Ny = grid.Nx, grid.Ny
     dx, dy = grid.dx, grid.dy
-    scale = 1e3 if units == 'mm' else 1.0   # m → mm
 
-    Lx = Nx * dx * scale
-    Ly = Ny * dy * scale
-    d_x = d_pml * dx * scale
-    d_y = d_pml * dy * scale
+    Lx = Nx * dx
+    Ly = Ny * dy
+    d_x = d_pml * dx
+    d_y = d_pml * dy
 
     pml_color = (0.4, 0.7, 0.9, 0.25)  # light blue, semi-transparent
     edge_kw = dict(linewidth=1.2, edgecolor='steelblue', linestyle='--')
