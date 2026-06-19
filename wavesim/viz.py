@@ -229,7 +229,9 @@ def plot_field_snapshot(snapshot_array: np.ndarray, grid: FDTDGrid,
     return fig, ax
 
 
-def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50):
+def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50,
+                      log: bool = False, linthresh: float = None,
+                      contour: bool = False, n_contours: int = 8):
     """
     Animate a sequence of field snapshots from a SnapshotMonitor.
 
@@ -241,7 +243,16 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50):
     ----------
     snapshot_monitor : SnapshotMonitor
     grid             : FDTDGrid
-    interval_ms      : int   frame interval in milliseconds
+    interval_ms      : int    frame interval in milliseconds
+    log              : bool   if True, use logarithmic colour scaling. The field
+                              is signed, so a symmetric-log (SymLogNorm) scale is
+                              used: linear within +/- `linthresh`, log beyond.
+    linthresh        : float  linear-region half-width for log scaling. Defaults
+                              to vmax/1000 (covers ~3 decades of dynamic range).
+    contour          : bool   if True, overlay contour lines on the field. Level
+                              spacing follows `log`: linearly spaced when log is
+                              False, log-spaced (symmetric about zero) when True.
+    n_contours       : int    number of contour levels per sign.
     """
     snaps = snapshot_monitor.snapshots
     times = snapshot_monitor.snap_times
@@ -252,27 +263,61 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50):
     if vmax < 1e-30:
         vmax = 1.0
 
+    if log:
+        if linthresh is None:
+            linthresh = vmax / 1e3
+        norm = matplotlib.colors.SymLogNorm(linthresh=linthresh,
+                                            vmin=-vmax, vmax=vmax)
+        imshow_kw = dict(norm=norm)
+    else:
+        imshow_kw = dict(vmin=-vmax, vmax=vmax)
+
     Nx, Ny = grid.Nx, grid.Ny
     extent = [0, Nx * grid.dx, 0, Ny * grid.dy]
+
+    # Contour levels: log-spaced (symmetric about zero) or linearly spaced.
+    if contour:
+        if log:
+            pos = np.logspace(np.log10(linthresh), np.log10(vmax), n_contours)
+            levels = np.concatenate([-pos[::-1], pos])
+        else:
+            levels = np.linspace(-vmax, vmax, 2 * n_contours + 1)
+        # contour() needs coordinate vectors matching the transposed data (Ny, Nx)
+        xc = np.linspace(extent[0], extent[1], Nx)
+        yc = np.linspace(extent[2], extent[3], Ny)
 
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(snaps[0].T, origin='lower', extent=extent,
                    cmap='RdBu_r', aspect='equal',
-                   vmin=-vmax, vmax=vmax, animated=True)
+                   animated=True, **imshow_kw)
     plt.colorbar(im, ax=ax)
     ax.set_xlabel('x (m)')
     ax.set_ylabel('y (m)')
     title = ax.set_title('')
 
+    cs_holder = [None]
+
+    def _draw_contours(frame):
+        cs_holder[0] = ax.contour(xc, yc, snaps[frame].T, levels=levels,
+                                  colors='k', linewidths=0.5, alpha=0.6)
+
+    if contour:
+        _draw_contours(0)
+
     def _update(frame):
         im.set_data(snaps[frame].T)
         title.set_text(f'{snapshot_monitor.component} — '
                        f't = {times[frame]*1e9:.3f} ns  (frame {frame}/{len(snaps)-1})')
+        if contour:
+            if cs_holder[0] is not None:
+                cs_holder[0].remove()
+            _draw_contours(frame)
         return im, title
 
+    # Contours are redrawn each frame, so blitting can't reliably track them.
     anim = animation.FuncAnimation(
         fig, _update, frames=len(snaps),
-        interval=interval_ms, blit=True
+        interval=interval_ms, blit=not contour
     )
     plt.tight_layout()
     return anim
