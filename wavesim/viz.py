@@ -11,7 +11,7 @@ INFRASTRUCTURE (no physics required):
 FIELD DIAGNOSTICS (2D / single slice):
     plot_field_snapshot()  — single 2D field snapshot
     animate_snapshots()    — animation of SnapshotMonitor data
-    plot_monitor_time_series() — FieldMonitor or MagnitudeMonitor time series
+    plot_monitor_time_series() — FieldProbe time series (component or |E|/|H|)
     plot_energy()          — total energy vs time (log scale)
 
 FIELD DIAGNOSTICS (full 3D):
@@ -325,14 +325,15 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50,
 
 def plot_monitor_time_series(monitor, dt: float, ax=None):
     """
-    Plot a FieldMonitor or MagnitudeMonitor time series.
+    Plot a FieldProbe time series.
 
     X-axis: time in nanoseconds. Y-axis: field value or magnitude in SI units.
     Labels with component name and monitor location.
 
     Parameters
     ----------
-    monitor : FieldMonitor or MagnitudeMonitor
+    monitor : FieldProbe
+        ``component`` is a single component ('Ex'..'Hz') or a magnitude ('|E|'/'|H|').
     dt      : float   grid timestep (for label only; monitor already stores times)
     """
     if ax is None:
@@ -345,12 +346,11 @@ def plot_monitor_time_series(monitor, dt: float, ax=None):
 
     # Determine label (monitor location is stored and shown in metres)
     pos_m = f"({monitor.x:.4g}, {monitor.y:.4g}, {monitor.z:.4g}) m"
-    if hasattr(monitor, 'component'):
-        label = f"{monitor.component} at {pos_m}"
-        ylabel = 'Field value (V/m or A/m)'
-    else:
-        label = f"|{monitor.field}| at {pos_m}"
+    label = f"{monitor.component} at {pos_m}"
+    if monitor.component in ('|E|', '|H|'):
         ylabel = '|Field| magnitude (V/m or A/m)'
+    else:
+        ylabel = 'Field value (V/m or A/m)'
 
     ax.plot(t_ns, vals, lw=1.2, label=label)
     ax.set_xlabel('Time (ns)')

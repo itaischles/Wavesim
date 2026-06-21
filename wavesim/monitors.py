@@ -6,7 +6,9 @@ All monitors follow the same pattern:
     - A record_*() function that appends current values to the monitor
 
 Usage:
-    mon = FieldMonitor(component='Ez', x=50e-3, y=50e-3, z=0.0)
+    mon = FieldProbe(component='Ez', x=50e-3, y=50e-3, z=0.0)
+    # Or a field magnitude:
+    mon = FieldProbe(component='|E|', x=50e-3, y=50e-3, z=0.0)
     # In time loop:
     mon = record_field(mon, grid)
 
@@ -21,13 +23,21 @@ from wavesim.constants import EPS0, MU0
 
 
 # ======================================================================= #
-# FieldMonitor — single component at a fixed cell
+# FieldProbe — single component at a fixed cell
 # ======================================================================= #
 
 @dataclass
-class FieldMonitor:
-    """Record a single field component at a fixed location given in metres."""
-    component: str      # 'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'
+class FieldProbe:
+    """
+    Record a single field value at a fixed location given in metres.
+
+    ``component`` selects what is recorded:
+        - A single component: 'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'
+        - A field magnitude:  '|E|' or '|H|', where
+              |E| = sqrt(Ex² + Ey² + Ez²)
+              |H| = sqrt(Hx² + Hy² + Hz²)
+    """
+    component: str      # 'Ex'..'Hz', or '|E|' / '|H|'
     x: float
     y: float
     z: float
@@ -35,45 +45,21 @@ class FieldMonitor:
     values: list = field(default_factory=list)
 
 
-def record_field(monitor: FieldMonitor, grid: FDTDGrid) -> FieldMonitor:
-    """Append current field value and timestep time to the monitor."""
+def record_field(monitor: FieldProbe, grid: FDTDGrid) -> FieldProbe:
+    """Append current field value (component or magnitude) to the monitor."""
     i, j, k = grid.position_to_index(monitor.x, monitor.y, monitor.z)
-    arr = getattr(grid, monitor.component)
-    monitor.times.append(grid.time_step * _get_dt(grid))
-    monitor.values.append(float(arr[i, j, k]))
-    return monitor
-
-
-# ======================================================================= #
-# MagnitudeMonitor — |E| or |H| at a fixed cell
-# ======================================================================= #
-
-@dataclass
-class MagnitudeMonitor:
-    """
-    Record |E| or |H| magnitude at a fixed location given in metres.
-    |E| = sqrt(Ex² + Ey² + Ez²)
-    |H| = sqrt(Hx² + Hy² + Hz²)
-    """
-    field: str          # 'E' or 'H'
-    x: float
-    y: float
-    z: float
-    times:  list = field(default_factory=list)
-    values: list = field(default_factory=list)
-
-
-def record_magnitude(monitor: MagnitudeMonitor, grid: FDTDGrid) -> MagnitudeMonitor:
-    """Compute and append |E| or |H| at the monitor location."""
-    i, j, k = grid.position_to_index(monitor.x, monitor.y, monitor.z)
-    if monitor.field == 'E':
-        mag = np.sqrt(grid.Ex[i,j,k]**2 + grid.Ey[i,j,k]**2 + grid.Ez[i,j,k]**2)
-    elif monitor.field == 'H':
-        mag = np.sqrt(grid.Hx[i,j,k]**2 + grid.Hy[i,j,k]**2 + grid.Hz[i,j,k]**2)
+    comp = monitor.component
+    if comp in ('|E|', '|H|'):
+        f = comp[1]  # 'E' or 'H'
+        value = np.sqrt(
+            getattr(grid, f + 'x')[i, j, k]**2 +
+            getattr(grid, f + 'y')[i, j, k]**2 +
+            getattr(grid, f + 'z')[i, j, k]**2
+        )
     else:
-        raise ValueError(f"MagnitudeMonitor.field must be 'E' or 'H', got '{monitor.field}'")
+        value = getattr(grid, comp)[i, j, k]
     monitor.times.append(grid.time_step * _get_dt(grid))
-    monitor.values.append(float(mag))
+    monitor.values.append(float(value))
     return monitor
 
 

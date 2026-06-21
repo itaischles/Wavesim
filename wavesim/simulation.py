@@ -35,16 +35,15 @@ from wavesim.pml import CPMLArrays
 from wavesim.pec import apply_pec_faces, apply_pec_mask
 from wavesim.sources import Source
 from wavesim.monitors import (
-    FieldMonitor, MagnitudeMonitor, SnapshotMonitor, EnergyMonitor,
-    record_field, record_magnitude, record_snapshot, record_energy,
+    FieldProbe, SnapshotMonitor, EnergyMonitor,
+    record_field, record_snapshot, record_energy,
 )
 
 
 # Map each monitor type to its recorder. Keeps the monitors as plain data
 # while letting the loop dispatch uniformly.
 _RECORDERS = {
-    FieldMonitor:     record_field,
-    MagnitudeMonitor: record_magnitude,
+    FieldProbe:     record_field,
     SnapshotMonitor:  record_snapshot,
     EnergyMonitor:    record_energy,
 }
@@ -83,8 +82,8 @@ class Simulation:
     sources : iterable of Source, optional
         Excitations injected each step (see :mod:`wavesim.sources`).
     monitors : iterable, optional
-        Any mix of FieldMonitor / MagnitudeMonitor / SnapshotMonitor /
-        EnergyMonitor; recorded each step.
+        Any mix of FieldProbe / SnapshotMonitor / EnergyMonitor;
+        recorded each step.
     pec_faces : tuple of str, optional
         Domain faces to hold as PEC walls each step, e.g. ('y0', 'y1').
         ``apply_pec_mask`` always runs as well (it is a no-op when the grid has

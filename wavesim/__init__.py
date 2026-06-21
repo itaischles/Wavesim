@@ -42,8 +42,8 @@ from wavesim.sources import (
     Source, PointSource, ArraySource, PlaneSource, LineSource, VolumeSource,
 )
 from wavesim.monitors import (
-    FieldMonitor, MagnitudeMonitor, SnapshotMonitor, EnergyMonitor,
-    record_field, record_magnitude, record_snapshot, record_energy,
+    FieldProbe, SnapshotMonitor, EnergyMonitor,
+    record_field, record_snapshot, record_energy,
 )
 from wavesim.update import update_H, update_E
 from wavesim.simulation import Simulation
@@ -91,8 +91,8 @@ __all__ = [
     "Waveform", "GaussianPulse",
     "Source", "PointSource", "ArraySource", "PlaneSource", "LineSource", "VolumeSource",
     # monitors
-    "FieldMonitor", "MagnitudeMonitor", "SnapshotMonitor", "EnergyMonitor",
-    "record_field", "record_magnitude", "record_snapshot", "record_energy",
+    "FieldProbe", "SnapshotMonitor", "EnergyMonitor",
+    "record_field", "record_snapshot", "record_energy",
     # update
     "update_H", "update_E",
     # simulation
