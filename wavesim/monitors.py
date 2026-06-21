@@ -69,8 +69,16 @@ def record_field(monitor: FieldProbe, grid: FDTDGrid) -> FieldProbe:
 
 @dataclass
 class SnapshotMonitor:
-    """Capture a 2D XY slice of a field component at regular intervals."""
-    component: str      # 'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'
+    """
+    Capture a 2D XY slice of a field component at regular intervals.
+
+    ``component`` selects what is recorded:
+        - A single component: 'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'
+        - A field magnitude:  '|E|' or '|H|', where
+              |E| = sqrt(Ex² + Ey² + Ez²)
+              |H| = sqrt(Hx² + Hy² + Hz²)
+    """
+    component: str      # 'Ex'..'Hz', or '|E|' / '|H|'
     at_z: float         # z position (metres) of the XY slice (use 0 for Nz=1)
     every_N_steps: int  # record every N timesteps
     snapshots:   list = field(default_factory=list)
@@ -78,11 +86,21 @@ class SnapshotMonitor:
 
 
 def record_snapshot(monitor: SnapshotMonitor, grid: FDTDGrid) -> SnapshotMonitor:
-    """Append a 2D slice to the snapshot list if this is a recording timestep."""
+    """Append a 2D slice (component or magnitude) if this is a recording timestep."""
     if grid.time_step % monitor.every_N_steps == 0:
         k = grid.axis_index('z', monitor.at_z)
-        arr = getattr(grid, monitor.component)
-        monitor.snapshots.append(arr[:, :, k].copy())
+        comp = monitor.component
+        if comp in ('|E|', '|H|'):
+            f = comp[1]  # 'E' or 'H'
+            arr = np.sqrt(
+                getattr(grid, f + 'x')[:, :, k]**2 +
+                getattr(grid, f + 'y')[:, :, k]**2 +
+                getattr(grid, f + 'z')[:, :, k]**2
+            )
+            monitor.snapshots.append(arr)
+        else:
+            arr = getattr(grid, comp)
+            monitor.snapshots.append(arr[:, :, k].copy())
         monitor.snap_times.append(grid.time_step * _get_dt(grid))
     return monitor
 
