@@ -252,7 +252,48 @@ class PlaneSource(Source):
         self.profiles = profiles
 
     def spatial_profiles(self, grid: FDTDGrid) -> Dict[str, np.ndarray]:
-        raise NotImplementedError("PlaneSource is not implemented yet.")
+        """Place each 2D transverse profile onto the slice at ``position``.
+
+        A uniform plane wave (``profiles=None``) is not implemented yet; the
+        port-mode path (``profiles`` given, e.g. from
+        :meth:`~wavesim.mode_solver.TEMMode.to_source`) maps each
+        ``{component: 2D-array}`` onto a full-grid weight array, nonzero only on
+        the slice perpendicular to ``axis`` at the snapped cell.
+        """
+        if self.profiles is None:
+            raise NotImplementedError(
+                "PlaneSource uniform plane wave (profiles=None) is not "
+                "implemented yet; pass transverse mode profiles.")
+
+        k = grid.axis_index(self.axis, self.position)
+        # Shape of the slice perpendicular to ``axis`` (same orientation as
+        # SnapshotMonitor / the mode solver).
+        if self.axis == 'z':
+            slice_shape = (grid.Nx, grid.Ny)
+        elif self.axis == 'y':
+            slice_shape = (grid.Nx, grid.Nz)
+        elif self.axis == 'x':
+            slice_shape = (grid.Ny, grid.Nz)
+        else:
+            raise ValueError(f"axis must be 'x', 'y' or 'z', got {self.axis!r}")
+
+        out: Dict[str, np.ndarray] = {}
+        for comp, prof in self.profiles.items():
+            prof = np.asarray(prof, dtype=np.float64)
+            if prof.shape != slice_shape:
+                raise ValueError(
+                    f"PlaneSource profile for {comp!r} has shape {prof.shape}, "
+                    f"which does not match the {self.axis}-slice shape "
+                    f"{slice_shape}.")
+            full = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=np.float64)
+            if self.axis == 'z':
+                full[:, :, k] = prof
+            elif self.axis == 'y':
+                full[:, k, :] = prof
+            else:
+                full[k, :, :] = prof
+            out[comp] = full
+        return out
 
 
 class LineSource(Source):

@@ -363,6 +363,74 @@ def plot_monitor_time_series(monitor, dt: float, ax=None):
 
 
 # ======================================================================= #
+# TEM MODE VISUALISATION
+# ======================================================================= #
+
+def plot_tem_mode(mode, ax=None, n_levels: int = 20, quiver_step: int = None):
+    """
+    Plot a solved TEM mode: potential contours + transverse E field arrows.
+
+    Draws the electrostatic potential ``phi`` as filled contours, overlays the
+    transverse E field as a quiver, and outlines the PEC conductors. Per-unit-
+    length parameters (Z0, eps_eff) are shown in the title when available.
+
+    Parameters
+    ----------
+    mode : wavesim.mode_solver.TEMMode
+    ax   : matplotlib Axes, optional
+    n_levels    : int   number of filled potential contour levels
+    quiver_step : int   draw an E arrow every this many cells (auto if None)
+
+    Returns
+    -------
+    (fig, ax)
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 6))
+    else:
+        fig = ax.figure
+
+    phi = mode.phi
+    Na, Nb = phi.shape
+    La, Lb = Na * mode.da, Nb * mode.db
+    extent = [0, La, 0, Lb]
+    a_name, b_name = mode.transverse_axes
+
+    # Filled potential contours (transpose for origin='lower' imshow/contour).
+    xa = (np.arange(Na) + 0.5) * mode.da
+    yb = (np.arange(Nb) + 0.5) * mode.db
+    cf = ax.contourf(xa, yb, phi.T, levels=n_levels, cmap='RdBu_r')
+    cbar = plt.colorbar(cf, ax=ax, pad=0.02)
+    cbar.set_label('potential φ (V)', fontsize=10)
+
+    # Transverse E quiver (the two stored E components).
+    (Ea_name, Ea), (Eb_name, Eb) = list(mode.E.items())
+    if quiver_step is None:
+        quiver_step = max(1, min(Na, Nb) // 25)
+    s = quiver_step
+    AX, BY = np.meshgrid(xa[::s], yb[::s], indexing='xy')
+    ax.quiver(AX, BY, Ea.T[::s, ::s], Eb.T[::s, ::s],
+              color='k', alpha=0.7, scale_units='xy', pivot='mid')
+
+    # PEC conductor outline.
+    if mode.pec is not None and mode.pec.any():
+        ax.contour(xa, yb, mode.pec.T.astype(float), levels=[0.5],
+                   colors='dimgray', linewidths=1.5)
+
+    ax.set_aspect('equal')
+    ax.set_xlabel(f'{a_name} (m)')
+    ax.set_ylabel(f'{b_name} (m)')
+    ax.set_xlim(0, La); ax.set_ylim(0, Lb)
+    title = (f'TEM mode (conductor {mode.conductor_id}) — '
+             f'{mode.normal}-propagation')
+    if mode.impedance is not None:
+        title += f'\nZ₀ = {mode.impedance:.2f} Ω,  ε_eff = {mode.eps_eff:.3f}'
+    ax.set_title(title)
+    plt.tight_layout()
+    return fig, ax
+
+
+# ======================================================================= #
 # 3D FIELD VISUALISATIONS
 # ======================================================================= #
 #

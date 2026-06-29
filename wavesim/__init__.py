@@ -47,6 +47,7 @@ from wavesim.monitors import (
 )
 from wavesim.update import update_H, update_E
 from wavesim.simulation import Simulation
+from wavesim.mode_solver import TEMMode, solve_tem_modes
 
 __version__ = "0.2.0"
 
@@ -58,6 +59,7 @@ _LAZY = {
         "plot_grid_xy", "plot_materials_xy",
         "plot_field_snapshot", "animate_snapshots", "plot_monitor_time_series",
         "plot_field_slices_3d", "animate_field_slices_3d", "plot_energy",
+        "plot_tem_mode",
     )
 }
 
@@ -97,6 +99,8 @@ __all__ = [
     "update_H", "update_E",
     # simulation
     "Simulation",
+    # mode solver
+    "TEMMode", "solve_tem_modes",
     # viz (lazy)
     *_LAZY,
 ]
