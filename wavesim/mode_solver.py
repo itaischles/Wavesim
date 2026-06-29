@@ -39,7 +39,7 @@ import warnings
 
 import numpy as np
 from scipy import ndimage
-from scipy.sparse import lil_matrix
+from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import splu
 
 from wavesim.constants import EPS0, ETA0, C0
@@ -310,46 +310,63 @@ def _factor_laplacian(eps_a, eps_b, da, db, fixed):
     """
     Na, Nb = eps_a.shape
     free_mask = ~fixed
-    free_idx = -np.ones((Na, Nb), dtype=np.int64)
-    free_idx[free_mask] = np.arange(int(free_mask.sum()))
     n_free = int(free_mask.sum())
+    free_idx = -np.ones((Na, Nb), dtype=np.int64)
+    free_idx[free_mask] = np.arange(n_free)
 
     fixed_pq = np.argwhere(fixed)
+    n_fixed = len(fixed_pq)
     fixed_idx = -np.ones((Na, Nb), dtype=np.int64)
-    fixed_idx[fixed[:, :]] = np.arange(len(fixed_pq))
-
-    A = lil_matrix((n_free, n_free))
-    B = lil_matrix((n_free, len(fixed_pq)))
+    fixed_idx[fixed] = np.arange(n_fixed)
 
     inv_da2 = 1.0 / (da * da)
     inv_db2 = 1.0 / (db * db)
 
-    for p in range(Na):
-        for q in range(Nb):
-            if fixed[p, q]:
-                continue
-            i = free_idx[p, q]
-            diag = 0.0
-            # four faces: (dp, dq, eps-array, inv-d², axis)
-            neigh = (
-                (p + 1, q, 0.5 * (eps_a[p, q] + eps_a[min(p + 1, Na - 1), q]), inv_da2, p + 1 < Na),
-                (p - 1, q, 0.5 * (eps_a[p, q] + eps_a[max(p - 1, 0), q]),       inv_da2, p - 1 >= 0),
-                (p, q + 1, 0.5 * (eps_b[p, q] + eps_b[p, min(q + 1, Nb - 1)]), inv_db2, q + 1 < Nb),
-                (p, q - 1, 0.5 * (eps_b[p, q] + eps_b[p, max(q - 1, 0)]),       inv_db2, q - 1 >= 0),
-            )
-            for np_, nq_, eps_face, invd2, inside in neigh:
-                if not inside:
-                    continue              # omit ⇒ zero-flux (Neumann) at array edge
-                coef = eps_face * invd2
-                diag -= coef
-                if fixed[np_, nq_]:
-                    B[i, fixed_idx[np_, nq_]] += coef
-                else:
-                    A[i, free_idx[np_, nq_]] += coef
-            A[i, i] = diag
+    # The 5-point stencil is built one *face direction* at a time (4 vectorised
+    # passes), not cell-by-cell. For each direction the in-bounds region is a
+    # whole-array slice ``src`` paired with its neighbour slice ``nbr``; the face
+    # permittivity is the arithmetic mean of the two, exactly as before. Omitting
+    # the out-of-bounds border rows/columns reproduces the zero-flux (Neumann)
+    # edge. Off-diagonal couplings split by whether the neighbour is free (→ A) or
+    # pinned (→ B); the diagonal accumulates −Σ(face coef) over the same faces.
+    diag = np.zeros((Na, Nb), dtype=np.float64)
+    rows_A, cols_A, data_A = [], [], []
+    rows_B, cols_B, data_B = [], [], []
 
-    lu = splu(A.tocsc())
-    return lu, B.tocsr(), free_idx, fixed_pq
+    directions = (
+        (np.s_[0:Na - 1, :], np.s_[1:Na, :],   eps_a, inv_da2),  # +a face
+        (np.s_[1:Na, :],     np.s_[0:Na - 1, :], eps_a, inv_da2),  # -a face
+        (np.s_[:, 0:Nb - 1], np.s_[:, 1:Nb],   eps_b, inv_db2),  # +b face
+        (np.s_[:, 1:Nb],     np.s_[:, 0:Nb - 1], eps_b, inv_db2),  # -b face
+    )
+    for src, nbr, eps, invd2 in directions:
+        if eps[src].size == 0:
+            continue
+        coef = 0.5 * (eps[src] + eps[nbr]) * invd2
+        i_src = free_idx[src]
+        free_src = i_src >= 0
+        # diagonal: only free source cells own a row (fixed-cell diag is unused).
+        diag[src] -= np.where(free_src, coef, 0.0)
+        jn_free = free_idx[nbr]
+        nbr_free = jn_free >= 0
+        m_AA = free_src & nbr_free                 # free ↔ free  → A
+        rows_A.append(i_src[m_AA]); cols_A.append(jn_free[m_AA]); data_A.append(coef[m_AA])
+        m_AB = free_src & ~nbr_free                # free ↔ fixed → B
+        rows_B.append(i_src[m_AB]); cols_B.append(fixed_idx[nbr][m_AB]); data_B.append(coef[m_AB])
+
+    # Diagonal entries (A[i, i] = diag) appended last; COO sums duplicates, so the
+    # off-diagonal and diagonal contributions accumulate just like the old ``+=``.
+    rows_A.append(np.arange(n_free)); cols_A.append(np.arange(n_free)); data_A.append(diag[free_mask])
+
+    A = coo_matrix((np.concatenate(data_A),
+                    (np.concatenate(rows_A), np.concatenate(cols_A))),
+                   shape=(n_free, n_free)).tocsc()
+    B = coo_matrix((np.concatenate(data_B),
+                    (np.concatenate(rows_B), np.concatenate(cols_B))),
+                   shape=(n_free, n_fixed)).tocsr()
+
+    lu = splu(A)
+    return lu, B, free_idx, fixed_pq
 
 
 def _solve_one(lu, B, free_idx, fixed_cells, labels, fixed, energized_label):
