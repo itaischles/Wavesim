@@ -43,7 +43,9 @@ from wavesim.sources import (
 )
 from wavesim.monitors import (
     FieldProbe, SnapshotMonitor, EnergyMonitor,
+    VoltageMonitor, CurrentMonitor, circular_path,
     record_field, record_snapshot, record_energy,
+    record_voltage, record_current,
 )
 from wavesim.update import update_H, update_E
 from wavesim.simulation import Simulation
@@ -58,6 +60,7 @@ _LAZY = {
     name: "wavesim.viz" for name in (
         "plot_grid_xy", "plot_materials_xy",
         "plot_field_snapshot", "animate_snapshots", "plot_monitor_time_series",
+        "plot_voltage_current",
         "plot_field_slices_3d", "animate_field_slices_3d", "plot_energy",
         "plot_tem_mode",
     )
@@ -94,7 +97,9 @@ __all__ = [
     "Source", "PointSource", "ArraySource", "PlaneSource", "LineSource", "VolumeSource",
     # monitors
     "FieldProbe", "SnapshotMonitor", "EnergyMonitor",
+    "VoltageMonitor", "CurrentMonitor", "circular_path",
     "record_field", "record_snapshot", "record_energy",
+    "record_voltage", "record_current",
     # update
     "update_H", "update_E",
     # simulation

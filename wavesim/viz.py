@@ -12,6 +12,7 @@ FIELD DIAGNOSTICS (2D / single slice):
     plot_field_snapshot()  — single 2D field snapshot
     animate_snapshots()    — animation of SnapshotMonitor data
     plot_monitor_time_series() — FieldProbe time series (component or |E|/|H|)
+    plot_voltage_current() — VoltageMonitor / CurrentMonitor time series
     plot_energy()          — total energy vs time (log scale)
 
 FIELD DIAGNOSTICS (full 3D):
@@ -357,6 +358,72 @@ def plot_monitor_time_series(monitor, dt: float, ax=None):
     ax.set_ylabel(ylabel)
     ax.set_title('Field Monitor Time Series')
     ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig, ax
+
+
+def plot_voltage_current(monitors, ax=None):
+    """
+    1D time-series plot of VoltageMonitor / CurrentMonitor data.
+
+    Accepts a single monitor or a list. Voltages plot against the left axis
+    (V), currents against the right axis (A) — a mixed list shares one time
+    axis with twin y-axes, so a port's V(t) and I(t) overlay naturally.
+
+    Parameters
+    ----------
+    monitors : VoltageMonitor | CurrentMonitor | list of them
+    ax       : matplotlib Axes, optional (the voltage/left axis)
+
+    Returns
+    -------
+    (fig, ax) — ax is the left (voltage) axis; the current axis, if created,
+    is available as ``ax.right_ax``.
+    """
+    from wavesim.monitors import VoltageMonitor, CurrentMonitor
+
+    if not isinstance(monitors, (list, tuple)):
+        monitors = [monitors]
+    if not monitors:
+        raise ValueError("plot_voltage_current needs at least one monitor.")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(9, 4))
+    else:
+        fig = ax.figure
+
+    v_mons = [m for m in monitors if isinstance(m, VoltageMonitor)]
+    i_mons = [m for m in monitors if isinstance(m, CurrentMonitor)]
+    if len(v_mons) + len(i_mons) != len(monitors):
+        bad = [type(m).__name__ for m in monitors
+               if not isinstance(m, (VoltageMonitor, CurrentMonitor))]
+        raise TypeError(f"Expected VoltageMonitor/CurrentMonitor, got {bad}")
+
+    lines = []
+    for n, mon in enumerate(v_mons):
+        t_ns = np.array(mon.times) * 1e9
+        lines += ax.plot(t_ns, mon.values, lw=1.2, color=f'C{n}',
+                         label=f'V{n if len(v_mons) > 1 else ""}(t)')
+    ax.set_xlabel('Time (ns)')
+    if v_mons:
+        ax.set_ylabel('Voltage (V)')
+
+    if i_mons:
+        if v_mons:                       # mixed -> currents on a twin axis
+            ax_i = ax.twinx()
+            ax.right_ax = ax_i
+        else:
+            ax_i = ax
+        for n, mon in enumerate(i_mons):
+            t_ns = np.array(mon.times) * 1e9
+            lines += ax_i.plot(t_ns, mon.values, lw=1.2, ls='--',
+                               color=f'C{len(v_mons) + n}',
+                               label=f'I{n if len(i_mons) > 1 else ""}(t)')
+        ax_i.set_ylabel('Current (A)')
+
+    ax.set_title('Voltage / Current Monitors')
+    ax.legend(lines, [l.get_label() for l in lines], fontsize=9)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig, ax
