@@ -34,6 +34,10 @@ The import package is named `wavesim`.
   ideal voltage/current source, or passive resistor on a line between two
   points (semi-implicit, stable for any Z > 0) and self-records its port
   V(t)/I(t) for impedance and S-parameter extraction.
+- **SPICE co-simulation** — `SpicePort` terminates a port with a full ngspice
+  circuit (authored in LTspice or any tool), solved in lockstep with the FDTD
+  loop. Bidirectional: the port presents its Thevenin equivalent to SPICE and
+  injects the returned current each step. See [SPICE co-simulation](#spice-co-simulation-ngspice).
 - **2D TEM mode solver** — finds the PEC conductor cross-sections on a grid plane
   and solves each supported TEM mode (ε-weighted electrostatic BVP), reporting
   per-unit-length C, L, Z₀, phase velocity and ε_eff. A solved mode launches
@@ -120,6 +124,78 @@ loop, and the conventions worth committing to memory — start with
 
 ---
 
+## SPICE co-simulation (ngspice)
+
+`SpicePort` terminates an FDTD port with an arbitrary ngspice circuit, solved in
+lockstep with the time loop. It is a `LineSource` whose per-step circuit law is
+replaced by a live ngspice solve: each step the port hands ngspice its Thevenin
+equivalent (the time-centred port voltage `v_mid` behind the discrete
+self-coupling `κ/2`) and injects the returned branch current. If the circuit
+reduces to a Thevenin `(Vs, Z)` this is bit-for-bit identical to
+`LineSource(voltage=Vs, impedance=Z)` — the equivalence is validated to ~1e-12,
+and nonlinear terminations (diodes, transistors) run through the same path.
+
+### Install ngspice + PySpice
+
+Runtime is **ngspice** driven through **PySpice**. Author the netlist anywhere
+(e.g. LTspice) — it is only the interchange format; LTspice itself cannot
+lockstep.
+
+```bash
+pip install PySpice                      # into the wavesim env
+```
+
+PySpice needs the ngspice **shared library** (`ngspice.dll`), *not* the console
+build. Download the **"ngspice as a DLL"** package (`ngspice-XX_dll_64.zip`) from
+<https://ngspice.sourceforge.io/download.html> and unzip it; the library is at
+`…\Spice64_dll\dll-vs\ngspice.dll`. Pass that path to `SpicePort(library_path=…)`
+(wavesim then auto-derives `SPICE_LIB_DIR` from the package layout), or set the
+`NGSPICE_LIBRARY_PATH` / `SPICE_LIB_DIR` environment variables yourself.
+
+> PySpice's bundled `pyspice-post-installation --install-ngspice-dll` also
+> fetches the DLL, but it downloads from SourceForge over TLS — behind a strict
+> proxy the manual download above is more reliable.
+
+### Netlist authoring contract
+
+- **Name two port nodes** where the FDTD structure connects (e.g. `port1p`,
+  `port1n`); pass them as `nodes=(plus, minus)`. `plus` is the FDTD `+` terminal
+  (`p0`). wavesim splices the Thevenin companion across them — you place *no*
+  port component yourself.
+- **Provide a ground.** SPICE needs a DC path to node `0`; the simplest port ties
+  the minus terminal to ground (`nodes=("port1p", "0")`).
+- **Standard primitives only.** R/L/C, independent + controlled sources,
+  diodes/BJT/MOSFET with explicit `.model`/`.subckt` cards are portable to
+  ngspice; avoid LTspice-only library parts and behavioural `A`-devices.
+- **No analysis cards.** wavesim owns the transient — any `.tran`/`.ac`/`.op`/
+  `.probe`/`.end` in your file is stripped; `.model`/`.subckt`/`.include`/`.param`
+  are kept.
+
+### Example
+
+```python
+import wavesim as ws
+
+grid = ws.set_vacuum(ws.create_grid(Nx=140, Ny=80, Nz=1, dx=0.5e-3))
+cpml = ws.init_cpml(grid, d_pml=10)
+sim  = ws.Simulation(grid, cpml=cpml)
+
+# launch a pulse down a parallel-plate line …
+sim.add_source(ws.LineSource(p0=(15e-3, 15e-3, 0.0), p1=(15e-3, 25e-3, 0.0),
+                             voltage=ws.GaussianPulse.for_fmax(20e9), impedance=50.0))
+
+# … terminated by a SPICE circuit (driver.net names nodes port1p / 0).
+port = ws.SpicePort(p0=(50e-3, 15e-3, 0.0), p1=(50e-3, 25e-3, 0.0),
+                    netlist="driver.net", nodes=("port1p", "0"),
+                    library_path=r"C:\ngspice\Spice64_dll\dll-vs\ngspice.dll")
+sim.add_source(port)
+sim.run(2000)
+
+# port.times / port.voltages / port.currents are the co-simulated port record.
+```
+
+---
+
 ## Repository layout
 
 ```
@@ -132,7 +208,8 @@ Wavesim/
 │   ├── pml.py           # CPML init + corrections (per-face selectable)
 │   ├── pec.py           # PEC faces and interior conductor mask
 │   ├── backend_numba.py # optional Numba JIT/multithreaded drop-in for update.py + pml.py
-│   ├── sources.py       # waveforms + Source / Point / Line / Plane / Volume / Array
+│   ├── sources.py       # waveforms + Source / Point / Line / Plane / Volume / Array / SpicePort
+│   ├── spice.py         # ngspice co-simulation coupler (SpicePort backend, PySpice)
 │   ├── mode_solver.py   # 2D TEM mode solver + TEMMode.to_source port launch
 │   ├── monitors.py      # field / magnitude / snapshot / energy / voltage / current
 │   ├── simulation.py    # Simulation class — runs the canonical loop (backend='numpy'|'numba')

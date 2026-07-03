@@ -507,6 +507,107 @@ class LineSource(Source):
         self.currents.append(i_port)
 
 
+class SpicePort(LineSource):
+    """Lumped port coupled to an ngspice circuit (SPICE co-simulation).
+
+    A :class:`SpicePort` is a :class:`LineSource` whose per-step circuit law is
+    replaced by a live ngspice solve. Geometry, the self-coupling κ, the
+    time-centred (Piket-May) injection and the port recording are all inherited
+    unchanged — the *only* difference is where the impressed current comes from:
+    each step the FDTD port hands ngspice its Thévenin equivalent (voltage
+    ``v_mid`` behind ``κ/2``) and reads the resulting branch current back (see
+    :mod:`wavesim.spice`). If the ngspice circuit reduces to a Thévenin
+    ``(Vs, Z)`` the injected current matches ``LineSource(voltage=Vs,
+    impedance=Z)`` exactly — the golden equivalence test.
+
+    The two ``nodes`` must already exist in the netlist (the user's circuit
+    connects to them); wavesim splices the Thévenin companion across them.
+    ``p0``/``nodes[0]`` are the "+" terminal.
+
+    Parameters
+    ----------
+    p0, p1 : tuple of float
+        Line endpoints ``(x, y, z)`` in metres; ``p0`` is the "+" terminal.
+    netlist : str
+        Path to the SPICE netlist file.
+    nodes : (str, str)
+        Port node names ``(plus, minus)`` in the netlist.
+    library_path : str, optional
+        Full path to the ngspice shared library (else PySpice's own search /
+        ``NGSPICE_LIBRARY_PATH``).
+    sign : float
+        ±1 branch-current orientation (fixed by the golden test); default +1.
+    uic : bool
+        Pass ``uic`` to ngspice's ``.tran`` (skip the DC operating point).
+    """
+
+    def __init__(self, *,
+                 p0: Tuple[float, float, float], p1: Tuple[float, float, float],
+                 netlist: str, nodes: Tuple[str, str],
+                 library_path: str | None = None,
+                 sign: float = 1.0, uic: bool = False) -> None:
+        # Bypass LineSource.__init__ (which validates voltage/current/impedance
+        # for the analytic modes); replicate just the state _build_port / inject
+        # need. The drive is supplied by ngspice, so there is no waveform.
+        Source.__init__(self, lambda t: 0.0)
+        self.p0 = tuple(p0)
+        self.p1 = tuple(p1)
+        self.voltage = None
+        self.current = None
+        self.impedance = None
+        self.times: list = []
+        self.voltages: list = []
+        self.currents: list = []
+        self._port: dict | None = None
+        self._v_prev = 0.0
+        # SPICE side.
+        self.netlist = netlist
+        self.nodes = (str(nodes[0]), str(nodes[1]))
+        self.library_path = library_path
+        self.sign = float(sign)
+        self.uic = bool(uic)
+        self._coupler = None    # wavesim.spice.SpiceCoupler, built on first inject
+
+    def inject(self, grid: FDTDGrid, t: float) -> None:
+        if self._port is None:
+            self._port = self._build_port(grid)
+        if self._coupler is None:
+            # Import here so `import wavesim` never requires PySpice/ngspice.
+            from wavesim.spice import SpiceCoupler
+            self._coupler = SpiceCoupler(
+                netlist=self.netlist, nodes=self.nodes,
+                kappa=self._port['kappa'], dt=grid.dt,
+                library_path=self.library_path, sign=self.sign, uic=self.uic)
+            self._coupler.start()
+
+        edges = self._port['edges']
+        kappa = self._port['kappa']
+
+        # Port voltage before injection: V* = Σ E·dl (p0 → p1), post curl update.
+        v_before = 0.0
+        for comp, (ii, jj, kk, w, _coef) in edges.items():
+            v_before += float(np.dot(getattr(grid, comp)[ii, jj, kk], w))
+
+        # Time-centred port voltage handed to ngspice as the Thévenin source.
+        v_mid = 0.5 * (self._v_prev + v_before)
+        i_port = self._coupler.advance(v_mid, grid.dt)
+
+        for comp, (ii, jj, kk, w, coef) in edges.items():
+            getattr(grid, comp)[ii, jj, kk] += coef * i_port
+        v_after = v_before + kappa * i_port
+
+        self._v_prev = v_after
+        self.times.append(t)
+        self.voltages.append(v_after)
+        self.currents.append(i_port)
+
+    def close(self) -> None:
+        """Tear down the ngspice instance (optional; also freed on GC)."""
+        if self._coupler is not None:
+            self._coupler.close()
+            self._coupler = None
+
+
 class VolumeSource(Source):
     """
     Volumetric excitation / field seeding over a box region — *not yet
