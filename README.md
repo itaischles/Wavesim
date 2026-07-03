@@ -30,6 +30,10 @@ The import package is named `wavesim`.
 - **Gaussian sources** (baseband envelope + narrowband/CW recipe), plus a
   `Source` abstraction — `PointSource`, `LineSource`, `PlaneSource`,
   `VolumeSource`, `ArraySource`, or subclass your own.
+- **Lumped V-I-Z elements** — `LineSource` places a Thevenin/Norton source,
+  ideal voltage/current source, or passive resistor on a line between two
+  points (semi-implicit, stable for any Z > 0) and self-records its port
+  V(t)/I(t) for impedance and S-parameter extraction.
 - **2D TEM mode solver** — finds the PEC conductor cross-sections on a grid plane
   and solves each supported TEM mode (ε-weighted electrostatic BVP), reporting
   per-unit-length C, L, Z₀, phase velocity and ε_eff. A solved mode launches

@@ -23,7 +23,10 @@ A Source captures the three things every excitation has:
     * **temporal profile** — the shared ``waveform(t)``.
 
 Soft injection (+=) is transparent to passing waves (no impedance mismatch).
-Hard injection (=) reflects waves — do not use; every Source here adds (+=).
+Hard injection (=) reflects waves; every Source here adds (+=), with one
+documented exception: :class:`LineSource` in ideal-voltage mode (``voltage=``
+with no ``impedance=``) pins ∫E·dl on its line, which is a hard write — the
+physically correct behaviour of a zero-impedance source.
 """
 
 from abc import ABC, abstractmethod
@@ -31,7 +34,11 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Tuple, Union
 import numpy as np
 
+from wavesim.constants import EPS0
 from wavesim.grid import FDTDGrid
+# Shared with VoltageMonitor so a LineSource and a monitor on the same path
+# snap to identical Yee E-edges and agree bit-for-bit on ∫E·dl.
+from wavesim.monitors import _build_path_quadrature
 
 
 # ====================================================================== #
@@ -298,37 +305,206 @@ class PlaneSource(Source):
 
 class LineSource(Source):
     """
-    Lumped V-I-Z (Thevenin) line source between two endpoints — *not yet
-    implemented*.
+    Lumped V-I-Z element on a straight line between two endpoints.
 
-    Unlike the soft sources above, the injected excitation depends on the *local
-    field each step* (a feedback/impedance relationship), so this class will
-    override ``inject`` rather than supply a static ``spatial_profiles``.
+    The line from ``p0`` to ``p1`` is rasterised onto Yee E-edges with the same
+    quadrature as :class:`~wavesim.monitors.VoltageMonitor`, so the element's
+    port voltage V(t) = ∫E·dl (p0 → p1) is exactly what a VoltageMonitor on the
+    same path reads. ``p0`` is the "+" terminal; positive port current I(t) is
+    delivered out of ``p0`` into the surrounding structure.
+
+    Exactly one of ``voltage`` / ``current`` selects the drive (or neither, for
+    a passive resistor); ``impedance`` composes with either:
+
+    ==========================  =============================================
+    Arguments                   Element
+    ==========================  =============================================
+    ``voltage=Vs``              Ideal voltage source — pins ∫E·dl = Vs(t)
+                                each step (a *hard* write; reflects incident
+                                waves, as a zero-impedance source must).
+    ``voltage=Vs, impedance=Z`` Thevenin source: V = Vs(t) − I·Z.
+    ``current=Is``              Ideal current source — soft impressed current
+                                Is(t) along the line.
+    ``current=Is, impedance=Z`` Norton source: I = Is(t) − V/Z.
+    ``impedance=Z`` only        Passive lumped resistor: I = −V/Z
+                                (e.g. a matched termination).
+    ==========================  =============================================
+
+    Unlike the static sources above, the injection depends on the local field
+    each step (an impedance/feedback relationship), so ``inject`` is overridden.
+    An impressed current I spread along the line adds
+    ``E_a += dt · I · dl_a / (ε_a · dV_cell)`` on each occupied edge, which
+    changes the port voltage by ``κ·I`` with ``κ = Σ dt·dl²/(ε·dV)`` (the line's
+    self-coupling, ohm-like). Impedance modes use the semi-implicit current
+
+        I = (Vs(t) − (Vⁿ + Vⁿ⁺¹)/2) / Z      (Norton: Vs ≡ Z·Is)
+
+    solved for the injected I as ``(Vs − (Vⁿ + V*)/2)/(Z + κ/2)``, where ``V*``
+    is the just-curl-updated line voltage and ``Vⁿ`` the voltage at the end of
+    the previous step. This is the standard Piket-May semi-implicit lumped
+    element, time-centred across the whole step, and is stable for any Z > 0.
+    (Centring on V* alone — or the naive explicit I = (Vs−V)/Z — couples
+    unstably with the leapfrog update once Z is below a few hundred ohms.)
+
+    The element self-records its port quantities each step — ``times`` (s),
+    ``voltages`` (V, post-injection, what a co-located VoltageMonitor reads) and
+    ``currents`` (A, the injected impressed current; in ideal-voltage mode the
+    equivalent current (Vs − V_before)/κ that produces the imposed field change)
+    — so it doubles as a port for impedance / S-parameter extraction.
+
+    Two discretisation caveats, both standard for FDTD lumped elements:
+
+    * **Effective impedance.** To the surrounding field the element presents
+      ≈ ``Z + κ/2``, not Z — the κ/2 is the parasitic of the stable implicit
+      averaging (verified here by matched-launch tests on a parallel-plate
+      line). ``self_coupling(grid)`` returns κ so you can pre-compensate
+      (``impedance = Z_target − κ/2``, only possible while that stays > 0) or
+      de-embed. The recorded V(t)/I(t) are exact regardless, so port
+      extraction is unaffected.
+    * **Co-located elements.** Elements sharing line edges inject
+      sequentially, not as a jointly solved circuit, so each contributes its
+      own κ/2 in series (a 2-element voltage divider on one line settles to
+      ``Vs·Z_L/(Z + Z_L + κ)``). Combine them into a single equivalent
+      element instead.
+
+    The line typically spans the gap between two conductors; endpoints may sit
+    just inside PEC (as with the monitors), but keep the driven gap itself in
+    dielectric — E on PEC edges is zeroed every step.
 
     Parameters
     ----------
-    waveform : Callable[[float], float]
-        Open-circuit drive (Thevenin source voltage) as a function of time.
     p0, p1 : tuple of float
-        Endpoint positions ``(x, y, z)`` of the line in metres, each snapped to
-        the nearest cell against the grid.
+        Endpoints ``(x, y, z)`` in metres; ``p0`` is the "+" terminal. Any
+        orientation (oblique lines are split per-axis onto staggered edges).
+    voltage : Callable[[float], float], optional
+        Source voltage Vs(t) in volts (Thevenin open-circuit value when
+        ``impedance`` is given).
+    current : Callable[[float], float], optional
+        Source current Is(t) in amperes (Norton short-circuit value when
+        ``impedance`` is given). Mutually exclusive with ``voltage``.
     impedance : float, optional
-        Series source impedance Z (ohms); ``None`` ⇒ ideal voltage source.
+        Resistive impedance Z in ohms (> 0).
     """
 
-    def __init__(self, waveform: Callable[[float], float], *,
+    def __init__(self, *,
                  p0: Tuple[float, float, float], p1: Tuple[float, float, float],
+                 voltage: Callable[[float], float] | None = None,
+                 current: Callable[[float], float] | None = None,
                  impedance: float | None = None) -> None:
-        super().__init__(waveform)
-        self.p0 = p0
-        self.p1 = p1
+        if voltage is not None and current is not None:
+            raise ValueError(
+                "LineSource takes either voltage= or current=, not both.")
+        if voltage is None and current is None and impedance is None:
+            raise ValueError(
+                "LineSource needs a drive (voltage= or current=) and/or an "
+                "impedance= (impedance alone gives a passive resistor).")
+        if impedance is not None and not impedance > 0:
+            raise ValueError(
+                f"impedance must be a positive resistance in ohms, "
+                f"got {impedance!r}.")
+        drive = voltage if voltage is not None else current
+        super().__init__(drive if drive is not None else (lambda t: 0.0))
+        self.p0 = tuple(p0)
+        self.p1 = tuple(p1)
+        self.voltage = voltage
+        self.current = current
         self.impedance = impedance
+        # Port record (see class docstring).
+        self.times: list = []
+        self.voltages: list = []
+        self.currents: list = []
+        self._port: dict | None = None      # quadrature + coefficients, built once
+        self._v_prev = 0.0                  # port V at end of previous step (Vⁿ)
+
+    # ------------------------------------------------------------------ #
+    # Geometry compilation (once per grid)
+    # ------------------------------------------------------------------ #
+    def _build_port(self, grid: FDTDGrid) -> dict:
+        """Compile the line into per-edge quadrature and injection coefficients.
+
+        For each occupied edge: ``w`` is its path length dl_a (metres, signed),
+        shared with VoltageMonitor; ``coef = dt·w/(ε·dV)`` is the E-change per
+        unit impressed current. ``kappa = Σ w·coef`` is then the port-voltage
+        change per unit current, and ``wsq = Σ w²`` normalises the hard
+        (ideal-voltage) write ``E_a = Vs·w_a/wsq``.
+        """
+        quad = _build_path_quadrature([self.p0, self.p1], grid, 'E', close=False)
+        eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+        dV = grid.dx * grid.dy * grid.dz
+        edges = {}
+        kappa = 0.0
+        wsq = 0.0
+        for comp, (ii, jj, kk, w) in quad.items():
+            coef = grid.dt * w / (EPS0 * eps_of[comp][ii, jj, kk] * dV)
+            edges[comp] = (ii, jj, kk, w, coef)
+            kappa += float(np.dot(w, coef))
+            wsq += float(np.dot(w, w))
+        return {'edges': edges, 'kappa': kappa, 'wsq': wsq}
+
+    def self_coupling(self, grid: FDTDGrid) -> float:
+        """κ in ohms: the port-voltage change per unit injected current per
+        step, ``Σ dt·dl²/(ε·dV)`` over the line's edges. The element's
+        effective impedance to the field is ≈ ``impedance + κ/2`` (see class
+        docstring)."""
+        if self._port is None:
+            self._port = self._build_port(grid)
+        return self._port['kappa']
 
     def spatial_profiles(self, grid: FDTDGrid) -> Dict[str, np.ndarray]:
-        raise NotImplementedError("LineSource is not implemented yet.")
+        """Geometric footprint for inspection: full-grid arrays holding each
+        occupied edge's path length dl_a (metres). ``inject`` does not use
+        this — the injection is field-dependent."""
+        if self._port is None:
+            self._port = self._build_port(grid)
+        out: Dict[str, np.ndarray] = {}
+        for comp, (ii, jj, kk, w, _coef) in self._port['edges'].items():
+            full = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=np.float64)
+            full[ii, jj, kk] = w
+            out[comp] = full
+        return out
 
+    # ------------------------------------------------------------------ #
+    # Per-step injection
+    # ------------------------------------------------------------------ #
     def inject(self, grid: FDTDGrid, t: float) -> None:
-        raise NotImplementedError("LineSource is not implemented yet.")
+        if self._port is None:
+            self._port = self._build_port(grid)
+        edges = self._port['edges']
+        kappa = self._port['kappa']
+        Z = self.impedance
+
+        # Port voltage before injection: V = Σ E·dl (p0 → p1).
+        v_before = 0.0
+        for comp, (ii, jj, kk, w, _coef) in edges.items():
+            v_before += float(np.dot(getattr(grid, comp)[ii, jj, kk], w))
+
+        if self.voltage is not None and Z is None:
+            # Ideal voltage source: hard-set the line edges so ∫E·dl = Vs(t).
+            vs = self.waveform(t)
+            wsq = self._port['wsq']
+            for comp, (ii, jj, kk, w, _coef) in edges.items():
+                getattr(grid, comp)[ii, jj, kk] = vs * w / wsq
+            v_after = vs
+            i_port = (vs - v_before) / kappa    # equivalent impressed current
+        else:
+            # Time-centred circuit law: the "old" voltage is Vⁿ from the end of
+            # the previous step (the line edges are untouched between then and
+            # this step's curl update), the "new" is v_before + κ·I.
+            v_mid = 0.5 * (self._v_prev + v_before)
+            if self.voltage is not None:        # Thevenin
+                i_port = (self.waveform(t) - v_mid) / (Z + 0.5 * kappa)
+            elif Z is None:                     # ideal current source
+                i_port = self.waveform(t)
+            else:                               # Norton (resistor when Is ≡ 0)
+                i_port = (Z * self.waveform(t) - v_mid) / (Z + 0.5 * kappa)
+            for comp, (ii, jj, kk, w, coef) in edges.items():
+                getattr(grid, comp)[ii, jj, kk] += coef * i_port
+            v_after = v_before + kappa * i_port
+
+        self._v_prev = v_after
+        self.times.append(t)
+        self.voltages.append(v_after)
+        self.currents.append(i_port)
 
 
 class VolumeSource(Source):
