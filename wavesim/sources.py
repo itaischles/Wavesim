@@ -507,6 +507,96 @@ class LineSource(Source):
         self.currents.append(i_port)
 
 
+class TEMPort(LineSource):
+    """Distributed TEM-mode port: a Thévenin ``(Vs, Z₀)`` drive of a solved mode.
+
+    Where :class:`LineSource` drives a straight p0→p1 line, a :class:`TEMPort`
+    drives the frozen transverse profile of a
+    :class:`~wavesim.mode_solver.TEMMode`. The mode is solved once; each step the
+    port reads the modal voltage (an ε-weighted overlap projection of the plane
+    field onto the mode), runs the same time-centred (Piket-May) circuit law with
+    series impedance ``Z₀`` (the mode's characteristic impedance by default), and
+    injects the resulting impressed current back over the whole profile —
+    launching / terminating the mode. See
+    :meth:`~wavesim.mode_solver.TEMMode.build_port_kernel`.
+
+    The port presents ``Z₀`` to the field: the internal series resistance is
+    pre-compensated to ``Z₀ − κ/2`` (κ = modal self-coupling), so a matched line
+    sees a matched source. If ``κ/2`` exceeds ``Z₀`` (a low-impedance mode on a
+    coarse transverse grid) the semi-implicit scheme cannot be stabilised — refine
+    the transverse grid to lower κ.
+
+    With ``directional=True`` (default) the same scalar current also drives the
+    paired H sheet (the EH launch of
+    :meth:`~wavesim.mode_solver.TEMMode.to_source`), biasing energy into +normal.
+    A passive matched termination (no drive) is usually best left bidirectional
+    (``directional=False``).
+
+    Parameters
+    ----------
+    mode : TEMMode
+        A mode from :func:`~wavesim.mode_solver.solve_tem_modes` (solve with
+        ``compute_params=True`` for its ``impedance``/Z₀).
+    voltage, current : Callable[[float], float], optional
+        Thévenin ``Vs(t)`` or Norton ``Is(t)`` drive (mutually exclusive); omit
+        both for a passive matched termination.
+    impedance : float, optional
+        Series/source impedance in ohms; defaults to the mode's ``Z₀``.
+    directional : bool
+        Also drive the H sheet for a one-way launch (default True).
+    """
+
+    def __init__(self, *, mode,
+                 voltage: Callable[[float], float] | None = None,
+                 current: Callable[[float], float] | None = None,
+                 impedance: float | None = None,
+                 directional: bool = True) -> None:
+        if voltage is not None and current is not None:
+            raise ValueError(
+                "TEMPort takes either voltage= or current=, not both.")
+        z0 = impedance if impedance is not None else getattr(mode, 'impedance', None)
+        if z0 is None or not z0 > 0:
+            raise ValueError(
+                "TEMPort needs a positive impedance: the mode has no Z₀ (solve "
+                "with compute_params=True) or pass impedance= explicitly.")
+        drive = voltage if voltage is not None else current
+        Source.__init__(self, drive if drive is not None else (lambda t: 0.0))
+        self.mode = mode
+        self.voltage = voltage
+        self.current = current
+        self._z0 = float(z0)
+        self.directional = bool(directional)
+        self.impedance = None       # finalised (pre-compensated) in _build_port
+        self.p0 = self.p1 = None    # not a straight-line port
+        self.times: list = []
+        self.voltages: list = []
+        self.currents: list = []
+        self._port: dict | None = None
+        self._v_prev = 0.0
+
+    def _build_port(self, grid: FDTDGrid) -> dict:
+        kernel = self.mode.build_port_kernel(grid, directional=self.directional)
+        half_kappa = 0.5 * kernel['kappa']
+        z_int = self._z0 - half_kappa
+        if not z_int > 0:
+            raise ValueError(
+                f"TEM port κ/2 = {half_kappa:.4g} Ω exceeds the target Z₀ = "
+                f"{self._z0:.4g} Ω; the semi-implicit lumped scheme is unstable "
+                f"there — refine the transverse grid to lower κ.")
+        self.impedance = z_int
+        return kernel
+
+    def inject(self, grid: FDTDGrid, t: float) -> None:
+        # Modal V* read-back, Piket-May law, E-injection and recording are all
+        # inherited from LineSource; only the paired directional H sheet is new.
+        super().inject(grid, t)
+        hedges = self._port.get('hedges')
+        if hedges:
+            i_port = self.currents[-1]
+            for comp, (ii, jj, kk, coefH) in hedges.items():
+                getattr(grid, comp)[ii, jj, kk] += coefH * i_port
+
+
 class SpicePort(LineSource):
     """Lumped port coupled to an ngspice circuit (SPICE co-simulation).
 
@@ -520,18 +610,31 @@ class SpicePort(LineSource):
     ``(Vs, Z)`` the injected current matches ``LineSource(voltage=Vs,
     impedance=Z)`` exactly — the golden equivalence test.
 
+    The port geometry is **either** a straight line (``p0``/``p1``, as in
+    :class:`LineSource`) **or** a solved TEM mode (``mode=``, as in
+    :class:`TEMPort`, with the same distributed projection / κ / directional H
+    sheet). Exactly one of the two must be given.
+
     The two ``nodes`` must already exist in the netlist (the user's circuit
     connects to them); wavesim splices the Thévenin companion across them.
-    ``p0``/``nodes[0]`` are the "+" terminal.
+    ``p0``/``nodes[0]`` are the "+" terminal. For a ``mode=`` port put the
+    matched source resistance ``Z₀`` in the netlist itself.
 
     Parameters
     ----------
-    p0, p1 : tuple of float
-        Line endpoints ``(x, y, z)`` in metres; ``p0`` is the "+" terminal.
     netlist : str
         Path to the SPICE netlist file.
     nodes : (str, str)
         Port node names ``(plus, minus)`` in the netlist.
+    p0, p1 : tuple of float, optional
+        Line endpoints ``(x, y, z)`` in metres (``p0`` is the "+" terminal).
+        Mutually exclusive with ``mode``.
+    mode : TEMMode, optional
+        A solved mode to drive as a distributed port. Mutually exclusive with
+        ``p0``/``p1``.
+    directional : bool
+        For a ``mode=`` port, also drive the paired H sheet (one-way launch);
+        ignored for a line port. Default True.
     library_path : str, optional
         Full path to the ngspice shared library (else PySpice's own search /
         ``NGSPICE_LIBRARY_PATH``).
@@ -542,16 +645,26 @@ class SpicePort(LineSource):
     """
 
     def __init__(self, *,
-                 p0: Tuple[float, float, float], p1: Tuple[float, float, float],
                  netlist: str, nodes: Tuple[str, str],
+                 p0: Tuple[float, float, float] | None = None,
+                 p1: Tuple[float, float, float] | None = None,
+                 mode=None, directional: bool = True,
                  library_path: str | None = None,
                  sign: float = 1.0, uic: bool = False) -> None:
         # Bypass LineSource.__init__ (which validates voltage/current/impedance
         # for the analytic modes); replicate just the state _build_port / inject
         # need. The drive is supplied by ngspice, so there is no waveform.
         Source.__init__(self, lambda t: 0.0)
-        self.p0 = tuple(p0)
-        self.p1 = tuple(p1)
+        if mode is None and (p0 is None or p1 is None):
+            raise ValueError(
+                "SpicePort needs either mode= or both p0= and p1=.")
+        if mode is not None and (p0 is not None or p1 is not None):
+            raise ValueError(
+                "SpicePort takes either mode= or p0=/p1=, not both.")
+        self.mode = mode
+        self.directional = bool(directional)
+        self.p0 = tuple(p0) if p0 is not None else None
+        self.p1 = tuple(p1) if p1 is not None else None
         self.voltage = None
         self.current = None
         self.impedance = None
@@ -567,6 +680,11 @@ class SpicePort(LineSource):
         self.sign = float(sign)
         self.uic = bool(uic)
         self._coupler = None    # wavesim.spice.SpiceCoupler, built on first inject
+
+    def _build_port(self, grid: FDTDGrid) -> dict:
+        if self.mode is not None:
+            return self.mode.build_port_kernel(grid, directional=self.directional)
+        return super()._build_port(grid)
 
     def inject(self, grid: FDTDGrid, t: float) -> None:
         if self._port is None:
@@ -595,6 +713,13 @@ class SpicePort(LineSource):
         for comp, (ii, jj, kk, w, coef) in edges.items():
             getattr(grid, comp)[ii, jj, kk] += coef * i_port
         v_after = v_before + kappa * i_port
+
+        # Directional (EH) launch for a mode port: the same scalar drives the
+        # paired H sheet (feed-forward, after the implicit V*→I solve).
+        hedges = self._port.get('hedges')
+        if hedges:
+            for comp, (ii, jj, kk, coefH) in hedges.items():
+                getattr(grid, comp)[ii, jj, kk] += coefH * i_port
 
         self._v_prev = v_after
         self.times.append(t)

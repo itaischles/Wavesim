@@ -70,6 +70,17 @@ _NORMAL_CFG = {
 }
 
 
+def _plane_to_grid(normal: str, k: int, a: np.ndarray, b: np.ndarray):
+    """Map transverse-plane indices ``(a, b)`` on the slice to full 3D grid
+    indices, inverting :func:`_slice` (same (a, b) axis order)."""
+    kk = np.full(a.shape, k, dtype=a.dtype)
+    if normal == 'z':      # plane axes (x, y); slice along z
+        return a, b, kk
+    if normal == 'y':      # plane axes (x, z); slice along y
+        return a, kk, b
+    return kk, a, b        # normal == 'x': plane axes (y, z); slice along x
+
+
 @dataclass
 class TEMMode:
     """One solved TEM mode on a transverse plane.
@@ -125,6 +136,74 @@ class TEMMode:
                 profiles[comp] = amplitude * arr
         return PlaneSource(waveform, axis=self.normal, position=self.position,
                            profiles=profiles)
+
+    def build_port_kernel(self, grid: FDTDGrid, *,
+                          directional: bool = True) -> dict:
+        """Compile this mode into a distributed lumped-port kernel.
+
+        The modal generalisation of
+        :meth:`wavesim.sources.LineSource._build_port`: it replaces the straight
+        p0→p1 path with the frozen transverse mode profile, so a
+        :class:`~wavesim.sources.TEMPort` / :class:`~wavesim.sources.SpicePort`
+        can still expose a single scalar ``(V, I)`` pair to a circuit / SPICE
+        solve. With ``Ê`` the 1 V-normalised modal E profile and
+        ``S = Σ ε_r Ê²`` summed over the transverse-plane cells (both components):
+
+        * **voltage read-back** ``V* = Σ (ε_r Ê / S)·E`` — an ε-weighted overlap
+          projection: reads 1 V for the pure mode and rejects non-modal content;
+        * **current injection** ``E += κ·Ê·I`` — launches the mode shape;
+        * **modal self-coupling** ``κ = dt / (ε₀·dV·S)`` — ohms, the change in
+          ``V*`` per unit injected current per step (exactly ``LineSource``'s κ).
+
+        The returned dict mirrors ``LineSource._build_port`` (``edges``/``kappa``)
+        so the existing time-centred (Piket-May) injection runs unchanged. When
+        ``directional`` the same scalar also drives the paired H sheet
+        ``H += κ·Ĥ·I`` (the EH launch of :meth:`to_source`), biasing energy into
+        +normal. That term is added *after* the implicit ``V*→I`` solve, so it
+        does not enter κ or the stability condition ``κ/2 < Z₀``.
+        """
+        cfg = _NORMAL_CFG[self.normal]
+        dV = grid.dx * grid.dy * grid.dz
+        eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+        k = self.slice_index
+
+        # Gather nonzero plane cells per E component; accumulate S = Σ ε_r Ê².
+        gathered = {}
+        S = 0.0
+        for comp in cfg['E']:
+            Ehat2d = self.E[comp]
+            a, b = np.nonzero(Ehat2d)
+            if a.size == 0:
+                continue
+            ii, jj, kk = _plane_to_grid(self.normal, k, a, b)
+            Ehat = Ehat2d[a, b]
+            epsr = eps_of[comp][ii, jj, kk]
+            gathered[comp] = (ii, jj, kk, Ehat, epsr)
+            S += float(np.sum(epsr * Ehat ** 2))
+        if not gathered or S <= 0.0:
+            raise ValueError(
+                "TEM mode has no transverse E energy on the plane; cannot build "
+                "a port kernel.")
+
+        kappa = grid.dt / (EPS0 * dV * S)
+        edges = {}
+        for comp, (ii, jj, kk, Ehat, epsr) in gathered.items():
+            w = epsr * Ehat / S            # projection weight (metres)
+            coef = kappa * Ehat            # E-injection coefficient
+            edges[comp] = (ii, jj, kk, w, coef)
+
+        hedges = {}
+        if directional:
+            for comp in cfg['H']:
+                Hhat2d = self.H[comp]
+                a, b = np.nonzero(Hhat2d)
+                if a.size == 0:
+                    continue
+                ii, jj, kk = _plane_to_grid(self.normal, k, a, b)
+                hedges[comp] = (ii, jj, kk, kappa * Hhat2d[a, b])
+
+        return {'edges': edges, 'kappa': kappa, 'hedges': hedges,
+                'z0': self.impedance}
 
 
 # ====================================================================== #

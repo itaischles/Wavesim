@@ -41,7 +41,11 @@ The import package is named `wavesim`.
 - **2D TEM mode solver** — finds the PEC conductor cross-sections on a grid plane
   and solves each supported TEM mode (ε-weighted electrostatic BVP), reporting
   per-unit-length C, L, Z₀, phase velocity and ε_eff. A solved mode launches
-  straight into the run as a directional input port (`TEMMode.to_source`).
+  straight into the run as a fixed directional source (`TEMMode.to_source`) or as
+  a **`TEMPort`** — a circuit-driven, matched modal port: a Thevenin `(Vs, Z₀)` (or
+  a `SpicePort(mode=…)` co-sim) drives the frozen mode profile, reading back the
+  modal voltage by ε-weighted overlap projection and launching one-way by also
+  driving the paired H sheet from the same port current.
 - **Diagnostics** — point field, `|E|`/`|H|` magnitude, 2D snapshots (XY/XZ/YZ
   slice planes), line-integral voltage (∫E·dl) and current (∮H·dl) monitors, and
   total energy.
@@ -193,6 +197,22 @@ sim.run(2000)
 
 # port.times / port.voltages / port.currents are the co-simulated port record.
 ```
+
+To drive a **distributed TEM mode** rather than a single line, solve the mode and
+pass it as `mode=` (put the matched source resistance `Z₀` in the netlist):
+
+```python
+mode = ws.solve_tem_modes(grid, normal='z', position=30e-3)[0]
+port = ws.SpicePort(mode=mode, nodes=("port1p", "0"), netlist="driver.net",
+                    library_path=r"C:\ngspice\Spice64_dll\dll-vs\ngspice.dll")
+# analytic equivalent, no SPICE:  ws.TEMPort(mode=mode, voltage=Vs)  # impedance defaults to Z₀
+```
+
+The port reads the modal voltage by an ε-weighted overlap projection (rejecting
+non-modal content), presents `Z₀` to the field (pre-compensated by the discrete
+`κ/2`), and — with `directional=True` (default) — drives the paired H sheet from
+the same port current for a one-way launch. `κ/2` must stay below `Z₀`; a
+low-impedance mode on a coarse transverse grid needs a finer cross-section.
 
 ---
 
