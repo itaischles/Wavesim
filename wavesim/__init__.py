@@ -29,7 +29,7 @@ from importlib import import_module
 
 # --- numpy-only core: safe to import eagerly --------------------------------- #
 from wavesim.constants import C0, EPS0, MU0, ETA0
-from wavesim.grid import FDTDGrid, create_grid
+from wavesim.grid import FDTDGrid, create_grid, create_grid_rectilinear
 from wavesim.materials import (
     set_vacuum, set_material_arrays, set_box, set_cylinder, set_coax,
 )
@@ -86,7 +86,7 @@ __all__ = [
     # constants
     "C0", "EPS0", "MU0", "ETA0",
     # grid
-    "FDTDGrid", "create_grid",
+    "FDTDGrid", "create_grid", "create_grid_rectilinear",
     # materials
     "set_vacuum", "set_material_arrays", "set_box", "set_cylinder", "set_coax",
     # pml

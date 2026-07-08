@@ -427,14 +427,21 @@ class LineSource(Source):
         unit impressed current. ``kappa = Σ w·coef`` is then the port-voltage
         change per unit current, and ``wsq = Σ w²`` normalises the hard
         (ideal-voltage) write ``E_a = Vs·w_a/wsq``.
+
+        ``dV`` is the **local Yee cell volume at each edge** — the product of the
+        primary cell widths at that index (``dxp[i]·dyp[j]·dzp[k]``), matching the
+        all-primary divisors of :func:`wavesim.update.update_E`. On a uniform grid
+        this is the constant ``dx*dy*dz``; on a rectilinear grid it varies per
+        edge, so κ and the injection stay physically correct. ``wsq`` is purely
+        geometric (physical lengths) and is unchanged.
         """
         quad = _build_path_quadrature([self.p0, self.p1], grid, 'E', close=False)
         eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
-        dV = grid.dx * grid.dy * grid.dz
         edges = {}
         kappa = 0.0
         wsq = 0.0
         for comp, (ii, jj, kk, w) in quad.items():
+            dV = grid.dxp[ii] * grid.dyp[jj] * grid.dzp[kk]   # per-edge local volume
             coef = grid.dt * w / (EPS0 * eps_of[comp][ii, jj, kk] * dV)
             edges[comp] = (ii, jj, kk, w, coef)
             kappa += float(np.dot(w, coef))

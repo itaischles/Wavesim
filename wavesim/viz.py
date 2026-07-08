@@ -59,14 +59,16 @@ def plot_grid_xy(grid: FDTDGrid, cpml=None, ax=None):
         fig = ax.figure
 
     Nx, Ny = grid.Nx, grid.Ny
-    dx, dy = grid.dx, grid.dy
+    # Node coordinates are the true (possibly non-uniform) cell boundaries; on a
+    # uniform grid grid.x[i] == i*dx exactly.
+    xn, yn = grid.x, grid.y
 
     # Draw cell grid lines
     step = 1
     for i in range(0, Nx + 1, step):
-        ax.axvline(i * dx, color='lightgray', lw=0.5, zorder=1)
+        ax.axvline(xn[i], color='lightgray', lw=0.5, zorder=1)
     for j in range(0, Ny + 1, step):
-        ax.axhline(j * dy, color='lightgray', lw=0.5, zorder=1)
+        ax.axhline(yn[j], color='lightgray', lw=0.5, zorder=1)
 
     # Plot staggered field positions for a small representative patch
     # Show a 4x4 block in the interior (away from PML)
@@ -80,8 +82,8 @@ def plot_grid_xy(grid: FDTDGrid, cpml=None, ax=None):
         for dj in range(n_show):
             i = i0 + di
             j = j0 + dj
-            x0, y0 = i * dx, j * dy
-            hx, hy = dx, dy
+            x0, y0 = xn[i], yn[j]
+            hx, hy = grid.dxp[i], grid.dyp[j]
 
             # Ez at cell centre
             ax.scatter(x0 + 0.5*hx, y0 + 0.5*hy, marker='o',
@@ -106,13 +108,13 @@ def plot_grid_xy(grid: FDTDGrid, cpml=None, ax=None):
     if cpml is not None:
         _draw_pml_overlay(ax, grid, cpml.d_pml)
 
-    ax.set_xlim(0, Nx * dx)
-    ax.set_ylim(0, Ny * dy)
+    ax.set_xlim(xn[0], xn[-1])
+    ax.set_ylim(yn[0], yn[-1])
     ax.set_xlabel('x (m)')
     ax.set_ylabel('y (m)')
     ax.set_title(f'Yee Grid — XY plane\n'
-                 f'Nx={Nx}, Ny={Ny}, dx={dx:.4g} m, dy={dy:.4g} m\n'
-                 f'Domain: {Nx*dx:.4g} m × {Ny*dy:.4g} m')
+                 f'Nx={Nx}, Ny={Ny}, dx∈[{grid.dxp.min():.4g}, {grid.dxp.max():.4g}] m\n'
+                 f'Domain: {xn[-1]-xn[0]:.4g} m × {yn[-1]-yn[0]:.4g} m')
     ax.set_aspect('equal')
 
     # Deduplicated legend
@@ -148,27 +150,26 @@ def plot_materials_xy(grid: FDTDGrid, component: str = 'eps_z',
         fig = ax.figure
 
     Nx, Ny = grid.Nx, grid.Ny
-    dx, dy = grid.dx, grid.dy
+    # Node coordinates are the true cell boundaries — pcolormesh renders each
+    # cell at its physical width, so a non-uniform (rectilinear) grid is drawn
+    # correctly; on a uniform grid it matches the old imshow.
+    xn, yn = grid.x, grid.y
 
     arr = getattr(grid, component)[:, :, 0]   # 2D slice at k=0
 
-    # Physical extent for imshow (metres)
-    extent = [0, Nx * dx, 0, Ny * dy]
-
-    im = ax.imshow(arr.T, origin='lower', extent=extent,
-                   cmap='plasma', aspect='equal',
-                   vmin=arr.min(), vmax=max(arr.max(), arr.min() + 1e-10))
+    im = ax.pcolormesh(xn, yn, arr.T, cmap='plasma', shading='flat',
+                       vmin=arr.min(), vmax=max(arr.max(), arr.min() + 1e-10))
+    ax.set_aspect('equal')
     cbar = plt.colorbar(im, ax=ax, pad=0.02)
     cbar.set_label(component, fontsize=10)
 
-    # PEC hatch overlay
+    # PEC overlay (a masked mesh so cells sit on the true rectilinear boundaries)
     if grid.pec_mask is not None:
         pec_2d = grid.pec_mask[:, :, 0]
-        pec_rgba = np.zeros((*pec_2d.T.shape, 4))
-        pec_rgba[pec_2d.T, :] = [0.2, 0.2, 0.2, 0.6]   # dark grey, semi-opaque
-        ax.imshow(pec_rgba, origin='lower', extent=extent, aspect='equal',
-                  zorder=3)
-        # Hatch via contourf is tricky with imshow; use a patch legend entry instead
+        pec_overlay = np.ma.masked_where(~pec_2d.T, np.ones(pec_2d.T.shape))
+        ax.pcolormesh(xn, yn, pec_overlay, shading='flat',
+                      cmap=matplotlib.colors.ListedColormap([(0.2, 0.2, 0.2)]),
+                      vmin=0, vmax=1, alpha=0.6, zorder=3)
         pec_patch = mpatches.Patch(color='dimgray', alpha=0.6, label='PEC')
         ax.legend(handles=[pec_patch], loc='upper right', fontsize=9)
 
@@ -179,7 +180,7 @@ def plot_materials_xy(grid: FDTDGrid, component: str = 'eps_z',
     ax.set_xlabel('x (m)')
     ax.set_ylabel('y (m)')
     ax.set_title(f'Material map: {component} (k=0 slice)\n'
-                 f'Domain: {Nx*dx:.4g} m × {Ny*dy:.4g} m')
+                 f'Domain: {xn[-1]-xn[0]:.4g} m × {yn[-1]-yn[0]:.4g} m')
 
     plt.tight_layout()
     return fig, ax
@@ -209,16 +210,15 @@ def plot_field_snapshot(snapshot_array: np.ndarray, grid: FDTDGrid,
     else:
         fig = ax.figure
 
-    Nx, Ny = grid.Nx, grid.Ny
-    extent = [0, Nx * grid.dx, 0, Ny * grid.dy]
+    xn, yn = grid.x, grid.y            # true cell boundaries (non-uniform aware)
 
     vmax = np.max(np.abs(snapshot_array))
     if vmax < 1e-30:
         vmax = 1.0
 
-    im = ax.imshow(snapshot_array.T, origin='lower', extent=extent,
-                   cmap='RdBu_r', aspect='equal',
-                   vmin=-vmax, vmax=vmax)
+    im = ax.pcolormesh(xn, yn, snapshot_array.T, cmap='RdBu_r',
+                       shading='flat', vmin=-vmax, vmax=vmax)
+    ax.set_aspect('equal')
     cbar = plt.colorbar(im, ax=ax, pad=0.02)
     cbar.set_label(f'{component} (V/m or A/m)', fontsize=9)
 
@@ -274,7 +274,8 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50,
         imshow_kw = dict(vmin=-vmax, vmax=vmax)
 
     Nx, Ny = grid.Nx, grid.Ny
-    extent = [0, Nx * grid.dx, 0, Ny * grid.dy]
+    # Physical extent from the true node coordinates (== N*ds on a uniform grid).
+    extent = [grid.x[0], grid.x[-1], grid.y[0], grid.y[-1]]
 
     # Contour levels: log-spaced (symmetric about zero) or linearly spaced.
     if contour:
@@ -284,8 +285,9 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50,
         else:
             levels = np.linspace(-vmax, vmax, 2 * n_contours + 1)
         # contour() needs coordinate vectors matching the transposed data (Ny, Nx)
-        xc = np.linspace(extent[0], extent[1], Nx)
-        yc = np.linspace(extent[2], extent[3], Ny)
+        # — use the true cell centres so contours land correctly on a graded grid.
+        xc = grid.xc
+        yc = grid.yc
 
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(snaps[0].T, origin='lower', extent=extent,
@@ -459,13 +461,21 @@ def plot_tem_mode(mode, ax=None, n_levels: int = 20, quiver_step: int = None):
 
     phi = mode.phi
     Na, Nb = phi.shape
-    La, Lb = Na * mode.da, Nb * mode.db
-    extent = [0, La, 0, Lb]
     a_name, b_name = mode.transverse_axes
 
+    # Transverse node coordinates (true cell boundaries) → correct extents and
+    # cell-center sample positions on a non-uniform mesh. Fall back to a uniform
+    # da/db ruler for legacy modes that carry no node arrays.
+    a_nodes = (mode.a_nodes if mode.a_nodes is not None
+               else np.arange(Na + 1) * mode.da)
+    b_nodes = (mode.b_nodes if mode.b_nodes is not None
+               else np.arange(Nb + 1) * mode.db)
+    La, Lb = a_nodes[-1] - a_nodes[0], b_nodes[-1] - b_nodes[0]
+    a0, b0 = a_nodes[0], b_nodes[0]
+
     # Filled potential contours (transpose for origin='lower' imshow/contour).
-    xa = (np.arange(Na) + 0.5) * mode.da
-    yb = (np.arange(Nb) + 0.5) * mode.db
+    xa = 0.5 * (a_nodes[:-1] + a_nodes[1:])     # cell centres along axis a
+    yb = 0.5 * (b_nodes[:-1] + b_nodes[1:])
     cf = ax.contourf(xa, yb, phi.T, levels=n_levels, cmap='RdBu_r')
     cbar = plt.colorbar(cf, ax=ax, pad=0.02)
     cbar.set_label('potential φ (V)', fontsize=10)
@@ -487,7 +497,7 @@ def plot_tem_mode(mode, ax=None, n_levels: int = 20, quiver_step: int = None):
     ax.set_aspect('equal')
     ax.set_xlabel(f'{a_name} (m)')
     ax.set_ylabel(f'{b_name} (m)')
-    ax.set_xlim(0, La); ax.set_ylim(0, Lb)
+    ax.set_xlim(a0, a0 + La); ax.set_ylim(b0, b0 + Lb)
     title = (f'TEM mode (conductor {mode.conductor_id}) — '
              f'{mode.normal}-propagation')
     if mode.impedance is not None:
@@ -572,9 +582,11 @@ def plot_field_slices_3d(data, grid: FDTDGrid, component: str = '',
         cmap = 'RdBu_r' if symmetric else 'inferno'
     vmin = -vmax if symmetric else 0.0
 
-    Lx, Ly, Lz = Nx * grid.dx, Ny * grid.dy, Nz * grid.dz
-    xi, yj = i * grid.dx, j * grid.dy
-    zk = k * grid.dz
+    # Physical extents and cut positions from the true node coordinates (each
+    # equals N*ds / i*ds on a uniform grid, but tracks a graded mesh correctly).
+    Lx, Ly, Lz = grid.x[-1], grid.y[-1], grid.z[-1]
+    xi, yj = grid.x[i], grid.y[j]
+    zk = grid.z[k]
 
     own_fig = axes is None
     if own_fig:
@@ -588,23 +600,27 @@ def plot_field_slices_3d(data, grid: FDTDGrid, component: str = '',
         fig = ax_xy.figure
     cross_kw = dict(color='limegreen', lw=0.8, ls='--', alpha=0.8)
 
-    # XY plane at k (transverse cross-section: keep it physically square)
-    im = ax_xy.imshow(arr[:, :, k].T, origin='lower', extent=[0, Lx, 0, Ly],
-                      cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal')
+    # XY plane at k (transverse cross-section: keep it physically square).
+    # pcolormesh on the node coordinates renders a graded mesh at true widths.
+    im = ax_xy.pcolormesh(grid.x, grid.y, arr[:, :, k].T, shading='flat',
+                          cmap=cmap, vmin=vmin, vmax=vmax)
+    ax_xy.set_aspect('equal')
     ax_xy.axvline(xi, **cross_kw); ax_xy.axhline(yj, **cross_kw)
     ax_xy.set_xlabel('x (m)'); ax_xy.set_ylabel('y (m)')
     ax_xy.set_title(f'XY plane  (k={k}, z={zk:.4g} m)')
 
     # XZ plane at j (z horizontal — usually the long axis)
-    ax_xz.imshow(arr[:, j, :], origin='lower', extent=[0, Lz, 0, Lx],
-                 cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
+    ax_xz.pcolormesh(grid.z, grid.x, arr[:, j, :], shading='flat',
+                     cmap=cmap, vmin=vmin, vmax=vmax)
+    ax_xz.set_aspect('auto')
     ax_xz.axvline(zk, **cross_kw); ax_xz.axhline(xi, **cross_kw)
     ax_xz.set_xlabel('z (m)'); ax_xz.set_ylabel('x (m)')
     ax_xz.set_title(f'XZ plane  (j={j}, y={yj:.4g} m)')
 
     # YZ plane at i (z horizontal)
-    ax_yz.imshow(arr[i, :, :], origin='lower', extent=[0, Lz, 0, Ly],
-                 cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
+    ax_yz.pcolormesh(grid.z, grid.y, arr[i, :, :], shading='flat',
+                     cmap=cmap, vmin=vmin, vmax=vmax)
+    ax_yz.set_aspect('auto')
     ax_yz.axvline(zk, **cross_kw); ax_yz.axhline(yj, **cross_kw)
     ax_yz.set_xlabel('z (m)'); ax_yz.set_ylabel('y (m)')
     ax_yz.set_title(f'YZ plane  (i={i}, x={xi:.4g} m)')
@@ -742,22 +758,26 @@ def _draw_pml_overlay(ax, grid: FDTDGrid, d_pml: int):
     Called internally by plot_grid_xy and plot_materials_xy.
     """
     Nx, Ny = grid.Nx, grid.Ny
-    dx, dy = grid.dx, grid.dy
+    xn, yn = grid.x, grid.y
 
-    Lx = Nx * dx
-    Ly = Ny * dy
-    d_x = d_pml * dx
-    d_y = d_pml * dy
+    # Domain span and PML-shell thickness from the true node coordinates. The
+    # non-uniform rehaul keeps the outer d_pml cells uniform, so this equals
+    # d_pml*dx on a uniform grid and the real shell width otherwise.
+    x0, y0 = xn[0], yn[0]
+    Lx = xn[-1] - x0
+    Ly = yn[-1] - y0
+    d_x = xn[d_pml] - x0
+    d_y = yn[d_pml] - y0
 
     pml_color = (0.4, 0.7, 0.9, 0.25)  # light blue, semi-transparent
     edge_kw = dict(linewidth=1.2, edgecolor='steelblue', linestyle='--')
 
     # 4 rectangular slabs (may overlap at corners — that's fine)
     rects = [
-        Rectangle((0,      0),      d_x,  Ly),   # x-low
-        Rectangle((Lx-d_x, 0),      d_x,  Ly),   # x-high
-        Rectangle((0,      0),      Lx,   d_y),   # y-low
-        Rectangle((0,      Ly-d_y), Lx,   d_y),   # y-high
+        Rectangle((x0,           y0),           d_x,  Ly),   # x-low
+        Rectangle((x0 + Lx-d_x,  y0),           d_x,  Ly),   # x-high
+        Rectangle((x0,           y0),           Lx,   d_y),   # y-low
+        Rectangle((x0,           y0 + Ly-d_y),  Lx,   d_y),   # y-high
     ]
     for rect in rects:
         rect.set_facecolor(pml_color)
@@ -768,9 +788,9 @@ def _draw_pml_overlay(ax, grid: FDTDGrid, d_pml: int):
         ax.add_patch(rect)
 
     # Label one corner
-    ax.text(d_x / 2, Ly / 2,
+    ax.text(x0 + d_x / 2, y0 + Ly / 2,
             f'PML\n{d_pml} cells', ha='center', va='center',
             fontsize=7, color='steelblue', rotation=90, zorder=5)
-    ax.text(Lx - d_x / 2, Ly / 2,
+    ax.text(x0 + Lx - d_x / 2, y0 + Ly / 2,
             f'PML\n{d_pml} cells', ha='center', va='center',
             fontsize=7, color='steelblue', rotation=90, zorder=5)

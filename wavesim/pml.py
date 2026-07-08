@@ -113,13 +113,63 @@ class CPMLArrays:
     byE_s: np.ndarray; cyE_s: np.ndarray     # shape (1, n_yE, 1)
     bzE_s: np.ndarray; czE_s: np.ndarray     # shape (1, 1, n_zE)
 
+    # --- Per-cell spacing sampled at sel_*, reshaped to broadcast (Session 4) -- #
+    # The CPML correction is part of the SAME curl as the base field update, so
+    # its derivative divisor must match update.py cell-for-cell: DUAL widths on
+    # the H-side psi (which correct E-derivatives, like update_H) and PRIMARY
+    # widths on the E-side psi (which correct H-derivatives, like update_E). Each
+    # is sampled at that face's slab indices and reshaped to broadcast along the
+    # derivative axis. On a uniform grid they are the constant PML spacing, so
+    # this is bit-identical to the pre-rehaul scalar ``/ds`` divisor.
+    #   H-side sampled at sel_*H          -> dual width dd[sel]
+    #   E-side sampled at sel_*E - 1      -> primary width dp[sel-1]  (Yee [1:] cell
+    #                                        j is driven by the diff at output j-1)
+    dxd_sH: np.ndarray; dyd_sH: np.ndarray; dzd_sH: np.ndarray   # H-side (dual)
+    dxp_sE: np.ndarray; dyp_sE: np.ndarray; dzp_sE: np.ndarray   # E-side (primary)
+
     d_pml: int             # PML thickness in cells
 
 
 # ---------------------------------------------------------------------- #
 # Profile construction
 # ---------------------------------------------------------------------- #
-def _calc_profile_1d(N, ds, dt, d_pml, staggered, low=True, high=True):
+def _pml_face_widths(dp, d_pml, low, high, axis):
+    """(ds_lo, ds_hi): the constant PML cell width at the low- and high-index
+    absorbing faces of one axis, read off the primary spacing array ``dp``.
+
+    Non-uniform CPML relies on the **uniform-PML constraint**: the outermost
+    ``d_pml`` cells of each absorbing face have constant spacing (the future mesh
+    generator guarantees this; it keeps the delicate grading math essentially
+    unchanged). The solver still handles a different constant per face, but not a
+    graded PML — so we assert the constraint holds and fail loudly on a mesh that
+    violates it instead of silently mis-grading the absorber. A per-cell
+    ``sigma_max`` + cumulative-sum profile would lift this restriction; it is a
+    documented follow-on, not built here.
+
+    Only enabled faces on a thick-enough axis are checked; the edge widths
+    ``dp[0]`` / ``dp[-1]`` are returned regardless (unused where the profile is
+    inert, e.g. an Nz=1 slice).
+    """
+    N = len(dp)
+    ds_lo = float(dp[0])
+    ds_hi = float(dp[-1])
+    if N > 2 * d_pml:
+        if low and not np.allclose(dp[:d_pml], ds_lo):
+            raise ValueError(
+                f"Non-uniform CPML requires a uniform PML shell: the {d_pml} "
+                f"cells at the low {axis}-face are not constant width "
+                f"({dp[:d_pml].min():.3e}..{dp[:d_pml].max():.3e} m). Keep the "
+                f"outer d_pml cells at constant spacing per axis.")
+        if high and not np.allclose(dp[N - d_pml:], ds_hi):
+            raise ValueError(
+                f"Non-uniform CPML requires a uniform PML shell: the {d_pml} "
+                f"cells at the high {axis}-face are not constant width "
+                f"({dp[N - d_pml:].min():.3e}..{dp[N - d_pml:].max():.3e} m). "
+                f"Keep the outer d_pml cells at constant spacing per axis.")
+    return ds_lo, ds_hi
+
+
+def _calc_profile_1d(N, ds_lo, ds_hi, dt, d_pml, staggered, low=True, high=True):
     """
     Build the 1D (b, c) CPML coefficient arrays along one axis.
 
@@ -132,6 +182,17 @@ def _calc_profile_1d(N, ds, dt, d_pml, staggered, low=True, high=True):
     where d is the depth into the PML (0 at the inner edge, d_pml*ds at the
     domain boundary). Returns (b, c) of length N; both reduce to (1, 0)
     outside the PML so the correction vanishes in the interior.
+
+    Non-uniform grid (Session 4)
+    ----------------------------
+    ``ds_lo`` / ``ds_hi`` are the (constant) PML cell widths at the low- and
+    high-index faces (from :func:`_pml_face_widths`). Under the uniform-PML
+    constraint the outermost ``d_pml`` cells of each face are constant, so the
+    grading *depth* is purely index-based — the depth ratios below cancel ``ds``
+    exactly — and the only place the physical width enters is
+    ``sigma_max = 0.8*(m+1)/(ETA0*ds)``. Each slab therefore uses its own face
+    width. On a uniform grid ``ds_lo == ds_hi`` equal today's scalar spacing, so
+    this reproduces the pre-rehaul profile bit-for-bit.
 
     Parameters
     ----------
@@ -151,29 +212,24 @@ def _calc_profile_1d(N, ds, dt, d_pml, staggered, low=True, high=True):
         return b, c
 
     m = 3
-    sigma_max = 0.8 * (m + 1) / (ETA0 * ds)
     alpha_max = 0.05
-    d_pml_len = d_pml * ds
-
-    # Inner edges of the two PML slabs, in metres.
-    left_edge = d_pml * ds
-    right_edge = (N - d_pml) * ds
+    idx = np.arange(N)
 
     sigma = np.zeros(N)
     alpha = np.zeros(N)
 
-    # Coordinate of each cell along this axis. The E-field derivatives that
-    # this profile corrects are centred half a cell to the LEFT of the index
-    # (e.g. Ez[i] is driven by Hy[i]-Hy[i-1], centred at x=(i-0.5)*ds), so the
-    # staggered grid uses a -0.5 offset — matching the differencing in
-    # update.py. Using +0.5 here mis-aligns the two PML slabs in opposite
-    # directions and produces phase-reversed residual reflections.
-    idx = np.arange(N)
-    coord = (idx - 0.5) * ds if staggered else idx * ds
-
     # Left slab (low-index face): depth grows towards the boundary (coord -> 0).
-    # clip handles the unused over-range staggered node at idx=0 (coord<0).
+    # The E-field derivatives this profile corrects are centred half a cell to
+    # the LEFT of the index (e.g. Ez[i] is driven by Hy[i]-Hy[i-1], centred at
+    # x=(i-0.5)*ds), so the staggered grid uses a -0.5 offset — matching the
+    # differencing in update.py. Using +0.5 here mis-aligns the two PML slabs in
+    # opposite directions and produces phase-reversed residual reflections. clip
+    # handles the unused over-range staggered node at idx=0 (coord < 0).
     if low:
+        sigma_max = 0.8 * (m + 1) / (ETA0 * ds_lo)
+        d_pml_len = d_pml * ds_lo
+        left_edge = d_pml * ds_lo
+        coord = (idx - 0.5) * ds_lo if staggered else idx * ds_lo
         left = coord < left_edge
         depth_l = np.clip((left_edge - coord[left]) / d_pml_len, 0.0, 1.0)
         sigma[left] = sigma_max * depth_l ** m
@@ -181,6 +237,10 @@ def _calc_profile_1d(N, ds, dt, d_pml, staggered, low=True, high=True):
 
     # Right slab (high-index face): depth grows towards the boundary (coord -> N*ds).
     if high:
+        sigma_max = 0.8 * (m + 1) / (ETA0 * ds_hi)
+        d_pml_len = d_pml * ds_hi
+        right_edge = (N - d_pml) * ds_hi
+        coord = (idx - 0.5) * ds_hi if staggered else idx * ds_hi
         right = coord > right_edge
         depth_r = np.clip((coord[right] - right_edge) / d_pml_len, 0.0, 1.0)
         sigma[right] = sigma_max * depth_r ** m
@@ -255,12 +315,21 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
 
     Nx, Ny, Nz = grid.Nx, grid.Ny, grid.Nz
 
-    bx_E, cx_E = _calc_profile_1d(Nx, grid.dx, grid.dt, d_pml, True,  x_lo, x_hi)
-    bx_H, cx_H = _calc_profile_1d(Nx, grid.dx, grid.dt, d_pml, False, x_lo, x_hi)
-    by_E, cy_E = _calc_profile_1d(Ny, grid.dy, grid.dt, d_pml, True,  y_lo, y_hi)
-    by_H, cy_H = _calc_profile_1d(Ny, grid.dy, grid.dt, d_pml, False, y_lo, y_hi)
-    bz_E, cz_E = _calc_profile_1d(Nz, grid.dz, grid.dt, d_pml, True,  z_lo, z_hi)
-    bz_H, cz_H = _calc_profile_1d(Nz, grid.dz, grid.dt, d_pml, False, z_lo, z_hi)
+    # PML cell width per face, from the primary spacing arrays (the true cell
+    # widths). On a uniform grid these equal grid.dx/dy/dz exactly; on a
+    # non-uniform grid grid.dx is the *minimum* interior width and must NOT be
+    # used here — the profile grades against the uniform PML shell, not the fine
+    # interior. _pml_face_widths also asserts that shell is uniform.
+    dsx_lo, dsx_hi = _pml_face_widths(grid.dxp, d_pml, x_lo, x_hi, 'x')
+    dsy_lo, dsy_hi = _pml_face_widths(grid.dyp, d_pml, y_lo, y_hi, 'y')
+    dsz_lo, dsz_hi = _pml_face_widths(grid.dzp, d_pml, z_lo, z_hi, 'z')
+
+    bx_E, cx_E = _calc_profile_1d(Nx, dsx_lo, dsx_hi, grid.dt, d_pml, True,  x_lo, x_hi)
+    bx_H, cx_H = _calc_profile_1d(Nx, dsx_lo, dsx_hi, grid.dt, d_pml, False, x_lo, x_hi)
+    by_E, cy_E = _calc_profile_1d(Ny, dsy_lo, dsy_hi, grid.dt, d_pml, True,  y_lo, y_hi)
+    by_H, cy_H = _calc_profile_1d(Ny, dsy_lo, dsy_hi, grid.dt, d_pml, False, y_lo, y_hi)
+    bz_E, cz_E = _calc_profile_1d(Nz, dsz_lo, dsz_hi, grid.dt, d_pml, True,  z_lo, z_hi)
+    bz_H, cz_H = _calc_profile_1d(Nz, dsz_lo, dsz_hi, grid.dt, d_pml, False, z_lo, z_hi)
 
     # Active boundary-slab indices along each (axis, grid).
     sel_xH = _slab_indices(cx_H, 'H'); sel_xE = _slab_indices(cx_E, 'E')
@@ -284,6 +353,16 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
     bxE_s, cxE_s = _rs(bx_E, sel_xE, 0), _rs(cx_E, sel_xE, 0)
     byE_s, cyE_s = _rs(by_E, sel_yE, 1), _rs(cy_E, sel_yE, 1)
     bzE_s, czE_s = _rs(bz_E, sel_zE, 2), _rs(cz_E, sel_zE, 2)
+
+    # Per-cell spacing divisors sampled at the slab indices (Session 4). The CPML
+    # correction shares the base update's curl, so it uses the same divisor: dual
+    # widths on the H-side (sampled at sel_*H, like update_H's dyd[sy]) and
+    # primary widths on the E-side (sampled at sel_*E - 1, since the Yee [1:] cell
+    # j is driven by the diff at output index j-1, like update_E's dyp[sy-1]).
+    dxd_sH = _rs(grid.dxd, sel_xH, 0); dyd_sH = _rs(grid.dyd, sel_yH, 1)
+    dzd_sH = _rs(grid.dzd, sel_zH, 2)
+    dxp_sE = _rs(grid.dxp, sel_xE - 1, 0); dyp_sE = _rs(grid.dyp, sel_yE - 1, 1)
+    dzp_sE = _rs(grid.dzp, sel_zE - 1, 2)
 
     # Allocate each psi slab: full on the two orthogonal axes, len(sel) on the
     # derivative axis.
@@ -311,6 +390,9 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
         bzH_s=bzH_s, czH_s=czH_s,
         bxE_s=bxE_s, cxE_s=cxE_s, byE_s=byE_s, cyE_s=cyE_s,
         bzE_s=bzE_s, czE_s=czE_s,
+        # Sampled per-cell spacing divisors
+        dxd_sH=dxd_sH, dyd_sH=dyd_sH, dzd_sH=dzd_sH,
+        dxp_sE=dxp_sE, dyp_sE=dyp_sE, dzp_sE=dzp_sE,
         d_pml=d_pml,
     )
 
@@ -330,20 +412,23 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     full-volume formulation since every dropped cell held 0.
     """
     dt = grid.dt
-    dx, dy, dz = grid.dx, grid.dy, grid.dz
     Nz = grid.Nz
     sx, sy, sz = cpml.sel_xH, cpml.sel_yH, cpml.sel_zH
+    # Non-uniform divisors: every E-derivative in the H-side curl is divided by
+    # the DUAL width, sampled at the slab indices (Session 4). On a uniform grid
+    # these are the constant PML spacing → bit-identical to the old scalar /ds.
+    dxd, dyd, dzd = cpml.dxd_sH, cpml.dyd_sH, cpml.dzd_sH
 
     # ---------- Hx  (curl term: dEz/dy - dEy/dz) ----------
     # dEz/dy lives at the Hx location -> non-staggered (H) profile along y.
-    dEz_dy = (grid.Ez[:, sy + 1, :] - grid.Ez[:, sy, :]) / dy         # (Nx, n_yH, Nz)
+    dEz_dy = (grid.Ez[:, sy + 1, :] - grid.Ez[:, sy, :]) / dyd        # (Nx, n_yH, Nz)
     cpml.psi_Ez_y = cpml.byH_s * cpml.psi_Ez_y + cpml.cyH_s * dEz_dy
 
     if Nz > 1:
         grid.Hx[:, sy, :-1] -= (dt / (MU0 * grid.mu_x[:, sy, :-1])) \
             * cpml.psi_Ez_y[:, :, :-1]
 
-        dEy_dz = (grid.Ey[:, :, sz + 1] - grid.Ey[:, :, sz]) / dz     # (Nx, Ny, n_zH)
+        dEy_dz = (grid.Ey[:, :, sz + 1] - grid.Ey[:, :, sz]) / dzd    # (Nx, Ny, n_zH)
         cpml.psi_Ey_z = cpml.bzH_s * cpml.psi_Ey_z + cpml.czH_s * dEy_dz
         grid.Hx[:, :-1, sz] += (dt / (MU0 * grid.mu_x[:, :-1, sz])) \
             * cpml.psi_Ey_z[:, :-1, :]
@@ -352,14 +437,14 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
 
     # ---------- Hy  (curl term: dEx/dz - dEz/dx) ----------
     # dEz/dx lives at the Hy location -> non-staggered (H) profile along x.
-    dEz_dx = (grid.Ez[sx + 1, :, :] - grid.Ez[sx, :, :]) / dx         # (n_xH, Ny, Nz)
+    dEz_dx = (grid.Ez[sx + 1, :, :] - grid.Ez[sx, :, :]) / dxd        # (n_xH, Ny, Nz)
     cpml.psi_Ez_x = cpml.bxH_s * cpml.psi_Ez_x + cpml.cxH_s * dEz_dx
 
     if Nz > 1:
         grid.Hy[sx, :, :-1] += (dt / (MU0 * grid.mu_y[sx, :, :-1])) \
             * cpml.psi_Ez_x[:, :, :-1]
 
-        dEx_dz = (grid.Ex[:, :, sz + 1] - grid.Ex[:, :, sz]) / dz     # (Nx, Ny, n_zH)
+        dEx_dz = (grid.Ex[:, :, sz + 1] - grid.Ex[:, :, sz]) / dzd    # (Nx, Ny, n_zH)
         cpml.psi_Ex_z = cpml.bzH_s * cpml.psi_Ex_z + cpml.czH_s * dEx_dz
         grid.Hy[:-1, :, sz] -= (dt / (MU0 * grid.mu_y[:-1, :, sz])) \
             * cpml.psi_Ex_z[:-1, :, :]
@@ -368,13 +453,13 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
 
     # ---------- Hz  (curl term: dEy/dx - dEx/dy) ----------
     # dEy/dx lives at the Hz location -> non-staggered (H) profile along x.
-    dEy_dx = (grid.Ey[sx + 1, :, :] - grid.Ey[sx, :, :]) / dx         # (n_xH, Ny, Nz)
+    dEy_dx = (grid.Ey[sx + 1, :, :] - grid.Ey[sx, :, :]) / dxd        # (n_xH, Ny, Nz)
     cpml.psi_Ey_x = cpml.bxH_s * cpml.psi_Ey_x + cpml.cxH_s * dEy_dx
     grid.Hz[sx, :-1, :] -= (dt / (MU0 * grid.mu_z[sx, :-1, :])) \
         * cpml.psi_Ey_x[:, :-1, :]
 
     # dEx/dy lives at the Hz location -> non-staggered (H) profile along y.
-    dEx_dy = (grid.Ex[:, sy + 1, :] - grid.Ex[:, sy, :]) / dy         # (Nx, n_yH, Nz)
+    dEx_dy = (grid.Ex[:, sy + 1, :] - grid.Ex[:, sy, :]) / dyd        # (Nx, n_yH, Nz)
     cpml.psi_Ex_y = cpml.byH_s * cpml.psi_Ex_y + cpml.cyH_s * dEx_dy
     grid.Hz[:-1, sy, :] += (dt / (MU0 * grid.mu_z[:-1, sy, :])) \
         * cpml.psi_Ex_y[:-1, :, :]
@@ -397,20 +482,23 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     so the differences below read (F[sel] - F[sel-1]).
     """
     dt = grid.dt
-    dx, dy, dz = grid.dx, grid.dy, grid.dz
     Nz = grid.Nz
     sx, sy, sz = cpml.sel_xE, cpml.sel_yE, cpml.sel_zE
+    # Non-uniform divisors: every H-derivative in the E-side curl is divided by
+    # the PRIMARY width, sampled at sel_* - 1 (Session 4). On a uniform grid these
+    # are the constant PML spacing → bit-identical to the old scalar /ds.
+    dxp, dyp, dzp = cpml.dxp_sE, cpml.dyp_sE, cpml.dzp_sE
 
     # ---------- Ex  (curl term: dHz/dy - dHy/dz) ----------
     # dHz/dy lives at the Ex location -> staggered (E) profile along y.
-    dHz_dy = (grid.Hz[:, sy, :] - grid.Hz[:, sy - 1, :]) / dy         # (Nx, n_yE, Nz)
+    dHz_dy = (grid.Hz[:, sy, :] - grid.Hz[:, sy - 1, :]) / dyp        # (Nx, n_yE, Nz)
     cpml.psi_Hz_y = cpml.byE_s * cpml.psi_Hz_y + cpml.cyE_s * dHz_dy
 
     if Nz > 1:
         grid.Ex[:, sy, 1:] += (dt / (EPS0 * grid.eps_x[:, sy, 1:])) \
             * cpml.psi_Hz_y[:, :, 1:]
 
-        dHy_dz = (grid.Hy[:, :, sz] - grid.Hy[:, :, sz - 1]) / dz     # (Nx, Ny, n_zE)
+        dHy_dz = (grid.Hy[:, :, sz] - grid.Hy[:, :, sz - 1]) / dzp    # (Nx, Ny, n_zE)
         cpml.psi_Hy_z = cpml.bzE_s * cpml.psi_Hy_z + cpml.czE_s * dHy_dz
         grid.Ex[:, 1:, sz] -= (dt / (EPS0 * grid.eps_x[:, 1:, sz])) \
             * cpml.psi_Hy_z[:, 1:, :]
@@ -419,14 +507,14 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
 
     # ---------- Ey  (curl term: dHx/dz - dHz/dx) ----------
     # dHz/dx lives at the Ey location -> staggered (E) profile along x.
-    dHz_dx = (grid.Hz[sx, :, :] - grid.Hz[sx - 1, :, :]) / dx         # (n_xE, Ny, Nz)
+    dHz_dx = (grid.Hz[sx, :, :] - grid.Hz[sx - 1, :, :]) / dxp        # (n_xE, Ny, Nz)
     cpml.psi_Hz_x = cpml.bxE_s * cpml.psi_Hz_x + cpml.cxE_s * dHz_dx
 
     if Nz > 1:
         grid.Ey[sx, :, 1:] -= (dt / (EPS0 * grid.eps_y[sx, :, 1:])) \
             * cpml.psi_Hz_x[:, :, 1:]
 
-        dHx_dz = (grid.Hx[:, :, sz] - grid.Hx[:, :, sz - 1]) / dz     # (Nx, Ny, n_zE)
+        dHx_dz = (grid.Hx[:, :, sz] - grid.Hx[:, :, sz - 1]) / dzp    # (Nx, Ny, n_zE)
         cpml.psi_Hx_z = cpml.bzE_s * cpml.psi_Hx_z + cpml.czE_s * dHx_dz
         grid.Ey[1:, :, sz] += (dt / (EPS0 * grid.eps_y[1:, :, sz])) \
             * cpml.psi_Hx_z[1:, :, :]
@@ -435,13 +523,13 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
 
     # ---------- Ez  (curl term: dHy/dx - dHx/dy) ----------
     # dHy/dx lives at the Ez location -> staggered (E) profile along x.
-    dHy_dx = (grid.Hy[sx, :, :] - grid.Hy[sx - 1, :, :]) / dx         # (n_xE, Ny, Nz)
+    dHy_dx = (grid.Hy[sx, :, :] - grid.Hy[sx - 1, :, :]) / dxp        # (n_xE, Ny, Nz)
     cpml.psi_Hy_x = cpml.bxE_s * cpml.psi_Hy_x + cpml.cxE_s * dHy_dx
     grid.Ez[sx, 1:, :] += (dt / (EPS0 * grid.eps_z[sx, 1:, :])) \
         * cpml.psi_Hy_x[:, 1:, :]
 
     # dHx/dy lives at the Ez location -> staggered (E) profile along y.
-    dHx_dy = (grid.Hx[:, sy, :] - grid.Hx[:, sy - 1, :]) / dy         # (Nx, n_yE, Nz)
+    dHx_dy = (grid.Hx[:, sy, :] - grid.Hx[:, sy - 1, :]) / dyp        # (Nx, n_yE, Nz)
     cpml.psi_Hx_y = cpml.byE_s * cpml.psi_Hx_y + cpml.cyE_s * dHx_dy
     grid.Ez[1:, sy, :] -= (dt / (EPS0 * grid.eps_z[1:, sy, :])) \
         * cpml.psi_Hx_y[1:, :, :]

@@ -136,8 +136,12 @@ def record_snapshot(monitor: SnapshotMonitor, grid: FDTDGrid) -> SnapshotMonitor
 class EnergyMonitor:
     """
     Track total electromagnetic energy in the domain.
-    U = 0.5 * sum(eps*|E|² + mu*|H|²) * dx*dy*dz
+    U = 0.5 * sum( (eps*|E|² + mu*|H|²) * dV_cell )
     Must not grow over time in a stable simulation.
+
+    Each cell is weighted by its own local volume (``grid.cell_volume()``), so
+    the sum is correct on a non-uniform (rectilinear) grid. On a uniform grid
+    ``dV_cell`` is the constant ``dx*dy*dz`` and this reduces to the old result.
     """
     times:  list = field(default_factory=list)
     values: list = field(default_factory=list)
@@ -145,17 +149,17 @@ class EnergyMonitor:
 
 def record_energy(monitor: EnergyMonitor, grid: FDTDGrid) -> EnergyMonitor:
     """Compute total field energy and append to time series."""
-    dV = grid.dx * grid.dy * grid.dz
+    dV = grid.cell_volume()                       # per-cell (Nx, Ny, Nz)
 
-    E_energy = 0.5 * EPS0 * dV * (
-        np.sum(grid.eps_x * grid.Ex**2) +
-        np.sum(grid.eps_y * grid.Ey**2) +
-        np.sum(grid.eps_z * grid.Ez**2)
+    E_energy = 0.5 * EPS0 * (
+        np.sum(dV * grid.eps_x * grid.Ex**2) +
+        np.sum(dV * grid.eps_y * grid.Ey**2) +
+        np.sum(dV * grid.eps_z * grid.Ez**2)
     )
-    H_energy = 0.5 * MU0 * dV * (
-        np.sum(grid.mu_x * grid.Hx**2) +
-        np.sum(grid.mu_y * grid.Hy**2) +
-        np.sum(grid.mu_z * grid.Hz**2)
+    H_energy = 0.5 * MU0 * (
+        np.sum(dV * grid.mu_x * grid.Hx**2) +
+        np.sum(dV * grid.mu_y * grid.Hy**2) +
+        np.sum(dV * grid.mu_z * grid.Hz**2)
     )
 
     monitor.times.append(grid.time_step * _get_dt(grid))
@@ -181,6 +185,32 @@ _YEE_OFFSETS = {
     'Ex': (0.0, 0.5, 0.5), 'Ey': (0.5, 0.0, 0.5), 'Ez': (0.5, 0.5, 0.0),
     'Hx': (0.5, 0.0, 0.0), 'Hy': (0.0, 0.5, 0.0), 'Hz': (0.0, 0.0, 0.5),
 }
+
+
+def _yee_index(grid: FDTDGrid, axis: str, off: float, coords) -> np.ndarray:
+    """Nearest staggered-Yee index along ``axis`` for physical ``coords`` (metres).
+
+    ``off`` is the component's half-cell offset on this axis (from
+    :data:`_YEE_OFFSETS`): ``0.0`` places it on the integer node (coordinate
+    ``grid.x[i]``), ``0.5`` on the cell centre (``grid.xc[i]``). We snap to the
+    nearest actual Yee location, so a non-uniform (rectilinear) grid works — the
+    old ``round(coord/ds - off)`` assumed uniform spacing.
+
+    On a uniform grid this reproduces that rounding for every non-tie position
+    (both reduce to round-half-up); exact half-way ties may pick the neighbour
+    the old even-rounding would not, which is physically inconsequential.
+    """
+    N = {'x': grid.Nx, 'y': grid.Ny, 'z': grid.Nz}[axis]
+    coords = np.asarray(coords, dtype=np.float64)
+    if N == 1:
+        return np.zeros(coords.shape, dtype=np.intp)
+    if off == 0.0:
+        locs = grid._coords(axis)[:N]                    # integer-node coords x[0..N-1]
+    else:
+        locs = {'x': grid.xc, 'y': grid.yc, 'z': grid.zc}[axis]   # cell centres
+    bounds = 0.5 * (locs[:-1] + locs[1:])                # midpoints between Yee locs
+    idx = np.searchsorted(bounds, coords, side='right')
+    return np.clip(idx, 0, N - 1).astype(np.intp)
 
 
 @dataclass
@@ -259,6 +289,11 @@ def _build_path_quadrature(path, grid: FDTDGrid, field_name: str,
     is split into sub-steps no longer than half the smallest cell size; every
     sub-step contributes its vector length, split per axis, at the staggered
     Yee location of that axis' component nearest the sub-step midpoint.
+
+    Index snapping goes through :func:`_yee_index` (a coordinate lookup), so the
+    quadrature is correct on a non-uniform (rectilinear) grid; ``w`` is already a
+    true physical length and needs no change. Ports (``sources.py``) reuse this
+    so a LineSource and a monitor on the same path agree on ∫E·dl.
     """
     pts = np.asarray(path, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 2:
@@ -268,9 +303,10 @@ def _build_path_quadrature(path, grid: FDTDGrid, field_name: str,
     if close and not np.allclose(pts[0], pts[-1]):
         pts = np.vstack([pts, pts[0]])
 
-    ds = np.array([grid.dx, grid.dy, grid.dz])
     shape = (grid.Nx, grid.Ny, grid.Nz)
-    max_step = 0.5 * ds.min()
+    # grid.dx/dy/dz hold the MINIMUM width per axis on a non-uniform grid, so
+    # this sub-step is <= half the smallest cell anywhere (fine everywhere).
+    max_step = 0.5 * min(grid.dx, grid.dy, grid.dz)
 
     # Accumulate flat-index -> weight per component (duplicates summed).
     flat_idx = {c: [] for c in 'xyz'}
@@ -281,7 +317,12 @@ def _build_path_quadrature(path, grid: FDTDGrid, field_name: str,
         length = np.linalg.norm(seg)
         if length == 0.0:
             continue
-        n_sub = max(1, int(np.ceil(length / max_step)))
+        # Guard the ceil against floating-point dust: when a segment length is an
+        # exact multiple of max_step the count must not tip to one extra sub-step.
+        # On a rectilinear grid ``grid.dx`` (hence max_step) carries the rounding
+        # of ``np.diff``, so an unguarded ceil would add a spurious sub-step and
+        # alias the per-edge weights (a line lying on cell edges bins unevenly).
+        n_sub = max(1, int(np.ceil(length / max_step * (1.0 - 1e-9))))
         dl = seg / n_sub                              # vector step (m)
         t_mid = (np.arange(n_sub) + 0.5) / n_sub
         mids = p0 + t_mid[:, None] * seg              # (n_sub, 3) midpoints
@@ -291,8 +332,8 @@ def _build_path_quadrature(path, grid: FDTDGrid, field_name: str,
                 continue
             comp = field_name + axis
             off = _YEE_OFFSETS[comp]
-            idx = [np.clip(np.rint(mids[:, b] / ds[b] - off[b]).astype(np.intp),
-                           0, shape[b] - 1) for b in range(3)]
+            idx = [_yee_index(grid, b_axis, off[b], mids[:, b])
+                   for b, b_axis in enumerate('xyz')]
             flat_idx[axis].append(np.ravel_multi_index(idx, shape))
             weights[axis].append(np.full(n_sub, dl[a]))
 

@@ -51,20 +51,32 @@ from wavesim.grid import FDTDGrid
 #
 # For each propagation normal we record, in slice (a, b) order:
 #   axes   — the two transverse axis letters,
-#   ds     — attribute names of the two cell sizes,
+#   ds     — attribute names of the two scalar cell sizes (min width per axis;
+#            kept for legacy display only — the solve uses the per-cell arrays),
+#   dp     — attribute names of the two primary-width arrays (per-cell widths),
+#   cen    — attribute names of the two cell-center coordinate arrays,
+#   node   — attribute names of the two node-coordinate arrays (length N+1),
 #   eps    — material attrs seen by the two transverse E components,
 #   mu     — material attr seen by the H_a component (for the wave impedance),
 #   E, H   — the field-component names driven on the plane,
 #   h_sign — (sa, sb) so that  H_a = sa·E_b/η,  H_b = sb·E_a/η  (= n̂ × E_t / η).
+#
+# The rectilinear (non-uniform) rehaul (``docs/nonuniform_grid_plan.md`` Session
+# 6) drives every transverse derivative and area weight off the per-cell ``dp``
+# widths / ``cen`` coordinates instead of the scalar ``ds``, so the solve is
+# correct on a graded transverse mesh; a uniform mesh reduces to the old result.
 # ====================================================================== #
 _NORMAL_CFG = {
     'z': dict(axes=('x', 'y'), ds=('dx', 'dy'),
+              dp=('dxp', 'dyp'), cen=('xc', 'yc'), node=('x', 'y'),
               eps=('eps_x', 'eps_y'), mu='mu_x',
               E=('Ex', 'Ey'), H=('Hx', 'Hy'), h_sign=(-1.0, +1.0)),
     'y': dict(axes=('x', 'z'), ds=('dx', 'dz'),
+              dp=('dxp', 'dzp'), cen=('xc', 'zc'), node=('x', 'z'),
               eps=('eps_x', 'eps_z'), mu='mu_x',
               E=('Ex', 'Ez'), H=('Hx', 'Hz'), h_sign=(+1.0, -1.0)),
     'x': dict(axes=('y', 'z'), ds=('dy', 'dz'),
+              dp=('dyp', 'dzp'), cen=('yc', 'zc'), node=('y', 'z'),
               eps=('eps_y', 'eps_z'), mu='mu_y',
               E=('Ey', 'Ez'), H=('Hy', 'Hz'), h_sign=(-1.0, +1.0)),
 }
@@ -94,8 +106,9 @@ class TEMMode:
     position: float                   # metres along ``normal``
     slice_index: int                  # cell index of the plane along ``normal``
     transverse_axes: Tuple[str, str]  # the two axes ⟂ to ``normal``, slice order
-    da: float                         # cell size along first transverse axis (m)
-    db: float                         # cell size along second transverse axis (m)
+    da: float                         # representative cell size, axis a (m; mean
+                                      #   width — the mesh may be non-uniform)
+    db: float                         # representative cell size, axis b (m)
 
     # --- field shapes (full transverse-plane 2D arrays) -------------------- #
     phi: np.ndarray                   # electrostatic potential (V), V=1 drive
@@ -105,6 +118,15 @@ class TEMMode:
 
     # --- identity & per-unit-length parameters ----------------------------- #
     conductor_id: int                 # label of the energized (1 V) conductor
+
+    # --- transverse node coordinates (metres) for the full plane ----------- #
+    # Length (Na+1, Nb+1); the true cell boundaries along each transverse axis.
+    # Carried so a non-uniform mesh plots with correct physical extents (viz)
+    # rather than assuming the constant da/db above. ``None`` ⇒ derive a uniform
+    # ruler from da/db (legacy).
+    a_nodes: np.ndarray = None
+    b_nodes: np.ndarray = None
+
     capacitance: float = None         # C (F/m)
     inductance: float = None          # L (H/m)
     impedance: float = None           # Z₀ (Ω)
@@ -152,8 +174,14 @@ class TEMMode:
         * **voltage read-back** ``V* = Σ (ε_r Ê / S)·E`` — an ε-weighted overlap
           projection: reads 1 V for the pure mode and rejects non-modal content;
         * **current injection** ``E += κ·Ê·I`` — launches the mode shape;
-        * **modal self-coupling** ``κ = dt / (ε₀·dV·S)`` — ohms, the change in
-          ``V*`` per unit injected current per step (exactly ``LineSource``'s κ).
+        * **modal self-coupling** ``κ = dt / (ε₀·Σ_c dV_c·ε_r·Ê_c²)`` — ohms, the
+          change in ``V*`` per unit injected current per step. ``dV_c`` is the
+          **local Yee cell volume** at cell ``c`` (the product of the primary
+          widths ``dxp·dyp·dzp`` there, matching the all-primary divisors of
+          :func:`wavesim.update.update_E`, exactly as ``LineSource._build_port``
+          does). On a uniform grid ``dV_c`` is the constant ``dx·dy·dz`` and this
+          reduces to the old ``κ = dt/(ε₀·dV·S)``; on a rectilinear mesh each
+          cell carries its own volume so κ tracks the local spacing.
 
         The returned dict mirrors ``LineSource._build_port`` (``edges``/``kappa``)
         so the existing time-centred (Piket-May) injection runs unchanged. When
@@ -163,13 +191,16 @@ class TEMMode:
         does not enter κ or the stability condition ``κ/2 < Z₀``.
         """
         cfg = _NORMAL_CFG[self.normal]
-        dV = grid.dx * grid.dy * grid.dz
         eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
         k = self.slice_index
 
-        # Gather nonzero plane cells per E component; accumulate S = Σ ε_r Ê².
+        # Gather nonzero plane cells per E component. ``S = Σ ε_r Ê²`` normalises
+        # the read-back projection (dimensionless, so V*=1 for the pure mode);
+        # ``Sv = Σ dV_c ε_r Ê²`` volume-weights the energy for κ (per-cell local
+        # Yee volume, all-primary as in update_E). On a uniform grid Sv = dV·S.
         gathered = {}
         S = 0.0
+        Sv = 0.0
         for comp in cfg['E']:
             Ehat2d = self.E[comp]
             a, b = np.nonzero(Ehat2d)
@@ -178,14 +209,16 @@ class TEMMode:
             ii, jj, kk = _plane_to_grid(self.normal, k, a, b)
             Ehat = Ehat2d[a, b]
             epsr = eps_of[comp][ii, jj, kk]
+            dV_c = grid.dxp[ii] * grid.dyp[jj] * grid.dzp[kk]
             gathered[comp] = (ii, jj, kk, Ehat, epsr)
             S += float(np.sum(epsr * Ehat ** 2))
-        if not gathered or S <= 0.0:
+            Sv += float(np.sum(dV_c * epsr * Ehat ** 2))
+        if not gathered or S <= 0.0 or Sv <= 0.0:
             raise ValueError(
                 "TEM mode has no transverse E energy on the plane; cannot build "
                 "a port kernel.")
 
-        kappa = grid.dt / (EPS0 * dV * S)
+        kappa = grid.dt / (EPS0 * Sv)
         edges = {}
         for comp, (ii, jj, kk, Ehat, epsr) in gathered.items():
             w = epsr * Ehat / S            # projection weight (metres)
@@ -251,8 +284,6 @@ def solve_tem_modes(grid: FDTDGrid, *,
     cfg = _NORMAL_CFG[normal]
 
     k = grid.axis_index(normal, position)
-    da = getattr(grid, cfg['ds'][0])
-    db = getattr(grid, cfg['ds'][1])
 
     # --- slice the plane: eps (per transverse component), mu, PEC ----------- #
     eps_a_full = _slice(getattr(grid, cfg['eps'][0]), normal, k)
@@ -281,6 +312,18 @@ def solve_tem_modes(grid: FDTDGrid, *,
     mu_a = np.ascontiguousarray(mu_a_full[sub], dtype=np.float64)
     pec = np.ascontiguousarray(pec_full[sub])
 
+    # --- transverse spacing (per-cell — rectilinear/non-uniform aware) ------ #
+    # ``da_w``/``db_w`` are the per-cell primary widths on the solved sub-rect;
+    # ``a_c``/``b_c`` the matching cell-center coordinates for gradients. The
+    # full-plane node coordinates are carried onto each mode for correct viz
+    # extents. On a uniform grid these are constant and reproduce the old result.
+    da_w = np.ascontiguousarray(getattr(grid, cfg['dp'][0])[ia0:ia1], np.float64)
+    db_w = np.ascontiguousarray(getattr(grid, cfg['dp'][1])[ib0:ib1], np.float64)
+    a_c = np.ascontiguousarray(getattr(grid, cfg['cen'][0])[ia0:ia1], np.float64)
+    b_c = np.ascontiguousarray(getattr(grid, cfg['cen'][1])[ib0:ib1], np.float64)
+    a_nodes = np.asarray(getattr(grid, cfg['node'][0]), np.float64)
+    b_nodes = np.asarray(getattr(grid, cfg['node'][1]), np.float64)
+
     # --- conductors & reference node --------------------------------------- #
     labels, n_cond = ndimage.label(pec)          # 4-connectivity (default)
     signals, ground_labels = _classify_conductors(labels, n_cond, boundary, ground)
@@ -299,21 +342,22 @@ def solve_tem_modes(grid: FDTDGrid, *,
         fixed[:, 0] = True; fixed[:, -1] = True
 
     # --- factorise the weighted Laplacian once, reuse for every mode -------- #
-    lu, B, free_idx, fixed_cells = _factor_laplacian(eps_a, eps_b, da, db, fixed)
+    lu, B, free_idx, fixed_cells = _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed)
     # Air-filled companion (ε≡1) for the per-unit-length parameters.
     if compute_params:
         lu_air, B_air, _, _ = _factor_laplacian(
-            np.ones_like(eps_a), np.ones_like(eps_b), da, db, fixed)
+            np.ones_like(eps_a), np.ones_like(eps_b), da_w, db_w, fixed)
 
     modes: List[TEMMode] = []
     for Ls in signals:
         phi = _solve_one(lu, B, free_idx, fixed_cells, labels, fixed, Ls)
-        mode = _build_mode(phi, eps_a, eps_b, mu_a, pec, da, db, cfg,
-                           normal, position, k, full_shape, (ia0, ib0), Ls)
+        mode = _build_mode(phi, eps_a, eps_b, mu_a, pec, da_w, db_w, a_c, b_c,
+                           cfg, normal, position, k, full_shape, (ia0, ib0), Ls,
+                           a_nodes, b_nodes)
         if compute_params:
             phi_air = _solve_one(lu_air, B_air, free_idx, fixed_cells,
                                  labels, fixed, Ls)
-            _attach_params(mode, phi, phi_air, eps_a, eps_b, da, db)
+            _attach_params(mode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c)
         modes.append(mode)
 
     return modes
@@ -373,14 +417,21 @@ def _classify_conductors(labels, n_cond, boundary, ground):
 # Sparse weighted-Laplacian assembly and solve
 # ====================================================================== #
 
-def _factor_laplacian(eps_a, eps_b, da, db, fixed):
+def _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed):
     """Assemble and LU-factorise the ε-weighted 2D Laplacian over free cells.
 
     Discretises ``∂_a(ε_a ∂_a φ) + ∂_b(ε_b ∂_b φ) = 0`` with a 5-point
-    variable-coefficient stencil; the face permittivity is the arithmetic mean of
-    the two adjoining cells. Out-of-array neighbours are simply omitted, which is
-    the natural zero-flux (Neumann) edge; a grounded edge is instead handled by
-    the caller marking the ring as ``fixed``.
+    variable-coefficient **finite-volume** stencil on a rectilinear (possibly
+    non-uniform) transverse mesh. ``da_w``/``db_w`` are the per-cell primary
+    widths along the two transverse axes. The flux across the face between two
+    cells is ``ε_face·(Δφ / centre_distance)·face_length`` with the face
+    permittivity the arithmetic mean of the two adjoining cells; ``centre_distance``
+    is the dual width ``(w[i]+w[i+1])/2`` and ``face_length`` is the cell width
+    on the *other* axis. Out-of-array neighbours are simply omitted, which is the
+    natural zero-flux (Neumann) edge; a grounded edge is instead handled by the
+    caller marking the ring as ``fixed``. On a uniform mesh every coefficient
+    reduces to a constant multiple of the old ``ε/da²`` stencil (a global row
+    scaling that leaves φ unchanged).
 
     Returns ``(lu, B, free_idx, fixed_cells)`` where ``lu`` solves ``A x = b`` over
     the free cells, ``B`` (free × fixed) maps pinned potentials into the RHS via
@@ -398,8 +449,18 @@ def _factor_laplacian(eps_a, eps_b, da, db, fixed):
     fixed_idx = -np.ones((Na, Nb), dtype=np.int64)
     fixed_idx[fixed] = np.arange(n_fixed)
 
-    inv_da2 = 1.0 / (da * da)
-    inv_db2 = 1.0 / (db * db)
+    # Centre-to-centre distances (dual widths) between adjacent cells per axis.
+    dac = 0.5 * (da_w[:-1] + da_w[1:])          # length Na-1, face i↔i+1
+    dbc = 0.5 * (db_w[:-1] + db_w[1:])          # length Nb-1
+    DA = da_w[:, None]                          # (Na, 1) a-widths (b-face length)
+    DB = db_w[None, :]                          # (1, Nb) b-widths (a-face length)
+
+    # Per-direction face weights, already shaped like the ``src`` slice: an
+    # a-face carries ``face_length(=db_w) / centre_distance(=dac)``, a b-face
+    # ``da_w / dbc``. ``+a``/``-a`` reference the same physical faces (rows
+    # 0..Na-2), so both use ``dac``; likewise ``±b`` share ``dbc``.
+    wa = DB / dac[:, None]                       # (Na-1, Nb)
+    wb = DA / dbc[None, :]                        # (Na, Nb-1)
 
     # The 5-point stencil is built one *face direction* at a time (4 vectorised
     # passes), not cell-by-cell. For each direction the in-bounds region is a
@@ -413,15 +474,15 @@ def _factor_laplacian(eps_a, eps_b, da, db, fixed):
     rows_B, cols_B, data_B = [], [], []
 
     directions = (
-        (np.s_[0:Na - 1, :], np.s_[1:Na, :],   eps_a, inv_da2),  # +a face
-        (np.s_[1:Na, :],     np.s_[0:Na - 1, :], eps_a, inv_da2),  # -a face
-        (np.s_[:, 0:Nb - 1], np.s_[:, 1:Nb],   eps_b, inv_db2),  # +b face
-        (np.s_[:, 1:Nb],     np.s_[:, 0:Nb - 1], eps_b, inv_db2),  # -b face
+        (np.s_[0:Na - 1, :], np.s_[1:Na, :],     eps_a, wa),  # +a face
+        (np.s_[1:Na, :],     np.s_[0:Na - 1, :], eps_a, wa),  # -a face
+        (np.s_[:, 0:Nb - 1], np.s_[:, 1:Nb],     eps_b, wb),  # +b face
+        (np.s_[:, 1:Nb],     np.s_[:, 0:Nb - 1], eps_b, wb),  # -b face
     )
-    for src, nbr, eps, invd2 in directions:
+    for src, nbr, eps, w in directions:
         if eps[src].size == 0:
             continue
-        coef = 0.5 * (eps[src] + eps[nbr]) * invd2
+        coef = 0.5 * (eps[src] + eps[nbr]) * w
         i_src = free_idx[src]
         free_src = i_src >= 0
         # diagonal: only free source cells own a row (fixed-cell diag is unused).
@@ -470,10 +531,16 @@ def _solve_one(lu, B, free_idx, fixed_cells, labels, fixed, energized_label):
 # Field construction and per-unit-length parameters
 # ====================================================================== #
 
-def _transverse_E(phi, da, db, pec):
-    """``E_t = -∇φ`` on the cross-section (centred differences), zeroed in PEC."""
-    dphi_da = np.gradient(phi, da, axis=0)
-    dphi_db = np.gradient(phi, db, axis=1)
+def _transverse_E(phi, a_c, b_c, pec):
+    """``E_t = -∇φ`` on the cross-section (centred differences), zeroed in PEC.
+
+    ``a_c``/``b_c`` are the cell-center coordinates along the two transverse
+    axes, so :func:`numpy.gradient` uses the true (possibly non-uniform) spacing
+    (2nd order in the interior). On a uniform mesh this matches the old scalar-Δ
+    gradient.
+    """
+    dphi_da = np.gradient(phi, a_c, axis=0)
+    dphi_db = np.gradient(phi, b_c, axis=1)
     Ea = -dphi_da
     Eb = -dphi_db
     Ea[pec] = 0.0
@@ -481,10 +548,11 @@ def _transverse_E(phi, da, db, pec):
     return Ea, Eb
 
 
-def _build_mode(phi, eps_a, eps_b, mu_a, pec, da, db, cfg,
-                normal, position, k, full_shape, offset, label):
+def _build_mode(phi, eps_a, eps_b, mu_a, pec, da_w, db_w, a_c, b_c, cfg,
+                normal, position, k, full_shape, offset, label,
+                a_nodes, b_nodes):
     """Assemble a :class:`TEMMode` (fields embedded into the full transverse plane)."""
-    Ea, Eb = _transverse_E(phi, da, db, pec)
+    Ea, Eb = _transverse_E(phi, a_c, b_c, pec)
 
     # H_t = (n̂ × E_t) / η,  η = η₀·√(μ_r/ε_r)  (local wave impedance).
     eta = ETA0 * np.sqrt(mu_a / np.where(eps_a > 0, eps_a, 1.0))
@@ -511,22 +579,25 @@ def _build_mode(phi, eps_a, eps_b, mu_a, pec, da, db, cfg,
 
     return TEMMode(
         normal=normal, position=position, slice_index=k,
-        transverse_axes=cfg['axes'], da=da, db=db,
-        phi=phi_full, E=E, H=H, pec=pec_full, conductor_id=int(label))
+        transverse_axes=cfg['axes'],
+        da=float(np.mean(da_w)), db=float(np.mean(db_w)),
+        phi=phi_full, E=E, H=H, pec=pec_full, conductor_id=int(label),
+        a_nodes=a_nodes, b_nodes=b_nodes)
 
 
-def _attach_params(mode: TEMMode, phi, phi_air, eps_a, eps_b, da, db):
+def _attach_params(mode: TEMMode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c):
     """Fill C, L, Z₀, v, ε_eff from the field energy of the filled & air solves."""
     # Energy integral uses the gradient over the whole cross-section (V = 1 V):
-    #   C = ε₀ ∫ (ε_a E_a² + ε_b E_b²) dA.
-    dA = da * db
-    Ea = -np.gradient(phi, da, axis=0)
-    Eb = -np.gradient(phi, db, axis=1)
-    C = EPS0 * np.sum(eps_a * Ea**2 + eps_b * Eb**2) * dA
+    #   C = ε₀ ∫ (ε_a E_a² + ε_b E_b²) dA,  with a per-cell area dA_ij = da_i·db_j
+    #   and the gradient taken against the true (non-uniform) centre coordinates.
+    dA = da_w[:, None] * db_w[None, :]
+    Ea = -np.gradient(phi, a_c, axis=0)
+    Eb = -np.gradient(phi, b_c, axis=1)
+    C = EPS0 * np.sum((eps_a * Ea**2 + eps_b * Eb**2) * dA)
 
-    Ea_air = -np.gradient(phi_air, da, axis=0)
-    Eb_air = -np.gradient(phi_air, db, axis=1)
-    C_air = EPS0 * np.sum(Ea_air**2 + Eb_air**2) * dA
+    Ea_air = -np.gradient(phi_air, a_c, axis=0)
+    Eb_air = -np.gradient(phi_air, b_c, axis=1)
+    C_air = EPS0 * np.sum((Ea_air**2 + Eb_air**2) * dA)
 
     if C > 0 and C_air > 0:
         mode.capacitance = float(C)
