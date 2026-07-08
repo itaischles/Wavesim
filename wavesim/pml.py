@@ -267,10 +267,16 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
     sel_yH = _slab_indices(cy_H, 'H'); sel_yE = _slab_indices(cy_E, 'E')
     sel_zH = _slab_indices(cz_H, 'H'); sel_zE = _slab_indices(cz_E, 'E')
 
+    # psi arrays and the sampled coefficients follow the grid's storage dtype
+    # (float32 for the GPU path); the full 1D profiles above stay float64 for
+    # inspection. The profiles are built in float64 and cast on sampling so the
+    # exp()/division that shapes them keeps full precision.
+    dtype = grid.Ex.dtype
+
     # (b, c) sampled at the slab indices, reshaped to broadcast along the axis.
     def _rs(arr, sel, axis):
         shape = [1, 1, 1]; shape[axis] = -1
-        return arr[sel].reshape(shape)
+        return arr[sel].reshape(shape).astype(dtype, copy=False)
 
     bxH_s, cxH_s = _rs(bx_H, sel_xH, 0), _rs(cx_H, sel_xH, 0)
     byH_s, cyH_s = _rs(by_H, sel_yH, 1), _rs(cy_H, sel_yH, 1)
@@ -283,7 +289,7 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
     # derivative axis.
     nxH, nyH, nzH = len(sel_xH), len(sel_yH), len(sel_zH)
     nxE, nyE, nzE = len(sel_xE), len(sel_yE), len(sel_zE)
-    z = lambda shape: np.zeros(shape, dtype=np.float64)
+    z = lambda shape: np.zeros(shape, dtype=dtype)
 
     return CPMLArrays(
         # H-update psi (E-derivative corrections), compressed on their axis

@@ -90,7 +90,8 @@ class FDTDGrid:
 
 
 def create_grid(Nx: int, Ny: int, Nz: int,
-                dx: float, dy: float = None, dz: float = None) -> FDTDGrid:
+                dx: float, dy: float = None, dz: float = None,
+                dtype=np.float64) -> FDTDGrid:
     """
     Allocate a grid with all fields and materials initialised to zero/vacuum.
 
@@ -101,6 +102,13 @@ def create_grid(Nx: int, Ny: int, Nz: int,
     dx : float
         Cell size in x (metres). If dy/dz are omitted they default to dx
         (uniform cubic cells).
+    dtype : numpy dtype, optional
+        Storage dtype for all field and material arrays (default
+        ``np.float64``). Pass ``np.float32`` for the GPU (``backend='cuda'``)
+        path: it halves memory traffic and, on consumer NVIDIA cards, avoids the
+        heavily throttled float64 arithmetic. The NumPy/Numba CPU backends run
+        correctly in either precision but are validated in float64.
+        :func:`wavesim.pml.init_cpml` follows this dtype automatically.
 
     Returns
     -------
@@ -124,8 +132,8 @@ def create_grid(Nx: int, Ny: int, Nz: int,
     dt = CFL / (C0 * np.sqrt(1.0/dx**2 + 1.0/dy**2 + 1.0/dz**2))
 
     shape = (Nx, Ny, Nz)
-    zeros = lambda: np.zeros(shape, dtype=np.float64)
-    ones  = lambda: np.ones(shape,  dtype=np.float64)
+    zeros = lambda: np.zeros(shape, dtype=dtype)
+    ones  = lambda: np.ones(shape,  dtype=dtype)
 
     return FDTDGrid(
         # Fields — initialised to zero

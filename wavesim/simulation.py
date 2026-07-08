@@ -66,9 +66,12 @@ def _load_backend(backend: str):
     elif backend == 'numba':
         from wavesim.backend_numba import (
             update_H, update_E, update_H_pml, update_E_pml)
+    elif backend == 'cuda':
+        from wavesim.backend_cuda import (
+            update_H, update_E, update_H_pml, update_E_pml)
     else:
         raise ValueError(
-            f"Unknown backend {backend!r}. Expected 'numpy' or 'numba'.")
+            f"Unknown backend {backend!r}. Expected 'numpy', 'numba' or 'cuda'.")
     return update_H, update_E, update_H_pml, update_E_pml
 
 
@@ -93,14 +96,27 @@ class Simulation:
         ``apply_pec_mask`` always runs as well (it is a no-op when the grid has
         no ``pec_mask``), so interior conductors placed by the material helpers
         are enforced automatically.
-    backend : {'numpy', 'numba'}, optional
+    backend : {'numpy', 'numba', 'cuda'}, optional
         Which implementation of the four hot update functions to call. ``'numpy'``
         (default) uses the validated reference in :mod:`wavesim.update` /
         :mod:`wavesim.pml`; ``'numba'`` uses the multithreaded JIT kernels in
         :mod:`wavesim.backend_numba`, which are bit-for-bit identical (no parallel
-        reductions) but parallelised across cores for large 3D grids. The first
-        ``'numba'`` step pays a one-time JIT compile cost. PEC, sources, and
+        reductions) but parallelised across cores for large 3D grids. ``'cuda'``
+        runs the curl/CPML/PEC updates on an NVIDIA GPU
+        (:mod:`wavesim.backend_cuda`): ``run()`` keeps the fields resident on the
+        device for the whole run (no per-step transfer when there are no host
+        hooks), and matches the reference to floating-point tolerance. Allocate
+        the grid as ``float32`` (``create_grid(..., dtype=np.float32)``) for the
+        best GPU throughput on consumer cards. The first step of ``'numba'`` /
+        ``'cuda'`` pays a one-time JIT/kernel compile cost. PEC, sources, and
         monitors are backend-independent and run identically either way.
+
+        .. note::
+           ``'cuda'`` needs a CUDA-capable GPU and the toolkit; on machines where
+           Windows Smart App Control blocks the default binding, set
+           ``NUMBA_CUDA_USE_NVIDIA_BINDING=0`` (backend_cuda sets this on import).
+           Per-step host hooks (sources / monitors) currently sync the E/H fields
+           around them; footprint-only sync is a future optimisation.
 
     Notes
     -----
@@ -204,6 +220,9 @@ class Simulation:
         FDTDGrid
             The final grid state (also available as ``self.grid``).
         """
+        if self.backend == 'cuda':
+            return self._run_cuda_resident(n_steps, callback, verbose)
+
         report = self._make_progress_reporter(n_steps) if verbose >= 1 else None
         for n in range(n_steps):
             self.step()
@@ -211,6 +230,52 @@ class Simulation:
                 callback(self, n)
             if report is not None:
                 report(n)
+        return self.grid
+
+    def _run_cuda_resident(self, n_steps: int,
+                           callback: Callable[["Simulation", int], None] = None,
+                           verbose: int = 0) -> FDTDGrid:
+        """GPU fast path: keep the fields resident on the device across the whole
+        run (see :class:`wavesim.backend_cuda.CudaResident`).
+
+        The curl/CPML/PEC updates run on the GPU with no per-step transfer. Host
+        hooks (sources, monitors, callback) still run on the CPU; on the steps
+        where they are present the E/H fields are synced device->host before them
+        and host->device after, preserving the exact ``step()`` semantics and
+        ordering. With no per-step hooks nothing is transferred until the end.
+        """
+        from wavesim.backend_cuda import CudaResident
+
+        res = CudaResident(self.grid, self.cpml, self.pec_faces)
+        # A callback may inspect the fields, so treat it as needing a host sync.
+        has_hooks = bool(self.sources or self.monitors or callback is not None)
+        report = self._make_progress_reporter(n_steps) if verbose >= 1 else None
+
+        for n in range(n_steps):
+            grid = self.grid
+            t = grid.time_step * grid.dt
+
+            # 1-4. H, CPML-H, E, CPML-E, PEC — all on the device.
+            res.step_evolution()
+
+            # 5-6. Host hooks: sync E/H down, inject/record, sync back.
+            if has_hooks:
+                res.download_EH(grid)
+                for src in self.sources:
+                    src.inject(grid, t)
+                for mon in self.monitors:
+                    _RECORDERS[type(mon)](mon, grid)
+                if self.sources:
+                    res.upload_EH(grid)   # push source writes back to the device
+
+            grid.time_step += 1
+            if callback is not None:
+                callback(self, n)
+            if report is not None:
+                report(n)
+
+        res.download_EH(self.grid)   # final host copy of the fields
+        res.sync()
         return self.grid
 
     # ------------------------------------------------------------------ #
