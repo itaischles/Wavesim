@@ -19,6 +19,7 @@ directly.
 
 import numpy as np
 from wavesim.grid import FDTDGrid
+from wavesim.subpixel import smooth_shape_region
 
 
 # ======================================================================= #
@@ -105,20 +106,43 @@ def set_box(grid: FDTDGrid,
             y0: float, y1: float,
             z0: float, z1: float,
             eps_r: float, mu_r: float = 1.0,
-            pec: bool = False) -> FDTDGrid:
+            pec: bool = False,
+            subpixel: bool = False, oversample: int = 4) -> FDTDGrid:
     """
     Fill an axis-aligned box with a uniform material, or mark as PEC.
 
     Parameters
     ----------
     x0, x1, y0, y1, z0, z1 : float
-        Box corners in metres. Snapped to nearest cell.
+        Box corners in metres. Snapped to nearest cell (unless ``subpixel``).
     eps_r, mu_r : float
         Relative permittivity / permeability of the fill material.
     pec : bool
         If True, mark the region as PEC in grid.pec_mask instead of
         writing eps/mu values.
+    subpixel : bool
+        If True (dielectric only), place the box with **subpixel smoothing**:
+        the true physical box edges are honoured and boundary cells receive the
+        anisotropic effective permittivity (see :mod:`wavesim.subpixel`) instead
+        of being snapped to whole cells. Restores ~2nd-order accuracy and makes
+        results vary smoothly with the box size. Not supported with ``pec=True``.
+    oversample : int
+        Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
     """
+    if subpixel:
+        if pec:
+            raise NotImplementedError(
+                "subpixel smoothing is for dielectrics only; PEC is a hard "
+                "field constraint, not a material average (see wavesim.pec). "
+                "Use pec=True without subpixel.")
+        return smooth_shape_region(
+            grid,
+            lambda X, Y, Z: ((X >= x0) & (X <= x1) &
+                             (Y >= y0) & (Y <= y1) &
+                             (Z >= z0) & (Z <= z1)),
+            eps_r, (x0, x1), (y0, y1), (z0, z1),
+            oversample=oversample, mu_r=mu_r)
+
     i0 = _metre_to_cell(x0, grid.dx)
     i1 = _metre_to_cell(x1, grid.dx)
     j0 = _metre_to_cell(y0, grid.dy)
@@ -153,7 +177,8 @@ def set_cylinder(grid: FDTDGrid,
                  radius: float,
                  z0: float, z1: float,
                  eps_r: float, mu_r: float = 1.0,
-                 pec: bool = False) -> FDTDGrid:
+                 pec: bool = False,
+                 subpixel: bool = False, oversample: int = 4) -> FDTDGrid:
     """
     Fill a cylindrical rod aligned with Z, or mark as PEC.
 
@@ -169,7 +194,26 @@ def set_cylinder(grid: FDTDGrid,
         Material properties (ignored when pec=True).
     pec : bool
         If True, mark the cylinder as PEC.
+    subpixel : bool
+        If True (dielectric only), place the rod with **subpixel smoothing** so
+        the curved boundary is anti-staircased with an anisotropic effective
+        permittivity (see :mod:`wavesim.subpixel`). Not supported with ``pec=True``.
+    oversample : int
+        Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
     """
+    if subpixel:
+        if pec:
+            raise NotImplementedError(
+                "subpixel smoothing is for dielectrics only; PEC is a hard "
+                "field constraint, not a material average (see wavesim.pec). "
+                "Use pec=True without subpixel.")
+        return smooth_shape_region(
+            grid,
+            lambda X, Y, Z: (((X - cx) ** 2 + (Y - cy) ** 2 <= radius ** 2) &
+                             (Z >= z0) & (Z <= z1)),
+            eps_r, (cx - radius, cx + radius), (cy - radius, cy + radius),
+            (z0, z1), oversample=oversample, mu_r=mu_r)
+
     k0 = max(0, _metre_to_cell(z0, grid.dz))
     k1 = min(grid.Nz, _metre_to_cell(z1, grid.dz))
 

@@ -33,6 +33,9 @@ from wavesim.grid import FDTDGrid, create_grid, create_grid_rectilinear
 from wavesim.materials import (
     set_vacuum, set_material_arrays, set_box, set_cylinder, set_coax,
 )
+from wavesim.subpixel import (
+    reduce_fine_eps, smooth_from_function, smooth_shape_region,
+)
 from wavesim.pml import (
     CPMLArrays, init_cpml, update_H_pml, update_E_pml, ALL_FACES,
 )
@@ -89,6 +92,8 @@ __all__ = [
     "FDTDGrid", "create_grid", "create_grid_rectilinear",
     # materials
     "set_vacuum", "set_material_arrays", "set_box", "set_cylinder", "set_coax",
+    # subpixel smoothing
+    "reduce_fine_eps", "smooth_from_function", "smooth_shape_region",
     # pml
     "CPMLArrays", "init_cpml", "update_H_pml", "update_E_pml", "ALL_FACES",
     # pec
