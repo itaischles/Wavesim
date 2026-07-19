@@ -5,13 +5,18 @@ Full 3D curl operators, vectorised over the entire grid using NumPy
 slicing. No loops over cells.
 
 Yee grid staggering (standard 3D convention, Taflove):
-    Ex[i,j,k]  at  (i,    j+½,  k+½) · (dx, dy, dz)
-    Ey[i,j,k]  at  (i+½,  j,    k+½) · (dx, dy, dz)
-    Ez[i,j,k]  at  (i+½,  j+½,  k  ) · (dx, dy, dz)
+    Ex[i,j,k]  at  (i+½,  j,    k  ) · (dx, dy, dz)
+    Ey[i,j,k]  at  (i,    j+½,  k  ) · (dx, dy, dz)
+    Ez[i,j,k]  at  (i,    j,    k+½) · (dx, dy, dz)
 
-    Hx[i,j,k]  at  (i+½,  j,    k  ) · (dx, dy, dz)
-    Hy[i,j,k]  at  (i,    j+½,  k  ) · (dx, dy, dz)
-    Hz[i,j,k]  at  (i,    j,    k+½) · (dx, dy, dz)
+    Hx[i,j,k]  at  (i,    j+½,  k+½) · (dx, dy, dz)
+    Hy[i,j,k]  at  (i+½,  j,    k+½) · (dx, dy, dz)
+    Hz[i,j,k]  at  (i+½,  j+½,  k  ) · (dx, dy, dz)
+
+E lives on cell *edges* (Ex spans node (i,j,k) → (i+1,j,k)), H on face centres.
+So cell (i,j,k) owns twelve E-edges but only three of them — Ex[i,j,k],
+Ey[i,j,k], Ez[i,j,k] — carry its own index; the other nine are indexed by its
+neighbours. See wavesim.pec.build_pec_edge_masks, which depends on this.
 
 Update equations (Faraday — H step):
     Hx[i,j,k] -= (dt/mu_x) * ( (Ez[i,j+1,k]-Ez[i,j,k])/dy - (Ey[i,j,k+1]-Ey[i,j,k])/dz )

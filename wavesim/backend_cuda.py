@@ -66,6 +66,7 @@ from numba import cuda
 
 from wavesim.grid import FDTDGrid
 from wavesim.pml import CPMLArrays
+from wavesim.pec import build_pec_edge_masks
 from wavesim.constants import MU0, EPS0
 
 # Default 3D thread-block. 256 threads/block suits Turing (CC 7.5) occupancy.
@@ -514,12 +515,23 @@ def _k_zero_z(arr, k0, Nx, Ny):
 
 
 @cuda.jit
-def _k_pec_mask(Ex, Ey, Ez, mask, Nx, Ny, Nz):
+def _k_pec_mask(Ex, Ey, Ez, mex, mey, mez, Nx, Ny, Nz):
+    """Zero each E component on its own edge mask.
+
+    The masks are the per-component ones from
+    :func:`wavesim.pec.build_pec_edge_masks`, computed on the host and uploaded
+    once — a cell's twelve edges are indexed partly by its neighbours, so a
+    single cell-wise mask would leave nine of them alive (see that function).
+    Deriving them host-side keeps this bit-identical to the NumPy/Numba path.
+    """
     i, j, k = cuda.grid(3)
-    if i < Nx and j < Ny and k < Nz and mask[i, j, k]:
-        Ex[i, j, k] = 0.0
-        Ey[i, j, k] = 0.0
-        Ez[i, j, k] = 0.0
+    if i < Nx and j < Ny and k < Nz:
+        if mex[i, j, k]:
+            Ex[i, j, k] = 0.0
+        if mey[i, j, k]:
+            Ey[i, j, k] = 0.0
+        if mez[i, j, k]:
+            Ez[i, j, k] = 0.0
 
 
 _TPB2 = (16, 16)
@@ -568,8 +580,11 @@ class CudaResident:
                                               (g.mu_x, g.mu_y, g.mu_z))
         self.depx, self.depy, self.depz = map(cuda.to_device,
                                                (g.eps_x, g.eps_y, g.eps_z))
-        self.dmask = (cuda.to_device(g.pec_mask)
-                      if g.pec_mask is not None else None)
+        if g.pec_mask is not None:
+            mex, mey, mez = build_pec_edge_masks(g.pec_mask)
+            self.dmask = tuple(map(cuda.to_device, (mex, mey, mez)))
+        else:
+            self.dmask = None
 
         self.cpml = cpml
         if cpml is not None:
@@ -688,7 +703,7 @@ class CudaResident:
                 raise ValueError(f"Unknown face {face!r}")
         if self.dmask is not None:
             _launch(_k_pec_mask, (Nx, Ny, Nz),
-                    (self.dEx, self.dEy, self.dEz, self.dmask, Nx, Ny, Nz))
+                    (self.dEx, self.dEy, self.dEz) + self.dmask + (Nx, Ny, Nz))
 
     def step_evolution(self):
         """One full field step on the device: H, CPML-H, E, CPML-E, PEC."""

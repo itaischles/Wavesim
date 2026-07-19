@@ -342,11 +342,14 @@ def solve_tem_modes(grid: FDTDGrid, *,
         fixed[:, 0] = True; fixed[:, -1] = True
 
     # --- factorise the weighted Laplacian once, reuse for every mode -------- #
-    lu, B, free_idx, fixed_cells = _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed)
-    # Air-filled companion (ε≡1) for the per-unit-length parameters.
+    lu, B, free_idx, fixed_cells = _factor_laplacian(eps_a, eps_b, da_w, db_w,
+                                                     fixed, pec)
+    # Air-filled companion (ε≡1) for the per-unit-length parameters. The PEC
+    # one-sided rule is a no-op here (ε is uniformly 1), which is precisely why
+    # applying it to the filled solve restores φ == φ_air on a homogeneous fill.
     if compute_params:
         lu_air, B_air, _, _ = _factor_laplacian(
-            np.ones_like(eps_a), np.ones_like(eps_b), da_w, db_w, fixed)
+            np.ones_like(eps_a), np.ones_like(eps_b), da_w, db_w, fixed, pec)
 
     modes: List[TEMMode] = []
     for Ls in signals:
@@ -357,7 +360,8 @@ def solve_tem_modes(grid: FDTDGrid, *,
         if compute_params:
             phi_air = _solve_one(lu_air, B_air, free_idx, fixed_cells,
                                  labels, fixed, Ls)
-            _attach_params(mode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c)
+            _attach_params(mode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c,
+                           pec)
         modes.append(mode)
 
     return modes
@@ -417,7 +421,7 @@ def _classify_conductors(labels, n_cond, boundary, ground):
 # Sparse weighted-Laplacian assembly and solve
 # ====================================================================== #
 
-def _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed):
+def _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed, pec=None):
     """Assemble and LU-factorise the ε-weighted 2D Laplacian over free cells.
 
     Discretises ``∂_a(ε_a ∂_a φ) + ∂_b(ε_b ∂_b φ) = 0`` with a 5-point
@@ -427,7 +431,9 @@ def _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed):
     cells is ``ε_face·(Δφ / centre_distance)·face_length`` with the face
     permittivity the arithmetic mean of the two adjoining cells; ``centre_distance``
     is the dual width ``(w[i]+w[i+1])/2`` and ``face_length`` is the cell width
-    on the *other* axis. Out-of-array neighbours are simply omitted, which is the
+    on the *other* axis. Faces onto a PEC cell take the free cell's ε one-sided
+    rather than the mean (``pec``, optional — see the inline note at the stencil
+    assembly). Out-of-array neighbours are simply omitted, which is the
     natural zero-flux (Neumann) edge; a grounded edge is instead handled by the
     caller marking the ring as ``fixed``. On a uniform mesh every coefficient
     reduces to a constant multiple of the old ``ε/da²`` stencil (a global row
@@ -482,7 +488,21 @@ def _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed):
     for src, nbr, eps, w in directions:
         if eps[src].size == 0:
             continue
-        coef = 0.5 * (eps[src] + eps[nbr]) * w
+        # Face permittivity: arithmetic mean of the two adjoining cells, EXCEPT
+        # where one of them is PEC. ε inside a conductor is not a material
+        # property — it is whatever the voxeliser happened to leave there (1.0)
+        # — so averaging it in makes conductor-adjacent faces carry a different
+        # ε ratio than interior faces. The filled and air systems then stop being
+        # scalar multiples of one another, φ ≠ φ_air, and the exact cancellation
+        # in ε_eff = C/C_air breaks. Taking the free cell's ε one-sided is both
+        # physically right (the dielectric runs up to the conductor surface) and
+        # restores A_filled = ε_r·A_air for a homogeneous fill.
+        eps_face = 0.5 * (eps[src] + eps[nbr])
+        if pec is not None:
+            pec_src, pec_nbr = pec[src], pec[nbr]
+            eps_face = np.where(pec_nbr & ~pec_src, eps[src], eps_face)
+            eps_face = np.where(pec_src & ~pec_nbr, eps[nbr], eps_face)
+        coef = eps_face * w
         i_src = free_idx[src]
         free_src = i_src >= 0
         # diagonal: only free source cells own a row (fixed-cell diag is unused).
@@ -585,18 +605,32 @@ def _build_mode(phi, eps_a, eps_b, mu_a, pec, da_w, db_w, a_c, b_c, cfg,
         a_nodes=a_nodes, b_nodes=b_nodes)
 
 
-def _attach_params(mode: TEMMode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c):
+def _attach_params(mode: TEMMode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c,
+                   pec=None):
     """Fill C, L, Z₀, v, ε_eff from the field energy of the filled & air solves."""
     # Energy integral uses the gradient over the whole cross-section (V = 1 V):
     #   C = ε₀ ∫ (ε_a E_a² + ε_b E_b²) dA,  with a per-cell area dA_ij = da_i·db_j
     #   and the gradient taken against the true (non-uniform) centre coordinates.
+    #
+    # E must be zeroed inside PEC first — exactly as _transverse_E does. φ is
+    # pinned there, but np.gradient is a centred difference, so a conductor cell
+    # bordering a free cell still reports a nonzero E. That phantom energy is
+    # weighted by the conductor's meaningless ε (1.0) in the filled solve and by
+    # 1.0 in the air solve, so it does not cancel in C/C_air and biases ε_eff low.
     dA = da_w[:, None] * db_w[None, :]
-    Ea = -np.gradient(phi, a_c, axis=0)
-    Eb = -np.gradient(phi, b_c, axis=1)
+
+    def _grad(p):
+        Ea = -np.gradient(p, a_c, axis=0)
+        Eb = -np.gradient(p, b_c, axis=1)
+        if pec is not None:
+            Ea[pec] = 0.0
+            Eb[pec] = 0.0
+        return Ea, Eb
+
+    Ea, Eb = _grad(phi)
     C = EPS0 * np.sum((eps_a * Ea**2 + eps_b * Eb**2) * dA)
 
-    Ea_air = -np.gradient(phi_air, a_c, axis=0)
-    Eb_air = -np.gradient(phi_air, b_c, axis=1)
+    Ea_air, Eb_air = _grad(phi_air)
     C_air = EPS0 * np.sum((Ea_air**2 + Eb_air**2) * dA)
 
     if C > 0 and C_air > 0:
