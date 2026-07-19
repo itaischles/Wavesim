@@ -273,9 +273,11 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50,
     else:
         imshow_kw = dict(vmin=-vmax, vmax=vmax)
 
-    Nx, Ny = grid.Nx, grid.Ny
-    # Physical extent from the true node coordinates (== N*ds on a uniform grid).
-    extent = [grid.x[0], grid.x[-1], grid.y[0], grid.y[-1]]
+    # Snapshots are collocated to cell centres and cropped to N-1 cells per
+    # in-plane axis (see SnapshotMonitor), so take the extent from the nodes
+    # bounding the cells actually present rather than the whole domain.
+    nx, ny = snaps[0].shape
+    extent = [grid.x[0], grid.x[nx], grid.y[0], grid.y[ny]]
 
     # Contour levels: log-spaced (symmetric about zero) or linearly spaced.
     if contour:
@@ -284,10 +286,10 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50,
             levels = np.concatenate([-pos[::-1], pos])
         else:
             levels = np.linspace(-vmax, vmax, 2 * n_contours + 1)
-        # contour() needs coordinate vectors matching the transposed data (Ny, Nx)
-        # — use the true cell centres so contours land correctly on a graded grid.
-        xc = grid.xc
-        yc = grid.yc
+        # contour() needs coordinate vectors matching the transposed data (ny, nx)
+        # — the frames sit on cell centres, so these are exactly the coordinates.
+        xc = grid.xc[:nx]
+        yc = grid.yc[:ny]
 
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(snaps[0].T, origin='lower', extent=extent,

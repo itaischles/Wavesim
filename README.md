@@ -48,7 +48,10 @@ The import package is named `wavesim`.
   driving the paired H sheet from the same port current.
 - **Diagnostics** — point field, `|E|`/`|H|` magnitude, 2D snapshots (XY/XZ/YZ
   slice planes), line-integral voltage (∫E·dl) and current (∮H·dl) monitors, and
-  total energy.
+  total energy. Snapshots are collocated off the staggered Yee points onto cell
+  centres and H is averaged onto the E timebase, so every component of a frame
+  shares one coordinate grid and one instant (frames are one cell shorter than
+  the grid per in-plane axis — see `SnapshotMonitor`).
 - **Visualisation** — grid/material/PML plots, field snapshots, animations,
   voltage/current time series, TEM-mode profiles, and full-3D helpers (orthogonal
   XY/XZ/YZ slice triptych + multi-plane animation).

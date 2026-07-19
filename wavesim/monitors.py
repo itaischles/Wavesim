@@ -90,6 +90,45 @@ class SnapshotMonitor:
         - A field magnitude:  '|E|' or '|H|', where
               |E| = sqrt(Ex² + Ey² + Ez²)
               |H| = sqrt(Hx² + Hy² + Hz²)
+
+    Output contract — where the recorded data lives
+    -----------------------------------------------
+    Snapshots are **collocated to cell centres**, not left on the staggered Yee
+    locations they are stored at. Every component of every snapshot therefore
+    shares one coordinate grid: frame element ``[a, b]`` is the field at the
+    centre of cell ``(a, b)`` of the slice plane, i.e. at ``grid.xc[a]``,
+    ``grid.yc[b]`` (and ``grid.zc[idx]`` on the normal axis) — the cell-centre
+    coordinate arrays, valid on a non-uniform grid.
+
+    Collocation consumes one neighbour per averaged axis, so each frame is
+    **one cell shorter than the grid along each in-plane axis**: a z-normal
+    slice of an ``(Nx, Ny, Nz)`` grid yields frames of shape ``(Nx-1, Ny-1)``,
+    spanning cells ``0 .. N-2``. All components are cropped to this same
+    interior even when they would not individually lose that axis, so that a
+    single coordinate grid serves the whole snapshot. An axis of length 1 (a 2D
+    run) is degenerate — it has no neighbour and the field is invariant along it
+    — and is left at length 1.
+
+    ``'|E|'`` / ``'|H|'`` collocate each component first and root-sum-square
+    afterwards, so they are the true magnitude at the cell centre rather than a
+    mix of three different sample points.
+
+    Output contract — when the recorded data lives
+    ----------------------------------------------
+    H trails E by half a timestep in the leapfrog (``update_H`` then
+    ``update_E`` then record), so **H snapshots are averaged onto the E
+    timebase**: the frame stamped ``t`` is the mean of the collocated H at
+    ``t - dt/2`` and ``t + dt/2``. E and H frames sharing a ``snap_times`` entry
+    therefore represent the same instant, which is what a Poynting vector
+    computed downstream requires. This costs one step of latency: a stashed H
+    frame that the run ends before completing is dropped, so ``snapshots`` and
+    ``snap_times`` always stay the same length. This assumes
+    :func:`record_snapshot` is called on *every* timestep (as ``Simulation``
+    does), not only on recording steps.
+
+    ``snap_times[n]`` is the physical time of the E field in the frame,
+    ``(time_step + 1) * dt`` — monitors run after ``update_E`` has already
+    advanced E to the end of the step.
     """
     component: str      # 'Ex'..'Hz', or '|E|' / '|H|'
     at_z: float         # slice position (metres) along `normal` (use 0 for a 1-cell axis)
@@ -97,34 +136,134 @@ class SnapshotMonitor:
     normal: str = 'z'   # axis the slice plane is perpendicular to: 'x'/'y'/'z'
     snapshots:   list = field(default_factory=list)
     snap_times:  list = field(default_factory=list)
+    # Half-step carry for H components: (snap_time, collocated frame) awaiting
+    # the next step's H so the two can be averaged onto the E timebase.
+    _pending: tuple = field(default=None, repr=False)
+
+
+# Yee half-cell offsets in cell units, per the update.py module docstring (the
+# authority on the staggering):
+#     Ex (i+½, j,   k  )      Hx (i,   j+½, k+½)
+#     Ey (i,   j+½, k  )      Hy (i+½, j,   k+½)
+#     Ez (i,   j,   k+½)      Hz (i+½, j+½, k  )
+# The target is the cell centre (i+½, j+½, k+½). An axis carrying 0.5 is already
+# centred; an axis carrying 0.0 sits on the cell's low node and must be averaged
+# with index+1 to reach the centre. So E components need a 4-point average (their
+# two transverse axes) and H components a 2-point one.
+#
+# Both weights are exactly 0.5 on a non-uniform rectilinear grid: grid.py defines
+# xc[i] = (x[i] + x[i+1]) / 2, so the cell centre is the arithmetic midpoint of
+# the two bounding nodes whatever the local spacing, and linear interpolation to
+# a midpoint is ½/½ regardless of how far apart the samples are. No spacing
+# arrays enter.
+#
+# NOTE: this deliberately does not reuse `_YEE_OFFSETS` further down, which
+# encodes a *different* (transposed) staggering convention — see the comment
+# there.
+_CENTRE_OFFSETS = {
+    'Ex': (0.5, 0.0, 0.0), 'Ey': (0.0, 0.5, 0.0), 'Ez': (0.0, 0.0, 0.5),
+    'Hx': (0.0, 0.5, 0.5), 'Hy': (0.5, 0.0, 0.5), 'Hz': (0.5, 0.5, 0.0),
+}
+
+_AXES = ('x', 'y', 'z')
+
+
+def _along(ndim: int, axis: int, s: slice) -> tuple:
+    """An index tuple applying ``s`` to ``axis`` and taking all of the rest."""
+    idx = [slice(None)] * ndim
+    idx[axis] = s
+    return tuple(idx)
+
+
+def _collocate_slice(arr: np.ndarray, comp: str, normal: str,
+                     idx: int, shape: tuple) -> np.ndarray:
+    """
+    Average *arr* (component ``comp``) onto cell centres and return the 2D plane
+    perpendicular to ``normal`` at index ``idx``, cropped to the common interior.
+
+    The normal axis is reduced first so at most two planes of the volume are ever
+    touched. Averaging on that axis needs the plane at ``idx+1``; on the last
+    cell of the axis there is none, so the neighbour index is clamped to ``idx``
+    and the value keeps its native half-cell offset on that axis alone. That is a
+    documented degradation on the extreme boundary plane, and it is also what
+    makes a 1-cell axis work: a 2D run is invariant along its thin axis, so
+    "average the plane with itself" is exact there.
+    """
+    offs = _CENTRE_OFFSETS[comp]
+    n_ax = _AXES.index(normal)
+
+    # --- normal axis: collapse to a single plane -----------------------------
+    if offs[n_ax] == 0.0:
+        hi = min(idx + 1, shape[n_ax] - 1)          # clamp, never wrap
+        plane = 0.5 * (np.take(arr, idx, n_ax) + np.take(arr, hi, n_ax))
+    else:
+        plane = np.take(arr, idx, n_ax)             # np.take copies: never a
+                                                    # view onto the live field
+    # --- in-plane axes: average (offset 0) or crop (offset ½), both lose one --
+    for a in (a for a in range(3) if a != n_ax):
+        if shape[a] == 1:
+            continue                                # degenerate axis, no neighbour
+        pa = a if a < n_ax else a - 1                # its axis within `plane`
+        lo = plane[_along(2, pa, slice(None, -1))]
+        if offs[a] == 0.0:
+            plane = 0.5 * (lo + plane[_along(2, pa, slice(1, None))])
+        else:
+            plane = lo
+    return plane
+
+
+def _collocated_frame(monitor: SnapshotMonitor, grid: FDTDGrid) -> np.ndarray:
+    """The monitor's current 2D frame, collocated to cell centres."""
+    normal = getattr(monitor, 'normal', 'z')
+    idx = grid.axis_index(normal, monitor.at_z)
+    shape = (grid.Nx, grid.Ny, grid.Nz)
+    comp = monitor.component
+
+    if comp in ('|E|', '|H|'):
+        f = comp[1]                                  # 'E' or 'H'
+        # Collocate each component *first*, then root-sum-square, so the result
+        # is the magnitude at one real location.
+        return np.sqrt(sum(
+            _collocate_slice(getattr(grid, f + a), f + a, normal, idx, shape)**2
+            for a in _AXES
+        ))
+    return _collocate_slice(getattr(grid, comp), comp, normal, idx, shape)
 
 
 def record_snapshot(monitor: SnapshotMonitor, grid: FDTDGrid) -> SnapshotMonitor:
-    """Append a 2D slice (component or magnitude) if this is a recording timestep."""
-    if grid.time_step % monitor.every_N_steps == 0:
-        normal = getattr(monitor, 'normal', 'z')
-        idx = grid.axis_index(normal, monitor.at_z)
+    """
+    Append a cell-centre-collocated 2D slice if this is a recording timestep.
 
-        def _slice(arr):
-            """The 2D plane of *arr* perpendicular to ``normal`` at ``idx``."""
-            if normal == 'z':
-                return arr[:, :, idx]
-            if normal == 'y':
-                return arr[:, idx, :]
-            return arr[idx, :, :]  # normal == 'x'
+    Must be called on every timestep (not only recording ones): H snapshots are
+    averaged across the half step, which needs the frame from the step after the
+    recording step. See :class:`SnapshotMonitor` for the output contract.
+    """
+    recording = grid.time_step % monitor.every_N_steps == 0
+    if not recording and monitor._pending is None:
+        return monitor
 
-        comp = monitor.component
-        if comp in ('|E|', '|H|'):
-            f = comp[1]  # 'E' or 'H'
-            arr = np.sqrt(
-                _slice(getattr(grid, f + 'x'))**2 +
-                _slice(getattr(grid, f + 'y'))**2 +
-                _slice(getattr(grid, f + 'z'))**2
-            )
-            monitor.snapshots.append(arr)
+    frame = _collocated_frame(monitor, grid)         # computed once, used twice
+                                                     # when every_N_steps == 1
+
+    # Complete a stashed H frame *before* stashing this one, so consecutive
+    # recording steps each get their own carry.
+    if monitor._pending is not None:
+        t_stash, previous = monitor._pending
+        monitor._pending = None
+        monitor.snapshots.append(0.5 * (previous + frame))
+        monitor.snap_times.append(t_stash)
+
+    if recording:
+        # E has just been advanced to the end of this step; time_step still holds
+        # the step's start index, so the field in `frame` is at (n+1)*dt.
+        t = (grid.time_step + 1) * _get_dt(grid)
+        if monitor.component[0] == 'H' or monitor.component == '|H|':
+            # H is at t - dt/2 here; carry it until the next step supplies
+            # t + dt/2 and the mean lands on the E timebase.
+            monitor._pending = (t, frame)
         else:
-            monitor.snapshots.append(_slice(getattr(grid, comp)).copy())
-        monitor.snap_times.append(grid.time_step * _get_dt(grid))
+            monitor.snapshots.append(frame)
+            monitor.snap_times.append(t)
     return monitor
 
 
@@ -179,8 +318,15 @@ def record_energy(monitor: EnergyMonitor, grid: FDTDGrid) -> EnergyMonitor:
 # index/weight arrays (a quadrature) and each timestep costs only a few small
 # fancy-indexed dot products.
 
-# Yee stagger offsets in cell units, matching update.py:
+# Yee stagger offsets in cell units, used by the path-integral monitors.
 #   Ex[i,j,k] at (i, j+1/2, k+1/2) etc.
+#
+# WARNING: this table contradicts the staggering documented in update.py, which
+# puts Ex at (i+1/2, j, k) — the transpose of the offsets below. It is left as-is
+# here because the line-integral monitors and the ports in sources.py share it
+# and were validated against each other with it; changing it shifts every port
+# and probe by half a cell and must be done (and re-validated) as its own change.
+# `_CENTRE_OFFSETS` above follows update.py and is the correct one.
 _YEE_OFFSETS = {
     'Ex': (0.0, 0.5, 0.5), 'Ey': (0.5, 0.0, 0.5), 'Ez': (0.5, 0.5, 0.0),
     'Hx': (0.5, 0.0, 0.0), 'Hy': (0.0, 0.5, 0.0), 'Hz': (0.0, 0.0, 0.5),
