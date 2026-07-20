@@ -4,9 +4,11 @@ sources.py — excitation waveforms and the Source injection abstraction.
 Two layers live here, and they compose:
 
 1. Waveforms — the *time* part of an excitation. A waveform is any callable
-   ``f(t) -> float``. :class:`GaussianPulse` is the built-in baseband pulse (and
-   is itself callable); for a narrowband/CW drive just pass your own
-   ``lambda t: ...`` anywhere a waveform is expected.
+   ``f(t) -> float``. :class:`GaussianPulse` is the built-in baseband pulse and
+   :class:`Sinusoid` the built-in CW drive (both are callable); any
+   ``lambda t: ...`` works anywhere a waveform is expected. Prefer
+   :class:`Sinusoid` over a hand-rolled ``lambda t: sin(2*pi*f*t)`` — it ramps
+   the turn-on, which the lambda does not.
 
 2. Source objects — the injection abstraction. A :class:`Source` bundles *where*
    and *which components* (``spatial_profiles(grid)`` → ``{component: weights}``),
@@ -94,6 +96,66 @@ class GaussianPulse(Waveform):
         width = 1.0 / (2.0 * np.pi * f_max)
         t0 = 4.0 * width
         return cls(t0=t0, width=width, amplitude=amplitude)
+
+
+@dataclass
+class Sinusoid(Waveform):
+    """Continuous-wave (CW) sinusoid with a smooth turn-on ramp.
+
+    Callable, like :class:`GaussianPulse`, so an instance can be passed directly
+    as the ``waveform`` of a :class:`Source`.
+
+    The ramp is the point of this class. A bare ``sin(ωt)`` switched on at t=0
+    starts at zero *amplitude* but at maximum *slope*, and that kink is a
+    broadband impulse: it injects energy far outside the intended line, excites
+    resonances that have nothing to do with the drive frequency, and can leave a
+    slowly-decaying static residue. Multiplying by a raised-cosine envelope over
+    the first ``ramp_cycles`` periods makes both the value and its derivative
+    continuous at turn-on, so the spectrum stays where it belongs.
+
+    Parameters
+    ----------
+    frequency : float
+        Drive frequency (Hz).
+    amplitude : float
+        Steady-state peak amplitude (reached after the ramp).
+    phase : float
+        Phase offset (radians). The default 0 starts the carrier at zero.
+    ramp_cycles : float
+        Length of the raised-cosine turn-on, in periods. Set to 0 to disable the
+        ramp and start the carrier abruptly — only sensible when ``phase`` leaves
+        the waveform continuous at t=0, and it forfeits the protection above.
+
+    Notes
+    -----
+    Output is identically zero for ``t <= 0``.
+    """
+    frequency: float
+    amplitude: float = 1.0
+    phase: float = 0.0
+    ramp_cycles: float = 3.0
+
+    def __call__(self, t: float) -> float:
+        if t <= 0.0:
+            return 0.0
+        envelope = 1.0
+        if self.ramp_cycles > 0.0:
+            t_ramp = self.ramp_cycles / self.frequency
+            if t < t_ramp:
+                # Raised cosine: 0 → 1 with zero slope at both ends.
+                envelope = 0.5 * (1.0 - np.cos(np.pi * t / t_ramp))
+        return self.amplitude * envelope * np.sin(
+            2.0 * np.pi * self.frequency * t + self.phase)
+
+    @property
+    def center_frequency(self) -> float:
+        """Spectral centre (Hz) — here simply the carrier frequency.
+
+        Read by machinery that has to tune itself to the drive frequency (the
+        numerical-impedance correction of a directional launch). Waveforms
+        without this attribute fall back to frequency-independent behaviour.
+        """
+        return self.frequency
 
 
 # ====================================================================== #

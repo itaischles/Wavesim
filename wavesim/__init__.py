@@ -41,7 +41,7 @@ from wavesim.pml import (
 )
 from wavesim.pec import apply_pec_faces, apply_pec_mask
 from wavesim.sources import (
-    Waveform, GaussianPulse,
+    Waveform, GaussianPulse, Sinusoid,
     Source, PointSource, ArraySource, PlaneSource, LineSource, TEMPort, SpicePort,
     VolumeSource,
 )
@@ -99,7 +99,7 @@ __all__ = [
     # pec
     "apply_pec_faces", "apply_pec_mask",
     # sources
-    "Waveform", "GaussianPulse",
+    "Waveform", "GaussianPulse", "Sinusoid",
     "Source", "PointSource", "ArraySource", "PlaneSource", "LineSource", "TEMPort",
     "SpicePort", "VolumeSource",
     # monitors
