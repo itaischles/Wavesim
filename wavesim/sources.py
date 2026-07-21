@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Tuple, Union
 import numpy as np
 
-from wavesim.constants import EPS0
+from wavesim.constants import C0, EPS0, ETA0
 from wavesim.grid import FDTDGrid
 # Shared with VoltageMonitor so a LineSource and a monitor on the same path
 # snap to identical Yee E-edges and agree bit-for-bit on ∫E·dl.
@@ -363,6 +363,225 @@ class PlaneSource(Source):
                 full[k, :, :] = prof
             out[comp] = full
         return out
+
+
+# ====================================================================== #
+# Plane-wave / full-slice directional launch
+# ====================================================================== #
+
+# Per boundary face: the propagation normal, which side of the box it is, and the
+# ordered transverse pair (a, b). The pair is chosen so **a × b = the inward
+# propagation direction**, which makes (â, b̂, n̂) right-handed on *every* face —
+# so the launch's magnetic field ``H = (n̂ × E)/η`` needs no per-face sign table.
+#
+# The price of that uniformity: the same physical polarization takes a DIFFERENT
+# ``angle`` value on opposite faces. E.g. a wave polarized along +z is angle=90°
+# on x0 (pair y→z) but angle=0° on x1 (pair z→y). This is deliberate — read the
+# angle as "measured from â towards b̂ in this face's own right-handed frame".
+_FACE_CFG = {
+    'x0': dict(normal='x', side='low',  a='y', b='z'),   # y × z = +x  (into +x)
+    'x1': dict(normal='x', side='high', a='z', b='y'),   # z × y = -x  (into -x)
+    'y0': dict(normal='y', side='low',  a='z', b='x'),   # z × x = +y
+    'y1': dict(normal='y', side='high', a='x', b='z'),   # x × z = -y
+    'z0': dict(normal='z', side='low',  a='x', b='y'),   # x × y = +z
+    'z1': dict(normal='z', side='high', a='y', b='x'),   # y × x = -z
+}
+
+
+def _plane_slice(arr: np.ndarray, normal: str, k: int) -> np.ndarray:
+    """The 2D plane of ``arr`` perpendicular to ``normal`` at cell ``k``
+    (same orientation as :mod:`wavesim.monitors` / the mode solver)."""
+    if normal == 'z':
+        return arr[:, :, k]
+    if normal == 'y':
+        return arr[:, k, :]
+    return arr[k, :, :]
+
+
+class _PlaneLaunch(Source):
+    """Full-slice E (and, when directional, paired H) launch with the corrected
+    co-indexed H time shift. Shared engine behind :class:`PlaneWave` and
+    :meth:`~wavesim.mode_solver.TEMMode.to_source`.
+
+    Both sheets sit on the *same* slice (index ``k``). E is driven by
+    ``waveform(t)``; the directional H sheet by ``waveform(t + τ)`` with
+
+        τ = dt/2 + p · dn/(2·v_num)
+
+    where ``p = +1`` for a launch into +normal (low faces / a +normal mode) and
+    ``p = -1`` into -normal (high faces). ``dt/2`` undoes the leapfrog stagger and
+    ``dn/(2·v_num)`` the half-cell that the co-indexed H sheet sits ahead of E
+    along +normal (``dn`` = the normal cell width, ``v_num`` the numerical phase
+    velocity). Because the correction is a *positive* shift — H sampled in the
+    future — it can only be built from an analytic waveform, which is exactly why
+    a circuit-driven port (:meth:`TEMMode.build_port_kernel`) instead puts its H
+    sheet one cell behind and lags it. The two are the same launch shifted by one
+    cell (``+dn/v``): both reject the backward wave to ≈ -150 dB on a 1D test.
+
+    Subclasses supply the geometry lazily (the grid is only seen at first
+    ``inject``): ``_plane_index(grid)`` and ``_transverse_profiles(grid)``.
+    """
+
+    def __init__(self, waveform: Callable[[float], float], *,
+                 normal: str, directional: bool, v_medium: float,
+                 prop_sign: float = 1.0,
+                 e_profiles: Mapping[str, np.ndarray] | None = None,
+                 h_profiles: Mapping[str, np.ndarray] | None = None,
+                 position: float | None = None) -> None:
+        super().__init__(waveform)
+        self.normal = normal
+        self.directional = bool(directional)
+        self.v_medium = float(v_medium)
+        self.prop_sign = float(prop_sign)
+        self.position = position
+        self._e2d = e_profiles
+        self._h2d = h_profiles
+        self._e_full: Dict[str, np.ndarray] | None = None
+        self._h_full: Dict[str, np.ndarray] = {}
+        self._tau = 0.0
+
+    # --- geometry hooks (overridable) ---------------------------------- #
+    def _plane_index(self, grid: FDTDGrid) -> int:
+        return grid.axis_index(self.normal, self.position)
+
+    def _transverse_profiles(self, grid: FDTDGrid):
+        """Return ``(E2d, H2d)`` transverse-plane profile dicts."""
+        return dict(self._e2d or {}), dict(self._h2d or {})
+
+    # --- lazy build ---------------------------------------------------- #
+    def _embed(self, grid: FDTDGrid, k: int, prof2d: np.ndarray) -> np.ndarray:
+        full = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=np.float64)
+        if self.normal == 'z':
+            full[:, :, k] = prof2d
+        elif self.normal == 'y':
+            full[:, k, :] = prof2d
+        else:
+            full[k, :, :] = prof2d
+        return full
+
+    def _build(self, grid: FDTDGrid) -> None:
+        k = self._plane_index(grid)
+        E2d, H2d = self._transverse_profiles(grid)
+        self._e_full = {c: self._embed(grid, k, np.asarray(p, np.float64))
+                        for c, p in E2d.items()}
+        if self.directional and H2d:
+            self._h_full = {c: self._embed(grid, k, np.asarray(p, np.float64))
+                            for c, p in H2d.items()}
+            dn = float({'x': grid.dxp, 'y': grid.dyp,
+                        'z': grid.dzp}[self.normal][k])
+            from wavesim.mode_solver import numerical_velocity
+            freq = getattr(self.waveform, 'center_frequency', None)
+            v_num = numerical_velocity(self.v_medium, dn, grid.dt, freq)
+            self._tau = grid.dt / 2.0 + self.prop_sign * dn / (2.0 * v_num)
+        else:
+            self._h_full = {}
+            self._tau = 0.0
+
+    def spatial_profiles(self, grid: FDTDGrid) -> Dict[str, np.ndarray]:
+        """Full-grid E (and H) weight arrays, for inspection. ``inject`` drives
+        the two sheets at different times, so it does not use this directly."""
+        if self._e_full is None:
+            self._build(grid)
+        return {**self._e_full, **self._h_full}
+
+    def inject(self, grid: FDTDGrid, t: float) -> None:
+        if self._e_full is None:
+            self._build(grid)
+        ae = self.waveform(t)
+        for comp, prof in self._e_full.items():
+            getattr(grid, comp)[...] += ae * prof
+        if self._h_full:
+            ah = self.waveform(t + self._tau)
+            for comp, prof in self._h_full.items():
+                getattr(grid, comp)[...] += ah * prof
+
+
+class PlaneWave(_PlaneLaunch):
+    """A directional plane wave launched from one boundary face.
+
+    Drives the full cross-section one PML-depth inside a boundary face with a
+    uniform transverse field, biased into the domain: an E sheet plus the paired
+    ``H = (n̂ × E)/η`` sheet (:class:`_PlaneLaunch`). The waveform carries the
+    amplitude — there is deliberately no ``amplitude`` parameter, as for every
+    other source. The launched field is *not* amplitude-calibrated (it scales as
+    ≈ ``1/S_n`` × the waveform, ``S_n`` the Courant number along the normal); use
+    a monitor to normalise if you need an absolute level.
+
+    Parameters
+    ----------
+    face : str
+        Boundary face to launch from — one of ``'x0','x1','y0','y1','z0','z1'``
+        (``'x0'`` = the low-x face, propagating into +x; ``'x1'`` = high-x, into
+        -x; etc.). The wave propagates *into* the domain.
+    angle : float
+        Polarization angle (radians) of E, measured from the face's first
+        transverse axis ``â`` towards its second ``b̂``: ``E ∝ cos(angle)·â +
+        sin(angle)·b̂``. The (a, b) pair is right-handed with the propagation
+        normal (see ``_FACE_CFG``), so the SAME physical polarization needs a
+        DIFFERENT ``angle`` on opposite faces — e.g. +z-polarized light is 90° on
+        x0 but 0° on x1.
+    waveform : Callable[[float], float]
+        Time function (e.g. a :class:`Sinusoid` or :class:`GaussianPulse`). A
+        waveform advertising a ``center_frequency`` tunes the H time shift to the
+        numerical phase velocity at that frequency; otherwise the continuum
+        velocity is used.
+    d_pml : int
+        PML thickness in cells (default 10, matching :func:`init_cpml`). The E
+        sheet is placed on the first interior cell — index ``d_pml`` on a low
+        face, ``N-1-d_pml`` on a high face — so the backward lobe is launched
+        straight into the absorber.
+    directional : bool
+        Pair the E sheet with an H sheet for a one-way launch (default True).
+        ``False`` gives a bare E sheet, which radiates symmetrically both ways.
+
+    Notes
+    -----
+    There are no periodic/Bloch boundaries, so a truly infinite plane wave is not
+    reachable: expect edge effects where the sheet meets the transverse PMLs.
+    """
+
+    def __init__(self, face: str, angle: float,
+                 waveform: Callable[[float], float], *,
+                 d_pml: int = 10, directional: bool = True) -> None:
+        if face not in _FACE_CFG:
+            raise ValueError(
+                f"face must be one of {sorted(_FACE_CFG)}, got {face!r}.")
+        cfg = _FACE_CFG[face]
+        super().__init__(waveform, normal=cfg['normal'], directional=directional,
+                         v_medium=C0,
+                         prop_sign=(1.0 if cfg['side'] == 'low' else -1.0))
+        self.face = face
+        self.angle = float(angle)
+        self.d_pml = int(d_pml)
+
+    def _plane_index(self, grid: FDTDGrid) -> int:
+        N = {'x': grid.Nx, 'y': grid.Ny, 'z': grid.Nz}[self.normal]
+        if _FACE_CFG[self.face]['side'] == 'low':
+            return self.d_pml
+        return N - 1 - self.d_pml
+
+    def _transverse_profiles(self, grid: FDTDGrid):
+        cfg = _FACE_CFG[self.face]
+        a_ax, b_ax = cfg['a'], cfg['b']
+        k = self._plane_index(grid)
+
+        # Local wave impedance per transverse cell. The (E_b, H_a) pair carries
+        # power along n̂, as does (E_a, H_b); each uses η = η₀·√(μ/ε) built from
+        # the permeability the H component sees and the permittivity its partner
+        # E component sees. Uniform (vacuum) grids give η₀ everywhere.
+        eps_a = _plane_slice(getattr(grid, 'eps_' + a_ax), self.normal, k)
+        eps_b = _plane_slice(getattr(grid, 'eps_' + b_ax), self.normal, k)
+        mu_a = _plane_slice(getattr(grid, 'mu_' + a_ax), self.normal, k)
+        mu_b = _plane_slice(getattr(grid, 'mu_' + b_ax), self.normal, k)
+        eta_a = ETA0 * np.sqrt(mu_a / np.where(eps_b > 0, eps_b, 1.0))
+        eta_b = ETA0 * np.sqrt(mu_b / np.where(eps_a > 0, eps_a, 1.0))
+
+        ca, sa = np.cos(self.angle), np.sin(self.angle)
+        ones = np.ones_like(eps_a)
+        # E = cos·â + sin·b̂;  H = (n̂ × E)/η = (cos·b̂ - sin·â)/η
+        E = {'E' + a_ax: ca * ones, 'E' + b_ax: sa * ones}
+        H = {'H' + a_ax: -sa / eta_a, 'H' + b_ax: ca / eta_b}
+        return E, H
 
 
 class LineSource(Source):

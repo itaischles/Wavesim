@@ -42,8 +42,8 @@ from wavesim.pml import (
 from wavesim.pec import apply_pec_faces, apply_pec_mask
 from wavesim.sources import (
     Waveform, GaussianPulse, Sinusoid,
-    Source, PointSource, ArraySource, PlaneSource, LineSource, TEMPort, SpicePort,
-    VolumeSource,
+    Source, PointSource, ArraySource, PlaneSource, PlaneWave,
+    LineSource, TEMPort, SpicePort, VolumeSource,
 )
 from wavesim.monitors import (
     FieldProbe, SnapshotMonitor, EnergyMonitor,
@@ -100,8 +100,8 @@ __all__ = [
     "apply_pec_faces", "apply_pec_mask",
     # sources
     "Waveform", "GaussianPulse", "Sinusoid",
-    "Source", "PointSource", "ArraySource", "PlaneSource", "LineSource", "TEMPort",
-    "SpicePort", "VolumeSource",
+    "Source", "PointSource", "ArraySource", "PlaneSource", "PlaneWave",
+    "LineSource", "TEMPort", "SpicePort", "VolumeSource",
     # monitors
     "FieldProbe", "SnapshotMonitor", "EnergyMonitor",
     "VoltageMonitor", "CurrentMonitor", "circular_path",

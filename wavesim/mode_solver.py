@@ -5,7 +5,7 @@ Given a grid face (or a rectangular subset of one), this finds the PEC conductor
 cross-sections lying on that plane and solves the transverse-static field of each
 TEM mode the structure supports. The resulting :class:`TEMMode` carries the 2D
 transverse E (and H) profiles, which can be scaled and launched as an input port
-via :meth:`TEMMode.to_source` (a :class:`~wavesim.sources.PlaneSource`).
+via :meth:`TEMMode.to_source`.
 
 Physics
 -------
@@ -179,7 +179,7 @@ class TEMMode:
 
     def to_source(self, waveform: Callable[[float], float],
                   amplitude: float = 1.0, fields: str = 'EH'):
-        """Build a :class:`~wavesim.sources.PlaneSource` that launches this mode.
+        """Build a source that launches this mode.
 
         Parameters
         ----------
@@ -189,30 +189,33 @@ class TEMMode:
             Scalar the mode profiles are multiplied by (the mode is normalised to
             a 1 V drive; scale it to whatever excitation you want).
         fields : str
-            ``'EH'`` injects both transverse E and H (directional launch);
-            ``'E'`` injects only E (simpler, bidirectional).
+            ``'EH'`` injects both transverse E and H for a directional
+            (one-way, +normal) launch; ``'E'`` injects only E (simpler,
+            bidirectional).
 
         Notes
         -----
-        The ``'EH'`` launch here is the *naive* pairing: both sheets go on the
-        same slice and share one waveform, which biases energy into +normal but
-        only rejects backwards by roughly -18 dB. The corrected pairing — H half
-        a cell behind, driven with a compensating time shift — currently lives in
-        :meth:`build_port_kernel` (used by
-        :class:`~wavesim.sources.TEMPort`), because applying it needs the grid's
-        ``dt`` and cell size, which a :class:`~wavesim.sources.PlaneSource` only
-        sees lazily at first injection.
+        The ``'EH'`` launch uses the corrected sheet pairing: E and the paired
+        ``H = (n̂ × E)/η`` sheet share the mode's slice, but H is driven by the
+        waveform evaluated a fraction of a step *ahead*
+        (``τ = dt/2 + dn/(2·v_num)``) so both sheets represent the same incident
+        wave and the backward lobe cancels rather than merely shrinking. That
+        shift needs the grid's ``dt`` and cell size, so it is applied lazily at
+        first injection (:class:`~wavesim.sources._PlaneLaunch`) — the same engine
+        :class:`~wavesim.sources.PlaneWave` uses. A waveform advertising a
+        ``center_frequency`` tunes ``v_num`` to that frequency. (The circuit-port
+        path, :meth:`build_port_kernel`, cannot look ahead, so it instead places
+        H one cell behind and lags it — the same launch shifted by one cell.)
         """
-        from wavesim.sources import PlaneSource  # local import avoids a cycle
-        profiles: Dict[str, np.ndarray] = {}
-        if 'E' in fields:
-            for comp, arr in self.E.items():
-                profiles[comp] = amplitude * arr
-        if 'H' in fields:
-            for comp, arr in self.H.items():
-                profiles[comp] = amplitude * arr
-        return PlaneSource(waveform, axis=self.normal, position=self.position,
-                           profiles=profiles)
+        from wavesim.sources import _PlaneLaunch  # local import avoids a cycle
+        E = {comp: amplitude * arr for comp, arr in self.E.items()} \
+            if 'E' in fields else {}
+        H = {comp: amplitude * arr for comp, arr in self.H.items()} \
+            if 'H' in fields else {}
+        return _PlaneLaunch(
+            waveform, normal=self.normal, position=self.position,
+            directional=bool(H), v_medium=(self.v_phase or C0),
+            prop_sign=1.0, e_profiles=E, h_profiles=H)
 
     def build_port_kernel(self, grid: FDTDGrid, *,
                           directional: bool = True,
