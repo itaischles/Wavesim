@@ -268,6 +268,117 @@ def record_snapshot(monitor: SnapshotMonitor, grid: FDTDGrid) -> SnapshotMonitor
 
 
 # ======================================================================= #
+# PoyntingMonitor — 2D slice of the instantaneous power flow S = E × H
+# ======================================================================= #
+
+@dataclass
+class PoyntingMonitor:
+    """
+    Capture the instantaneous Poynting vector S = E × H on a 2D slice.
+
+    This is the power-flow companion to :class:`SnapshotMonitor`: same slice
+    geometry, same recording cadence, but it records the local energy flux
+    density (W/m²) as a *vector* rather than a single field component, so a
+    downstream plot can show which way — and how strongly — power is flowing
+    through the plane.
+
+    The slice is the plane perpendicular to ``normal`` ('x', 'y' or 'z') at
+    position ``at_z`` (metres) along that axis — identical to
+    :class:`SnapshotMonitor`:
+        - normal='z' -> an XY slice (the default)
+        - normal='y' -> an XZ slice
+        - normal='x' -> a YZ slice
+    ``at_z`` keeps its name for parity with SnapshotMonitor; for a non-z normal
+    it is simply the coordinate along ``normal``.
+
+    Output contract
+    ---------------
+    Each recorded frame is an array of shape ``(Na, Nb, 3)``: the two in-plane
+    axes of the slice followed by the three Cartesian components of S in
+    ``(x, y, z)`` order, i.e. ``frame[a, b] = (Sx, Sy, Sz)`` at the centre of
+    cell ``(a, b)`` of the slice plane. For a z-normal slice ``(Sx, Sy)`` is the
+    in-plane power flow and ``Sz`` the flow through the plane.
+
+    S = E × H requires E and H at the **same location and the same instant**.
+    Both are met by reusing SnapshotMonitor's machinery:
+
+    - *Location.* Every one of the six field components is collocated to the cell
+      centre first (see :func:`_collocate_slice`), then the cross product is
+      formed there. Frames are therefore **one cell shorter than the grid along
+      each in-plane axis** (a z-normal slice of an ``(Nx, Ny, Nz)`` grid yields
+      ``(Nx-1, Ny-1, 3)``) and share the cell-centre coordinate arrays
+      ``grid.xc`` / ``grid.yc`` / ``grid.zc``, exactly like SnapshotMonitor.
+
+    - *Instant.* H trails E by half a timestep in the leapfrog, so the collocated
+      H is averaged across the half step onto the E timebase: the frame stamped
+      ``t`` crosses E at ``t`` with the mean of H at ``t - dt/2`` and
+      ``t + dt/2``. This costs one step of latency — a stashed frame the run ends
+      before completing is dropped, so ``snapshots`` and ``snap_times`` always
+      stay the same length. As with SnapshotMonitor this assumes
+      :func:`record_poynting` runs on *every* timestep (as ``Simulation`` does).
+
+    ``snap_times[n]`` is the physical time of the frame, ``(time_step + 1) * dt``
+    at the recording step.
+    """
+    at_z: float         # slice position (metres) along `normal` (use 0 for a 1-cell axis)
+    every_N_steps: int  # record every N timesteps
+    normal: str = 'z'   # axis the slice plane is perpendicular to: 'x'/'y'/'z'
+    snapshots:   list = field(default_factory=list)   # each (Na, Nb, 3): Sx,Sy,Sz
+    snap_times:  list = field(default_factory=list)
+    # Half-step carry: (snap_time, E frame, H frame) — E is already on its
+    # timebase; the stashed H (at t - dt/2) waits for the next step's H (t + dt/2)
+    # so their mean lands H on the E timebase before the cross product is formed.
+    _pending: tuple = field(default=None, repr=False)
+
+
+def _collocated_vector(grid: FDTDGrid, f: str, normal: str,
+                       idx: int, shape: tuple) -> np.ndarray:
+    """Stack the three components of field ``f`` ('E' or 'H'), each collocated to
+    cell centres on the slice plane, into one ``(Na, Nb, 3)`` frame in x,y,z order."""
+    return np.stack(
+        [_collocate_slice(getattr(grid, f + a), f + a, normal, idx, shape)
+         for a in _AXES], axis=-1)
+
+
+def record_poynting(monitor: PoyntingMonitor, grid: FDTDGrid) -> PoyntingMonitor:
+    """
+    Append a cell-centre-collocated 2D slice of S = E × H if this is a recording step.
+
+    Must be called on every timestep (not only recording ones): H is averaged
+    across the half step onto the E timebase, which needs the frame from the step
+    after the recording step. See :class:`PoyntingMonitor` for the output contract.
+    """
+    recording = grid.time_step % monitor.every_N_steps == 0
+    if not recording and monitor._pending is None:
+        return monitor
+
+    normal = getattr(monitor, 'normal', 'z')
+    idx = grid.axis_index(normal, monitor.at_z)
+    shape = (grid.Nx, grid.Ny, grid.Nz)
+
+    # H at this step is at t - dt/2 relative to the E it accompanies; needed both
+    # to complete a stashed frame (as its t + dt/2 partner) and to stash a new one.
+    H_frame = _collocated_vector(grid, 'H', normal, idx, shape)
+
+    # Complete a stashed frame *before* stashing this one, so consecutive
+    # recording steps each get their own carry (matters when every_N_steps == 1).
+    if monitor._pending is not None:
+        t_stash, E_stash, H_stash = monitor._pending
+        monitor._pending = None
+        H_at_t = 0.5 * (H_stash + H_frame)           # onto the E timebase
+        monitor.snapshots.append(np.cross(E_stash, H_at_t))
+        monitor.snap_times.append(t_stash)
+
+    if recording:
+        E_frame = _collocated_vector(grid, 'E', normal, idx, shape)
+        # E has just been advanced to the end of this step; time_step still holds
+        # the step's start index, so the field is at (n+1)*dt.
+        t = (grid.time_step + 1) * _get_dt(grid)
+        monitor._pending = (t, E_frame, H_frame)
+    return monitor
+
+
+# ======================================================================= #
 # EnergyMonitor — total EM energy in the domain
 # ======================================================================= #
 

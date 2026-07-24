@@ -11,6 +11,8 @@ INFRASTRUCTURE (no physics required):
 FIELD DIAGNOSTICS (2D / single slice):
     plot_field_snapshot()  — single 2D field snapshot
     animate_snapshots()    — animation of SnapshotMonitor data
+    plot_poynting()        — single power-flow (Poynting) frame: flow arrows + magnitude
+    animate_poynting()     — animation of PoyntingMonitor data
     plot_monitor_time_series() — FieldProbe time series (component or |E|/|H|)
     plot_voltage_current() — VoltageMonitor / CurrentMonitor time series
     plot_energy()          — total energy vs time (log scale)
@@ -324,6 +326,228 @@ def animate_snapshots(snapshot_monitor, grid: FDTDGrid, interval_ms: int = 50,
         fig, _update, frames=len(snaps),
         interval=interval_ms, blit=not contour
     )
+    plt.tight_layout()
+    return anim
+
+
+# ======================================================================= #
+# POYNTING (power-flow) VISUALISATION
+# ======================================================================= #
+#
+# A PoyntingMonitor frame is (Na, Nb, 3): the two in-plane axes of the slice
+# followed by the Cartesian (Sx, Sy, Sz) at each cell centre. The helpers below
+# split that into the two in-plane components (drawn as flow arrows) and the
+# through-plane component, and render power flux in W/m². They mirror
+# plot_field_snapshot / animate_snapshots for the E/H SnapshotMonitor.
+
+_AXES = ('x', 'y', 'z')
+
+
+def _poynting_split(frame: np.ndarray, normal: str):
+    """Split a (Na, Nb, 3) Poynting frame into in-plane (Sa, Sb) and normal Sn.
+
+    Returns (Sa, Sb, Sn, a_ax, b_ax) where a_ax/b_ax are the Cartesian axis
+    indices (0/1/2) of the two in-plane directions, in the same order as the
+    frame's two spatial axes (increasing axis index — the order
+    :func:`_collocate_slice` produces).
+    """
+    frame = np.asarray(frame)
+    n_ax = _AXES.index(normal)
+    a_ax, b_ax = (k for k in range(3) if k != n_ax)
+    return frame[..., a_ax], frame[..., b_ax], frame[..., n_ax], a_ax, b_ax
+
+
+def _poynting_background(Sa, Sb, Sn, background: str):
+    """The scalar field drawn under the flow arrows, plus (is_signed, label)."""
+    if background == 'normal':
+        return Sn, True, 'S·n̂ (W/m²)'
+    if background == 'magnitude':
+        return np.sqrt(Sa**2 + Sb**2 + Sn**2), False, '|S| (W/m²)'
+    if background == 'inplane':
+        return np.hypot(Sa, Sb), False, '|S_∥| (W/m²)'
+    raise ValueError("background must be 'inplane', 'magnitude' or 'normal', "
+                     f"got {background!r}")
+
+
+def plot_poynting(frame: np.ndarray, grid: FDTDGrid, normal: str = 'z',
+                  time: float = None, ax=None, quiver_step: int = None,
+                  background: str = 'inplane', cmap: str = None,
+                  normalize: bool = False):
+    """
+    Draw one Poynting (power-flow) frame: a scalar background + in-plane arrows.
+
+    The in-plane components of S are shown as a quiver (which way power flows in
+    the slice) over a colour map of a scalar derived from S (how strong the flow
+    is). This is the still-frame companion to :func:`plot_field_snapshot`.
+
+    Parameters
+    ----------
+    frame : np.ndarray, shape (Na, Nb, 3)
+        A single frame from a :class:`~wavesim.monitors.PoyntingMonitor`
+        (``monitor.snapshots[k]``): the in-plane axes followed by (Sx, Sy, Sz).
+    grid : FDTDGrid
+    normal : str
+        Slice normal ('x'/'y'/'z'); must match the monitor's ``normal``.
+    time : float, optional
+        Frame time in seconds (``monitor.snap_times[k]``) — shown in the title.
+    quiver_step : int, optional
+        Draw an arrow every this many cells (auto from the frame size if None).
+    background : str
+        Scalar drawn under the arrows: 'inplane' (in-plane magnitude |S_∥|,
+        default), 'magnitude' (full |S|), or 'normal' (through-plane S·n̂, drawn
+        on a zero-centred diverging scale).
+    cmap : str, optional
+        Colormap. Defaults to 'RdBu_r' for the signed 'normal' background,
+        'inferno' otherwise.
+    normalize : bool
+        If True, draw all arrows the same length (direction only) — the
+        background then carries all magnitude information.
+
+    Returns
+    -------
+    (fig, ax)
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 6))
+    else:
+        fig = ax.figure
+
+    Sa, Sb, Sn, a_ax, b_ax = _poynting_split(frame, normal)
+    na, nb = Sa.shape
+
+    # Frames are collocated to cell centres and cropped to N-1 cells per in-plane
+    # axis, so use the nodes bounding those cells (pcolormesh) and the cell-centre
+    # coordinates for the arrows — both non-uniform-grid correct.
+    nodes = (grid.x, grid.y, grid.z)
+    centres = (grid.xc, grid.yc, grid.zc)
+    a_nodes, b_nodes = nodes[a_ax][:na + 1], nodes[b_ax][:nb + 1]
+    a_cent, b_cent = centres[a_ax][:na], centres[b_ax][:nb]
+
+    bg, signed, cbar_label = _poynting_background(Sa, Sb, Sn, background)
+    if cmap is None:
+        cmap = 'RdBu_r' if signed else 'inferno'
+    vmax = float(np.max(np.abs(bg)))
+    if vmax < 1e-30:
+        vmax = 1.0
+    vmin = -vmax if signed else 0.0
+
+    im = ax.pcolormesh(a_nodes, b_nodes, bg.T, cmap=cmap, shading='flat',
+                       vmin=vmin, vmax=vmax)
+    cbar = plt.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label(cbar_label, fontsize=9)
+
+    if quiver_step is None:
+        quiver_step = max(1, min(na, nb) // 25)
+    s = quiver_step
+    AX, BY = np.meshgrid(a_cent[::s], b_cent[::s], indexing='xy')
+    U, V = Sa.T[::s, ::s], Sb.T[::s, ::s]
+    if normalize:
+        norm = np.hypot(U, V)
+        norm[norm == 0.0] = 1.0
+        U, V = U / norm, V / norm
+    ax.quiver(AX, BY, U, V, color='k', alpha=0.8, pivot='mid')
+
+    ax.set_aspect('equal')
+    ax.set_xlabel(f'{_AXES[a_ax]} (m)')
+    ax.set_ylabel(f'{_AXES[b_ax]} (m)')
+    title = f'Power flow  S = E × H  ({normal}-normal slice)'
+    if time is not None:
+        title += f'\nt = {time * 1e9:.3f} ns'
+    ax.set_title(title)
+    plt.tight_layout()
+    return fig, ax
+
+
+def animate_poynting(poynting_monitor, grid: FDTDGrid, interval_ms: int = 60,
+                     quiver_step: int = None, background: str = 'inplane',
+                     cmap: str = None, normalize: bool = True):
+    """
+    Animate a :class:`~wavesim.monitors.PoyntingMonitor`: flowing power over time.
+
+    The in-plane power flow is drawn as a quiver over a colour map of a scalar
+    derived from S; both share one colour scale across the whole run so frames
+    are comparable. This is the power-flow companion to
+    :func:`animate_snapshots`.
+
+    Returns a matplotlib FuncAnimation. Save with
+    ``anim.save('out.gif', writer='pillow', fps=18)``.
+
+    Parameters
+    ----------
+    poynting_monitor : PoyntingMonitor
+    grid : FDTDGrid
+    interval_ms : int
+        Frame interval in milliseconds.
+    quiver_step, background, cmap :
+        As in :func:`plot_poynting`.
+    normalize : bool
+        If True (default here), arrows show direction only (unit length) so their
+        motion is legible frame-to-frame; magnitude is read from the background.
+    """
+    snaps = poynting_monitor.snapshots
+    times = poynting_monitor.snap_times
+    if not snaps:
+        raise ValueError("PoyntingMonitor has no recorded snapshots.")
+
+    normal = getattr(poynting_monitor, 'normal', 'z')
+
+    # Global colour scale so the background is comparable across frames.
+    bgs = []
+    for fr in snaps:
+        Sa, Sb, Sn, _, _ = _poynting_split(fr, normal)
+        bg, signed, cbar_label = _poynting_background(Sa, Sb, Sn, background)
+        bgs.append(bg)
+    if cmap is None:
+        cmap = 'RdBu_r' if signed else 'inferno'
+    vmax = max((float(np.max(np.abs(b))) for b in bgs), default=1e-30)
+    if vmax < 1e-30:
+        vmax = 1.0
+    vmin = -vmax if signed else 0.0
+
+    Sa0, Sb0, Sn0, a_ax, b_ax = _poynting_split(snaps[0], normal)
+    na, nb = Sa0.shape
+    nodes = (grid.x, grid.y, grid.z)
+    centres = (grid.xc, grid.yc, grid.zc)
+    a_nodes, b_nodes = nodes[a_ax][:na + 1], nodes[b_ax][:nb + 1]
+    a_cent, b_cent = centres[a_ax][:na], centres[b_ax][:nb]
+
+    if quiver_step is None:
+        quiver_step = max(1, min(na, nb) // 25)
+    s = quiver_step
+    AX, BY = np.meshgrid(a_cent[::s], b_cent[::s], indexing='xy')
+
+    def _uv(frame):
+        Sa, Sb, _, _, _ = _poynting_split(frame, normal)
+        U, V = Sa.T[::s, ::s], Sb.T[::s, ::s]
+        if normalize:
+            n = np.hypot(U, V)
+            n[n == 0.0] = 1.0
+            U, V = U / n, V / n
+        return U, V
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.pcolormesh(a_nodes, b_nodes, bgs[0].T, cmap=cmap, shading='flat',
+                       vmin=vmin, vmax=vmax, animated=True)
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label(cbar_label, fontsize=9)
+    U0, V0 = _uv(snaps[0])
+    q = ax.quiver(AX, BY, U0, V0, color='k', alpha=0.8, pivot='mid')
+    ax.set_aspect('equal')
+    ax.set_xlabel(f'{_AXES[a_ax]} (m)')
+    ax.set_ylabel(f'{_AXES[b_ax]} (m)')
+    title = ax.set_title('')
+
+    def _update(fr):
+        # QuadMesh.set_array wants the C values matching shading='flat'.
+        im.set_array(bgs[fr].T.ravel())
+        U, V = _uv(snaps[fr])
+        q.set_UVC(U, V)
+        title.set_text(f'Power flow  S = E × H  ({normal}-normal) — '
+                       f't = {times[fr]*1e9:.3f} ns  (frame {fr}/{len(snaps)-1})')
+        return im, q, title
+
+    anim = animation.FuncAnimation(fig, _update, frames=len(snaps),
+                                   interval=interval_ms, blit=False)
     plt.tight_layout()
     return anim
 
