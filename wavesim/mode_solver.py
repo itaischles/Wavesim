@@ -179,43 +179,52 @@ class TEMMode:
 
     def to_source(self, waveform: Callable[[float], float],
                   amplitude: float = 1.0, fields: str = 'EH'):
-        """Build a source that launches this mode.
+        """Build an amplitude-calibrated source that launches this mode.
 
         Parameters
         ----------
         waveform : Callable[[float], float]
             Temporal profile (e.g. a :class:`~wavesim.sources.GaussianPulse`).
         amplitude : float
-            Scalar the mode profiles are multiplied by (the mode is normalised to
-            a 1 V drive; scale it to whatever excitation you want).
+            Forward-wave voltage in volts. The mode is normalised to a 1 V drive,
+            so ``amplitude=1`` launches a wave a downstream
+            :class:`~wavesim.monitors.VoltageMonitor` reads as ``waveform(t)``
+            volts; scale it for any other level.
         fields : str
-            ``'EH'`` injects both transverse E and H for a directional
-            (one-way, +normal) launch; ``'E'`` injects only E (simpler,
-            bidirectional).
+            ``'EH'`` (default) launches a directional (one-way, +normal) wave with
+            the paired E and H sheets; ``'E'`` drives only the E footprint, a
+            simpler bidirectional launch that radiates both ways.
 
         Notes
         -----
-        The ``'EH'`` launch uses the corrected sheet pairing: E and the paired
-        ``H = (n̂ × E)/η`` sheet share the mode's slice, but H is driven by the
-        waveform evaluated a fraction of a step *ahead*
-        (``τ = dt/2 + dn/(2·v_num)``) so both sheets represent the same incident
-        wave and the backward lobe cancels rather than merely shrinking. That
-        shift needs the grid's ``dt`` and cell size, so it is applied lazily at
-        first injection (:class:`~wavesim.sources._PlaneLaunch`) — the same engine
-        :class:`~wavesim.sources.PlaneWave` uses. A waveform advertising a
-        ``center_frequency`` tunes ``v_num`` to that frequency. (The circuit-port
-        path, :meth:`build_port_kernel`, cannot look ahead, so it instead places
-        H one cell behind and lags it — the same launch shifted by one cell.)
+        The launch is *calibrated* — it impresses the modal current that a matched
+        line turns into ``amplitude·waveform(t)`` volts forward, using the same
+        current kernel a :class:`~wavesim.sources.TEMPort` uses
+        (:meth:`build_port_kernel`), so the amplitude is correct on any grid or
+        fill permittivity. (The earlier engine wrote the mode profile straight
+        into the field arrays, ignoring the FDTD update coefficient, and came out
+        √ε_r / S_c too large.)
+
+        The directional (``'EH'``) launch reuses the port's corrected sheet
+        pairing: the paired ``H = (n̂ × E)/η`` sheet sits one cell *behind* the E
+        plane and is driven by the impressed current lagged onto its own
+        space-time sample point, so the backward lobe cancels rather than merely
+        shrinking. That places the port plane one cell inside the domain — a mode
+        solved against a boundary (``position`` on the domain edge) has no room
+        for the H sheet; move it at least one cell in. A waveform advertising a
+        ``center_frequency`` (e.g. :class:`~wavesim.sources.Sinusoid`) tunes the
+        lag to the numerical phase velocity at that frequency.
+
+        Unlike a :class:`~wavesim.sources.TEMPort`, this is a pure soft source: it
+        launches but does not absorb the returning wave. Use a ``TEMPort`` (a
+        matched Thévenin drive) when you also want the port to terminate.
         """
-        from wavesim.sources import _PlaneLaunch  # local import avoids a cycle
-        E = {comp: amplitude * arr for comp, arr in self.E.items()} \
-            if 'E' in fields else {}
-        H = {comp: amplitude * arr for comp, arr in self.H.items()} \
-            if 'H' in fields else {}
-        return _PlaneLaunch(
-            waveform, normal=self.normal, position=self.position,
-            directional=bool(H), v_medium=(self.v_phase or C0),
-            prop_sign=1.0, e_profiles=E, h_profiles=H)
+        from wavesim.sources import _ModalLaunch  # local import avoids a cycle
+        if 'E' not in fields:
+            raise ValueError("fields must contain 'E' (an H-only launch is not "
+                             "a valid source).")
+        return _ModalLaunch(self, waveform, amplitude=amplitude,
+                            directional=('H' in fields))
 
     def build_port_kernel(self, grid: FDTDGrid, *,
                           directional: bool = True,

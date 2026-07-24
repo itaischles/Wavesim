@@ -324,10 +324,9 @@ class PlaneSource(Source):
         """Place each 2D transverse profile onto the slice at ``position``.
 
         A uniform plane wave (``profiles=None``) is not implemented yet; the
-        port-mode path (``profiles`` given, e.g. from
-        :meth:`~wavesim.mode_solver.TEMMode.to_source`) maps each
-        ``{component: 2D-array}`` onto a full-grid weight array, nonzero only on
-        the slice perpendicular to ``axis`` at the snapped cell.
+        port-mode path (``profiles`` given, a ``{component: 2D-array}`` transverse
+        mode profile) maps each onto a full-grid weight array, nonzero only on the
+        slice perpendicular to ``axis`` at the snapped cell.
         """
         if self.profiles is None:
             raise NotImplementedError(
@@ -400,8 +399,10 @@ def _plane_slice(arr: np.ndarray, normal: str, k: int) -> np.ndarray:
 
 class _PlaneLaunch(Source):
     """Full-slice E (and, when directional, paired H) launch with the corrected
-    co-indexed H time shift. Shared engine behind :class:`PlaneWave` and
-    :meth:`~wavesim.mode_solver.TEMMode.to_source`.
+    co-indexed H time shift. The engine behind :class:`PlaneWave`. It writes the
+    profiles straight into the field arrays each step, so — unlike the calibrated
+    current kernel a :class:`TEMPort` / :meth:`TEMMode.to_source` uses — the
+    launched amplitude is *not* calibrated (it scales as ≈ 1/S_n × the waveform).
 
     Both sheets sit on the *same* slice (index ``k``). E is driven by
     ``waveform(t)``; the directional H sheet by ``waveform(t + τ)`` with
@@ -818,6 +819,22 @@ class LineSource(Source):
         self.voltages.append(v_after)
         self.currents.append(i_port)
 
+    def _inject_directional_h(self, grid: FDTDGrid) -> None:
+        """Drive the paired directional H sheet, if the port has one.
+
+        Shared by :class:`TEMPort` and :class:`_ModalLaunch`. The sheet is
+        driven by the port current sampled at *its* space-time point, which
+        trails the E plane by ``_h_lag_steps`` (built from the kernel's
+        ``h_tau``); the shift is read out of the recorded current history, so
+        this must be called only after the present step's current has been
+        appended (see :meth:`_lagged_current`)."""
+        hedges = self._port.get('hedges') if self._port else None
+        if not hedges:
+            return
+        i_port = self._lagged_current(self._h_lag_steps)
+        for comp, (ii, jj, kk, coefH) in hedges.items():
+            getattr(grid, comp)[ii, jj, kk] += coefH * i_port
+
 
 class TEMPort(LineSource):
     """Distributed TEM-mode port: a Thévenin ``(Vs, Z₀)`` drive of a solved mode.
@@ -917,11 +934,81 @@ class TEMPort(LineSource):
         # Modal V* read-back, Piket-May law, E-injection and recording are all
         # inherited from LineSource; only the paired directional H sheet is new.
         super().inject(grid, t)
-        hedges = self._port.get('hedges')
-        if hedges:
-            i_port = self._lagged_current(self._h_lag_steps)
-            for comp, (ii, jj, kk, coefH) in hedges.items():
-                getattr(grid, comp)[ii, jj, kk] += coefH * i_port
+        self._inject_directional_h(grid)
+
+
+class _ModalLaunch(LineSource):
+    """Amplitude-calibrated impressed launch of a solved TEM mode.
+
+    The engine behind :meth:`~wavesim.mode_solver.TEMMode.to_source`. Unlike a
+    :class:`TEMPort` — a *terminated* Thévenin/Norton port that also absorbs the
+    returning wave — this is a pure soft source: it impresses the modal current
+    that a matched line turns into the requested forward voltage, and reflects
+    nothing.
+
+    Calibration comes from the very same
+    :meth:`~wavesim.mode_solver.TEMMode.build_port_kernel` current kernel a port
+    uses (``E += κ·Ê·I``, the paired one-cell-behind, lagged ``H += κ·Ĥ·I``), so
+    the launched amplitude is correct by construction on any grid or fill — the
+    older additive field write (a straight ``E += waveform·Ê``) ignored the FDTD
+    update coefficient ``dt/(ε·dV)`` and came out √ε_r / S_c too large.
+
+    The forward voltage of a matched-line launch relates to the impressed modal
+    current by ``V = I·Z₀`` for a directional (one-way) launch and ``V = I·Z₀/2``
+    for a bidirectional one (the current splits both ways). So to put
+    ``amplitude·waveform(t)`` volts into the forward wave the impressed current is
+    ``amplitude·waveform(t)/Z₀`` directional, twice that bidirectional. Because
+    the mode is normalised to a 1 V drive, ``amplitude`` is just that forward
+    voltage in volts.
+
+    Like a port it self-records ``times``/``voltages``/``currents`` (the injected
+    impressed current and the resulting plane voltage), so it can double as a
+    launch monitor.
+    """
+
+    def __init__(self, mode, waveform: Callable[[float], float], *,
+                 amplitude: float = 1.0, directional: bool = True) -> None:
+        z0 = getattr(mode, 'impedance', None)
+        if z0 is None or not z0 > 0:
+            raise ValueError(
+                "TEMMode.to_source needs the mode's characteristic impedance to "
+                "calibrate the launch amplitude; solve with compute_params=True.")
+        # Impressed modal current I(t) = amplitude·waveform(t)·scale/Z₀ that a
+        # matched line turns into amplitude·waveform(t) volts forward.
+        scale = 1.0 if directional else 2.0
+        current = lambda t: amplitude * scale * waveform(t) / z0
+        # Bypass LineSource.__init__ (its p0/p1/impedance validation): this is an
+        # ideal impressed *current* source (Z=None) on a modal footprint, not a
+        # straight line. Mirror the state _build_port / inject need.
+        Source.__init__(self, current)
+        self.mode = mode
+        self.base_waveform = waveform
+        self.amplitude = float(amplitude)
+        self.directional = bool(directional)
+        self._z0 = float(z0)
+        self.voltage = None
+        self.current = current
+        self.impedance = None       # ideal (soft) current source: no absorption
+        self.p0 = self.p1 = None    # not a straight-line port
+        self.times: list = []
+        self.voltages: list = []
+        self.currents: list = []
+        self._port: dict | None = None
+        self._v_prev = 0.0
+        self._h_lag_steps = 0.0
+
+    def _build_port(self, grid: FDTDGrid) -> dict:
+        freq = getattr(self.base_waveform, 'center_frequency', None)
+        kernel = self.mode.build_port_kernel(
+            grid, directional=self.directional, frequency=freq)
+        self._h_lag_steps = -kernel.get('h_tau', 0.0) / grid.dt
+        return kernel
+
+    def inject(self, grid: FDTDGrid, t: float) -> None:
+        # Ideal-current E-injection, V read-back and recording come from
+        # LineSource; the paired directional H sheet is added on top.
+        super().inject(grid, t)
+        self._inject_directional_h(grid)
 
 
 class SpicePort(LineSource):

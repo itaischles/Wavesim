@@ -19,7 +19,7 @@ import pytest
 import wavesim as ws
 from wavesim.constants import C0, ETA0
 from wavesim.mode_solver import numerical_velocity
-from wavesim.sources import PlaneWave, _PlaneLaunch, _FACE_CFG
+from wavesim.sources import PlaneWave, _FACE_CFG
 
 
 # ---------------------------------------------------------------------- #
@@ -222,7 +222,13 @@ def test_bidirectional_launch_is_symmetric():
 
 
 # ---------------------------------------------------------------------- #
-# TEMMode.to_source now shares the corrected pairing
+# TEMMode.to_source: an amplitude-calibrated modal launch
+#
+# The launch impresses the modal current a matched line turns into the
+# requested forward voltage, using the same calibrated current kernel a TEMPort
+# uses (build_port_kernel). It is NOT the uncalibrated _PlaneLaunch used by
+# PlaneWave: a straight ``E += waveform*Ehat`` field write ignored the FDTD
+# update coefficient and came out √ε_r / S_c too large.
 # ---------------------------------------------------------------------- #
 
 R_IN, R_OUT = 0.405e-3, 1.475e-3
@@ -237,27 +243,100 @@ def _coax(n=28, nz=64, eps_r=2.3):
     return grid, ds
 
 
-def test_to_source_eh_builds_the_corrected_directional_launch():
-    """'EH' now returns a directional _PlaneLaunch with a co-indexed, shifted H."""
+def test_to_source_eh_builds_a_calibrated_directional_launch():
+    """'EH' returns a directional _ModalLaunch backed by the port current kernel:
+    an H sheet one cell *behind* the E plane, driven by a lagged current."""
     from wavesim.mode_solver import solve_tem_modes
+    from wavesim.sources import _ModalLaunch
     grid, ds = _coax()
+    k = grid.axis_index('z', 20 * ds)
     mode = solve_tem_modes(grid, normal='z', position=20 * ds,
                            compute_params=True)[0]
     src = mode.to_source(ws.Sinusoid(frequency=20e9), fields='EH')
-    assert isinstance(src, _PlaneLaunch)
-    src._build(grid)
-    assert src._h_full and src._tau > 0.0            # H sheet + forward shift
-    k = grid.axis_index('z', 20 * ds)
-    for prof in src._h_full.values():                # co-indexed with E
-        assert prof[:, :, k].any() and not np.any(np.delete(prof, k, axis=2))
+    assert isinstance(src, _ModalLaunch) and src.directional
+    kernel = src._build_port(grid)
+    assert kernel['hedges'] and src._h_lag_steps >= 0.0     # H sheet + lag
+    for _comp, (_ii, _jj, kk, _c) in kernel['hedges'].items():
+        assert np.all(kk == k - 1)                          # one cell behind E
+    for _comp, (_ii, _jj, kk, _w, _c) in kernel['edges'].items():
+        assert np.all(kk == k)
 
 
-def test_to_source_e_only_has_no_h_sheet():
+def test_to_source_e_only_is_bidirectional_with_no_h_sheet():
     from wavesim.mode_solver import solve_tem_modes
+    from wavesim.sources import _ModalLaunch
     grid, ds = _coax()
     mode = solve_tem_modes(grid, normal='z', position=20 * ds,
                            compute_params=True)[0]
     src = mode.to_source(ws.GaussianPulse.for_fmax(20e9), fields='E')
-    src._build(grid)
-    assert src._h_full == {}
-    assert src._tau == 0.0
+    assert isinstance(src, _ModalLaunch) and not src.directional
+    kernel = src._build_port(grid)
+    assert kernel['hedges'] == {}
+    assert src._h_lag_steps == 0.0
+
+
+def test_to_source_needs_the_mode_impedance_to_calibrate():
+    """Without Z₀ (compute_params=False) the amplitude cannot be calibrated."""
+    from wavesim.mode_solver import solve_tem_modes
+    grid, ds = _coax()
+    mode = solve_tem_modes(grid, normal='z', position=20 * ds,
+                           compute_params=False)[0]
+    with pytest.raises(ValueError, match='impedance'):
+        mode.to_source(ws.Sinusoid(frequency=20e9))
+
+
+def test_to_source_rejects_an_h_only_launch():
+    from wavesim.mode_solver import solve_tem_modes
+    grid, ds = _coax()
+    mode = solve_tem_modes(grid, normal='z', position=20 * ds,
+                           compute_params=True)[0]
+    with pytest.raises(ValueError, match="must contain 'E'"):
+        mode.to_source(ws.Sinusoid(frequency=20e9), fields='H')
+
+
+def _launched_modal_amplitude(eps_r, directional, *, freq=20e9, nsteps=2200):
+    """Forward-wave amplitude of a 1 V ``to_source`` launch, read downstream with
+    the mode's own ε-weighted overlap (reads 1.0 for the pure mode)."""
+    from wavesim.mode_solver import solve_tem_modes, _NORMAL_CFG, _plane_to_grid
+    grid, ds = _coax(nz=160, eps_r=eps_r)
+    k_port, k_mon = 30, 110
+    mode = solve_tem_modes(grid, normal='z', position=k_port * ds,
+                           compute_params=True)[0]
+    cpml = ws.init_cpml(grid, d_pml=10, faces=('z0', 'z1'))
+    sim = ws.Simulation(grid, cpml=cpml)
+    sim.add_source(mode.to_source(ws.Sinusoid(frequency=freq),
+                                  fields='EH' if directional else 'E'))
+
+    eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+    gathered, S = {}, 0.0
+    for comp in _NORMAL_CFG['z']['E']:
+        a, b = np.nonzero(mode.E[comp])
+        if a.size == 0:
+            continue
+        ii, jj, _ = _plane_to_grid('z', k_mon, a, b)
+        km = np.full_like(ii, k_mon)
+        Ehat, epsr = mode.E[comp][a, b], eps_of[comp][ii, jj, km]
+        gathered[comp] = (ii, jj, km, epsr * Ehat)
+        S += float(np.sum(epsr * Ehat ** 2))
+
+    vstar = np.zeros(nsteps)
+    for s in range(nsteps):
+        g = sim.step()
+        vstar[s] = sum(float(np.sum((w / S) * getattr(g, c)[ii, jj, km]))
+                       for c, (ii, jj, km, w) in gathered.items())
+    idx = np.arange(nsteps - 600, nsteps)
+    ref = np.exp(-1j * 2 * np.pi * freq * idx * grid.dt)
+    return abs(2.0 * np.sum(vstar[idx] * ref) / len(idx))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize('directional', [True, False])
+def test_to_source_launches_one_volt_independent_of_fill(directional):
+    """The core fix: a 1 V mode launches ≈ 1 V, on vacuum and on an ε_r = 2.3
+    fill alike. The pre-fix additive write gave √ε_r / S_c (≈ 2.3 V on the coax,
+    1/S_c ≈ 1.7 V in vacuum) — a fill/Courant-dependent error, not ≈ 1."""
+    a_vac = _launched_modal_amplitude(1.0, directional)
+    a_fill = _launched_modal_amplitude(2.3, directional)
+    assert a_vac == pytest.approx(1.0, abs=0.08), f"vacuum launched {a_vac:.3f} V"
+    assert a_fill == pytest.approx(1.0, abs=0.08), f"fill launched {a_fill:.3f} V"
+    assert a_fill == pytest.approx(a_vac, rel=0.05)   # not scaling with √ε_r/S_c
