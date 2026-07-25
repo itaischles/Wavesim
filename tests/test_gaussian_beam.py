@@ -1,12 +1,17 @@
-"""Boundary-face plane-wave source (:class:`wavesim.sources.PlaneWave`).
+"""Boundary-face Gaussian-beam source (:class:`wavesim.sources.GaussianBeam`).
 
-A ``PlaneWave`` drives the full cross-section one PML-depth inside a boundary
-face with a uniform transverse field, biased into the domain by the paired
-``H = (n̂ × E)/η`` sheet. Two things are asserted here:
+A ``GaussianBeam`` drives a cross-section one PML-depth inside a boundary face,
+apodized by a transverse Gaussian ``exp(-r²/w₀²)`` and biased into the domain by
+the paired ``H = (n̂ × E)/η`` sheet. Because the sheet is driven with a flat
+phase front, the waist w₀ sits at the launch plane. Three things are asserted
+here:
 
 * **Convention** — the ordered transverse pair (a, b) per face is right-handed
   with the inward normal, so the magnetic field needs no per-face sign table but
   the same physical polarization takes a *different* ``angle`` on opposite faces.
+* **Aperture** — the sheet is a Gaussian, peaking on the beam axis and zeroed
+  over the transverse PML slabs, so a DC-containing waveform cannot accumulate
+  without bound in the corner where the sheet meets the absorber.
 * **Directionality** — the corrected co-indexed H sheet, driven a fraction of a
   step ahead (``τ = dt/2 + p·dn/(2·v_num)``), cancels the backward wave. On a
   clean 2D slab this measures ≈ -96 dB on both a low and a high face, versus
@@ -19,7 +24,11 @@ import pytest
 import wavesim as ws
 from wavesim.constants import C0, ETA0
 from wavesim.mode_solver import numerical_velocity
-from wavesim.sources import PlaneWave, _FACE_CFG
+from wavesim.sources import GaussianBeam, _FACE_CFG
+
+# A waist far larger than the transverse domain ⇒ a near-uniform sheet, i.e. a
+# (finite-aperture) plane wave — used where the test wants a clean TEM launch.
+WIDE = 1.0
 
 
 # ---------------------------------------------------------------------- #
@@ -41,25 +50,30 @@ def test_transverse_pair_is_right_handed_with_propagation(face):
     assert np.allclose(np.cross(a, b), n)
 
 
-def _driven(grid, pw):
-    """{component: scalar} of the (uniform) driven amplitude, E and H."""
-    pw._build(grid)
-    out = {}
-    for comp, prof in {**pw._e_full, **pw._h_full}.items():
-        nz = prof[np.nonzero(prof)]
-        out[comp] = float(nz.flat[0]) if nz.size else 0.0
-    return out
+def _driven_peak(grid, gb):
+    """{component: value} at the beam-axis (peak-apodization) cell, E and H.
+
+    The Gaussian apodization is common to every sheet, so the component *ratios*
+    at this cell are exactly the polarization projection, independent of the
+    apodization amplitude there.
+    """
+    gb._build(grid)
+    prof = {**gb._e_full, **gb._h_full}
+    e2 = sum(p * p for p in gb._e_full.values())     # total |E|² over the grid
+    idx = np.unravel_index(np.argmax(e2), e2.shape)
+    return {c: float(p[idx]) for c, p in prof.items()}
 
 
 def test_angle_zero_drives_the_first_transverse_axis():
     """angle=0 ⇒ E along â; the H partner is E_a/η on the b-axis component."""
     g = ws.create_grid(Nx=16, Ny=16, Nz=16, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
-    pw = PlaneWave('z0', angle=0.0, waveform=ws.Sinusoid(frequency=10e9), d_pml=4)
-    d = _driven(g, pw)
-    assert d['Ex'] == pytest.approx(1.0)          # a = x on z0
-    assert d.get('Ey', 0.0) == pytest.approx(0.0)
-    assert d['Hy'] == pytest.approx(1.0 / ETA0)    # H = (n̂ × E)/η on b = y
+    gb = GaussianBeam('z0', angle=0.0, waveform=ws.Sinusoid(frequency=10e9),
+                      waist=5e-3, d_pml=4)
+    d = _driven_peak(g, gb)
+    assert d['Ex'] > 0.0                              # a = x on z0, driven
+    assert d.get('Ey', 0.0) == pytest.approx(0.0)     # no b-component
+    assert d['Hy'] == pytest.approx(d['Ex'] / ETA0)   # H = (n̂ × E)/η on b = y
     assert d.get('Hx', 0.0) == pytest.approx(0.0)
 
 
@@ -68,16 +82,26 @@ def test_same_polarization_different_angle_on_opposite_faces():
     g = ws.create_grid(Nx=16, Ny=16, Nz=16, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
     wf = ws.Sinusoid(frequency=10e9)
-    on_x0 = _driven(g, PlaneWave('x0', angle=np.pi / 2, waveform=wf, d_pml=4))
-    on_x1 = _driven(g, PlaneWave('x1', angle=0.0, waveform=wf, d_pml=4))
+    on_x0 = _driven_peak(g, GaussianBeam('x0', angle=np.pi / 2, waveform=wf,
+                                         waist=5e-3, d_pml=4))
+    on_x1 = _driven_peak(g, GaussianBeam('x1', angle=0.0, waveform=wf,
+                                         waist=5e-3, d_pml=4))
     for d in (on_x0, on_x1):
-        assert d['Ez'] == pytest.approx(1.0)
+        assert d['Ez'] > 0.0                          # E along +z on both faces
         assert d.get('Ey', 0.0) == pytest.approx(0.0)
+    assert on_x0['Ez'] == pytest.approx(on_x1['Ez'])  # same peak apodization
 
 
 def test_unknown_face_is_rejected():
     with pytest.raises(ValueError, match='face must be one of'):
-        PlaneWave('z2', angle=0.0, waveform=ws.Sinusoid(frequency=10e9))
+        GaussianBeam('z2', angle=0.0, waveform=ws.Sinusoid(frequency=10e9),
+                     waist=5e-3)
+
+
+def test_nonpositive_waist_is_rejected():
+    with pytest.raises(ValueError, match='waist must be positive'):
+        GaussianBeam('z0', angle=0.0, waveform=ws.Sinusoid(frequency=10e9),
+                     waist=0.0)
 
 
 # ---------------------------------------------------------------------- #
@@ -87,23 +111,70 @@ def test_unknown_face_is_rejected():
 def test_e_sheet_lands_on_the_first_interior_cell():
     g = ws.create_grid(Nx=8, Ny=8, Nz=64, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
-    low = PlaneWave('z0', angle=0.0, waveform=ws.Sinusoid(frequency=10e9), d_pml=10)
-    high = PlaneWave('z1', angle=0.0, waveform=ws.Sinusoid(frequency=10e9), d_pml=10)
+    low = GaussianBeam('z0', angle=0.0, waveform=ws.Sinusoid(frequency=10e9),
+                       waist=WIDE, d_pml=10)
+    high = GaussianBeam('z1', angle=0.0, waveform=ws.Sinusoid(frequency=10e9),
+                        waist=WIDE, d_pml=10)
     assert low._plane_index(g) == 10
     assert high._plane_index(g) == 64 - 1 - 10
 
 
 def test_h_sheet_is_co_indexed_with_e():
-    """Unlike a TEMPort (H one cell behind), the plane wave keeps H on E's slice."""
+    """Unlike a TEMPort (H one cell behind), the beam keeps H on E's slice."""
     g = ws.create_grid(Nx=8, Ny=8, Nz=64, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
-    pw = PlaneWave('z0', angle=0.3, waveform=ws.Sinusoid(frequency=10e9), d_pml=10)
-    pw._build(g)
-    k = pw._plane_index(g)
-    for prof in pw._e_full.values():
+    gb = GaussianBeam('z0', angle=0.3, waveform=ws.Sinusoid(frequency=10e9),
+                      waist=WIDE, d_pml=10)
+    gb._build(g)
+    k = gb._plane_index(g)
+    for prof in gb._e_full.values():
         assert prof[:, :, k].any() and not np.any(np.delete(prof, k, axis=2))
-    for prof in pw._h_full.values():
+    for prof in gb._h_full.values():
         assert prof[:, :, k].any() and not np.any(np.delete(prof, k, axis=2))
+
+
+def test_gaussian_aperture_is_zeroed_over_the_pml_and_peaks_on_axis():
+    """The sheet is a Gaussian: zero over the transverse PML slabs, unity on the
+    beam axis, and 1/e a waist off-axis — the physical apodization that turns the
+    flat-phase launch into a beam and keeps DC out of the PML corner."""
+    d_pml, waist = 10, 8e-3           # waist = 8 cells at dx = 1 mm
+    g = ws.create_grid(Nx=49, Ny=49, Nz=32, dx=1e-3, dy=1e-3, dz=1e-3)
+    ws.set_vacuum(g)
+    gb = GaussianBeam('z0', angle=0.0, waveform=ws.Sinusoid(frequency=10e9),
+                      waist=waist, d_pml=d_pml)
+    gb._build(g)
+    k = gb._plane_index(g)
+    sheet = gb._e_full['Ex'][:, :, k]
+    # the outer d_pml cells (the transverse PML slabs) are exactly zero
+    assert not sheet[:d_pml, :].any() and not sheet[-d_pml:, :].any()
+    assert not sheet[:, :d_pml].any() and not sheet[:, -d_pml:].any()
+    # unity on the beam axis (odd N ⇒ centre lands on a node)
+    cx, cy = 49 // 2, 49 // 2
+    assert sheet[cx, cy] == pytest.approx(1.0)
+    # 1/e a waist (8 cells) off-axis along each transverse direction
+    assert sheet[cx + 8, cy] == pytest.approx(np.exp(-1.0), rel=1e-6)
+    assert sheet[cx, cy + 8] == pytest.approx(np.exp(-1.0), rel=1e-6)
+
+
+def test_dc_pulse_does_not_run_away_in_the_pml_corner():
+    """A unipolar (DC-containing) pulse into all-six PML stays bounded: the
+    launch-sheet/transverse-PML corner cell is outside the apodized aperture, so
+    it never accumulates the DC bias that previously grew without bound and
+    swamped the energy monitor (findings.md Failure B)."""
+    g = ws.create_grid(Nx=40, Ny=40, Nz=80, dx=1.5e-3, dy=1.5e-3, dz=1.5e-3)
+    ws.set_vacuum(g)
+    cpml = ws.init_cpml(g, d_pml=10)
+    wf = ws.GaussianPulse.for_fmax(10e9)              # unipolar ⇒ has DC
+    sim = ws.Simulation(g, cpml=cpml)
+    sim.add_source(GaussianBeam('z0', 0.0, wf, waist=20e-3, d_pml=10))
+    corner_peak = 0.0
+    for _ in range(400):
+        sim.step()
+        corner_peak = max(corner_peak, abs(float(g.Ex[39, 1, 10])))
+    energy = 0.5 * float(np.sum(g.eps_x * g.Ex**2 + g.eps_y * g.Ey**2 +
+                                g.eps_z * g.Ez**2))
+    assert corner_peak < 1.0        # the corner cell is masked out of the sheet
+    assert energy < 1e4             # no unbounded growth (the bug gave ~1e8)
 
 
 @pytest.mark.parametrize('face,sign', [('z0', +1.0), ('z1', -1.0)])
@@ -112,23 +183,24 @@ def test_time_shift_matches_the_launch_formula(face, sign):
     g = ws.create_grid(Nx=8, Ny=8, Nz=64, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
     freq = 15e9
-    pw = PlaneWave(face, angle=0.0, waveform=ws.Sinusoid(frequency=freq), d_pml=10)
-    pw._build(g)
-    k = pw._plane_index(g)
+    gb = GaussianBeam(face, angle=0.0, waveform=ws.Sinusoid(frequency=freq),
+                      waist=WIDE, d_pml=10)
+    gb._build(g)
+    k = gb._plane_index(g)
     dn = float(g.dzp[k])
     v_num = numerical_velocity(C0, dn, g.dt, freq)
-    assert pw._tau == pytest.approx(g.dt / 2.0 + sign * dn / (2.0 * v_num))
-    assert pw.prop_sign == sign
+    assert gb._tau == pytest.approx(g.dt / 2.0 + sign * dn / (2.0 * v_num))
+    assert gb.prop_sign == sign
 
 
-def test_bidirectional_plane_wave_has_no_h_sheet():
+def test_bidirectional_beam_has_no_h_sheet():
     g = ws.create_grid(Nx=8, Ny=8, Nz=64, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
-    pw = PlaneWave('z0', angle=0.0, waveform=ws.Sinusoid(frequency=10e9),
-                   d_pml=10, directional=False)
-    pw._build(g)
-    assert pw._h_full == {}
-    assert pw._tau == 0.0
+    gb = GaussianBeam('z0', angle=0.0, waveform=ws.Sinusoid(frequency=10e9),
+                      waist=WIDE, d_pml=10, directional=False)
+    gb._build(g)
+    assert gb._h_full == {}
+    assert gb._tau == 0.0
 
 
 # ---------------------------------------------------------------------- #
@@ -141,23 +213,25 @@ def _backward_rejection(face, *, angle, comp, freq=15e9, N=200, Ny=32,
 
     The source sits mid-domain (placed via ``d_pml``) so both sides are clean
     vacuum; the forward/backward probes are 50 cells either way, sampled after
-    the wave has filled the window. In-plane (TE_z) polarization only — the
-    out-of-plane component is degenerate on an Nz=1 slice.
+    the wave has filled the window. A wide waist keeps the launch near-uniform
+    across y so the null measures directionality, not diffraction. In-plane
+    (TE_z) polarization only — the out-of-plane component is degenerate on an
+    Nz=1 slice.
     """
     g = ws.create_grid(Nx=N, Ny=Ny, Nz=1, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
     kmid = N // 2
     place = kmid if face == 'x0' else N - 1 - kmid
-    pw = PlaneWave(face, angle=angle, waveform=ws.Sinusoid(frequency=freq),
-                   d_pml=place, directional=True)
+    gb = GaussianBeam(face, angle=angle, waveform=ws.Sinusoid(frequency=freq),
+                      waist=WIDE, d_pml=place, directional=True)
     cpml = ws.init_cpml(g, d_pml=d_pml, faces=('x0', 'x1'))
-    sim = ws.Simulation(g, cpml=cpml, sources=[pw], pec_faces=('y0', 'y1'))
+    sim = ws.Simulation(g, cpml=cpml, sources=[gb], pec_faces=('y0', 'y1'))
     if flip_sign:
-        pw.prop_sign = -pw.prop_sign
-    pw._build(g)
+        gb.prop_sign = -gb.prop_sign
+    gb._build(g)
     if naive:
-        pw._tau = 0.0
-    k0 = pw._plane_index(g)
+        gb._tau = 0.0
+    k0 = gb._plane_index(g)
     jc = Ny // 2
     # Forward is +x on a low face, −x on a high face.
     if face == 'x0':
@@ -205,10 +279,10 @@ def test_bidirectional_launch_is_symmetric():
     g = ws.create_grid(Nx=200, Ny=32, Nz=1, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
     freq, nt = 15e9, 1200
-    pw = PlaneWave('x0', angle=0.0, waveform=ws.Sinusoid(frequency=freq),
-                   d_pml=100, directional=False)
+    gb = GaussianBeam('x0', angle=0.0, waveform=ws.Sinusoid(frequency=freq),
+                      waist=WIDE, d_pml=100, directional=False)
     cpml = ws.init_cpml(g, d_pml=12, faces=('x0', 'x1'))
-    sim = ws.Simulation(g, cpml=cpml, sources=[pw], pec_faces=('y0', 'y1'))
+    sim = ws.Simulation(g, cpml=cpml, sources=[gb], pec_faces=('y0', 'y1'))
     fwd = np.zeros(nt)
     bwd = np.zeros(nt)
     for s in range(nt):
@@ -227,7 +301,7 @@ def test_bidirectional_launch_is_symmetric():
 # The launch impresses the modal current a matched line turns into the
 # requested forward voltage, using the same calibrated current kernel a TEMPort
 # uses (build_port_kernel). It is NOT the uncalibrated _PlaneLaunch used by
-# PlaneWave: a straight ``E += waveform*Ehat`` field write ignored the FDTD
+# GaussianBeam: a straight ``E += waveform*Ehat`` field write ignored the FDTD
 # update coefficient and came out √ε_r / S_c too large.
 # ---------------------------------------------------------------------- #
 

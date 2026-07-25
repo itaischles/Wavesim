@@ -75,8 +75,10 @@ def test_plane_wave_carries_power_in_propagation_direction():
     """A +x directional launch gives Sx > 0 downstream and Sy ≈ Sz ≈ 0."""
     g = ws.create_grid(Nx=160, Ny=24, Nz=1, dx=1e-3, dy=1e-3, dz=1e-3)
     ws.set_vacuum(g)
-    pw = ws.PlaneWave('x0', angle=0.0, waveform=ws.Sinusoid(frequency=15e9),
-                      d_pml=12, directional=True)
+    # A waist far wider than the 24 mm transverse span ⇒ a near-uniform (plane-
+    # wave) sheet, so the launch stays a clean TEM mode with no transverse power.
+    pw = ws.GaussianBeam('x0', angle=0.0, waveform=ws.Sinusoid(frequency=15e9),
+                         waist=10.0, d_pml=12, directional=True)
     cpml = ws.init_cpml(g, d_pml=12, faces=('x0', 'x1'))
     mon = ws.PoyntingMonitor(at_z=0.0, every_N_steps=10, normal='z')
     sim = ws.Simulation(g, cpml=cpml, sources=[pw], pec_faces=('y0', 'y1'),

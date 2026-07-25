@@ -397,9 +397,49 @@ def _plane_slice(arr: np.ndarray, normal: str, k: int) -> np.ndarray:
     return arr[k, :, :]
 
 
+# The two array axes of a ``_plane_slice`` perpendicular to each normal, in the
+# slice's own order (axis 0, axis 1) — see :func:`_plane_slice`.
+_TRANSVERSE_AXES = {'x': ('y', 'z'), 'y': ('x', 'z'), 'z': ('x', 'y')}
+
+
+def _cell_centers(nodes: np.ndarray) -> np.ndarray:
+    """Cell-centre coordinates (length N) from the N+1 node coordinates — the
+    positions the cell-centred field/material slices actually sit on."""
+    return 0.5 * (nodes[:-1] + nodes[1:])
+
+
+def _gaussian_aperture(coord0: np.ndarray, coord1: np.ndarray,
+                       d_pml: int, waist: float) -> np.ndarray:
+    """2D transverse Gaussian apodization, hard-zeroed over the PML cells.
+
+    Returns ``exp(-r²/w₀²)`` on the transverse plane, centred on the plane and
+    then set to zero over the ``d_pml`` outermost cells at each transverse edge.
+    ``coord0``/``coord1`` are the physical cell-centre coordinates (metres) of the
+    plane's two array axes and ``waist`` is w₀, the 1/e field radius.
+
+    A flat-phase sheet apodized this way launches a Gaussian beam whose waist w₀
+    sits at the launch plane. Zeroing the PML cells also stops a DC-containing
+    waveform from accumulating without bound in the corner where the sheet meets
+    the transverse absorber — choose ``waist`` small enough that the beam is
+    already negligible there and the hard cut adds no diffraction of its own.
+    """
+    mid0 = 0.5 * (coord0[0] + coord0[-1])
+    mid1 = 0.5 * (coord1[0] + coord1[-1])
+    r2 = ((coord0 - mid0) ** 2)[:, None] + ((coord1 - mid1) ** 2)[None, :]
+    w = np.exp(-r2 / (waist * waist))
+    for axis, coord in enumerate((coord0, coord1)):
+        n = coord.size
+        if n - 2 * d_pml <= 0:             # no interior — leave the Gaussian
+            continue
+        keep = np.zeros(n, dtype=bool)
+        keep[d_pml:n - d_pml] = True
+        w = w * (keep[:, None] if axis == 0 else keep[None, :])
+    return w
+
+
 class _PlaneLaunch(Source):
     """Full-slice E (and, when directional, paired H) launch with the corrected
-    co-indexed H time shift. The engine behind :class:`PlaneWave`. It writes the
+    co-indexed H time shift. The engine behind :class:`GaussianBeam`. It writes the
     profiles straight into the field arrays each step, so — unlike the calibrated
     current kernel a :class:`TEMPort` / :meth:`TEMMode.to_source` uses — the
     launched amplitude is *not* calibrated (it scales as ≈ 1/S_n × the waveform).
@@ -497,16 +537,29 @@ class _PlaneLaunch(Source):
                 getattr(grid, comp)[...] += ah * prof
 
 
-class PlaneWave(_PlaneLaunch):
-    """A directional plane wave launched from one boundary face.
+class GaussianBeam(_PlaneLaunch):
+    """A directional Gaussian beam launched from one boundary face.
 
-    Drives the full cross-section one PML-depth inside a boundary face with a
-    uniform transverse field, biased into the domain: an E sheet plus the paired
-    ``H = (n̂ × E)/η`` sheet (:class:`_PlaneLaunch`). The waveform carries the
-    amplitude — there is deliberately no ``amplitude`` parameter, as for every
-    other source. The launched field is *not* amplitude-calibrated (it scales as
-    ≈ ``1/S_n`` × the waveform, ``S_n`` the Courant number along the normal); use
-    a monitor to normalise if you need an absolute level.
+    Drives a cross-section one PML-depth inside a boundary face, biased into the
+    domain: an E sheet plus the paired ``H = (n̂ × E)/η`` sheet
+    (:class:`_PlaneLaunch`). The transverse amplitude is a Gaussian
+    ``exp(-r²/w₀²)`` centred on the face; because the sheet is driven with a flat
+    phase front, this launches a Gaussian beam whose **waist w₀ sits at the launch
+    plane** and then diverges downstream by the usual Gaussian-beam laws. Taking
+    ``waist`` large relative to the aperture recovers a (finite-aperture) plane
+    wave. The waveform carries the amplitude — there is deliberately no
+    ``amplitude`` parameter, as for every other source. The launched field is
+    *not* amplitude-calibrated (its peak scales as ≈ ``1/S_n`` × the waveform,
+    ``S_n`` the Courant number along the normal); use a monitor to normalise if
+    you need an absolute level.
+
+    The sheet is always zeroed over the transverse PML slabs. This matters for a
+    DC-containing waveform (e.g. a unipolar :class:`GaussianPulse`): a sheet that
+    overlapped the transverse absorber would inject a DC bias into the corner
+    cells there, which neither propagate nor absorb DC, so the field would grow
+    without bound and swamp the energy monitor. Keep ``waist`` comfortably smaller
+    than the interior half-width so the beam is already negligible at that edge
+    and the hard cut adds no diffraction of its own.
 
     Parameters
     ----------
@@ -526,33 +579,41 @@ class PlaneWave(_PlaneLaunch):
         waveform advertising a ``center_frequency`` tunes the H time shift to the
         numerical phase velocity at that frequency; otherwise the continuum
         velocity is used.
+    waist : float
+        Beam waist w₀ in metres — the 1/e radius of the transverse E amplitude
+        (1/e² in intensity), located at the launch plane. Centred on the face.
     d_pml : int
         PML thickness in cells (default 10, matching :func:`init_cpml`). The E
         sheet is placed on the first interior cell — index ``d_pml`` on a low
         face, ``N-1-d_pml`` on a high face — so the backward lobe is launched
-        straight into the absorber.
+        straight into the absorber, and the same depth is zeroed off every
+        transverse edge.
     directional : bool
         Pair the E sheet with an H sheet for a one-way launch (default True).
         ``False`` gives a bare E sheet, which radiates symmetrically both ways.
 
     Notes
     -----
-    There are no periodic/Bloch boundaries, so a truly infinite plane wave is not
-    reachable: expect edge effects where the sheet meets the transverse PMLs.
+    There are no periodic/Bloch boundaries. A beam whose waist approaches the
+    transverse aperture will diffract off the finite, PML-masked edge; keep the
+    waist well inside it.
     """
 
     def __init__(self, face: str, angle: float,
-                 waveform: Callable[[float], float], *,
+                 waveform: Callable[[float], float], waist: float, *,
                  d_pml: int = 10, directional: bool = True) -> None:
         if face not in _FACE_CFG:
             raise ValueError(
                 f"face must be one of {sorted(_FACE_CFG)}, got {face!r}.")
+        if not waist > 0:
+            raise ValueError(f"waist must be positive, got {waist!r}.")
         cfg = _FACE_CFG[face]
         super().__init__(waveform, normal=cfg['normal'], directional=directional,
                          v_medium=C0,
                          prop_sign=(1.0 if cfg['side'] == 'low' else -1.0))
         self.face = face
         self.angle = float(angle)
+        self.waist = float(waist)
         self.d_pml = int(d_pml)
 
     def _plane_index(self, grid: FDTDGrid) -> int:
@@ -578,10 +639,16 @@ class PlaneWave(_PlaneLaunch):
         eta_b = ETA0 * np.sqrt(mu_b / np.where(eps_a > 0, eps_a, 1.0))
 
         ca, sa = np.cos(self.angle), np.sin(self.angle)
-        ones = np.ones_like(eps_a)
+        # Transverse Gaussian apodization, zeroed over the PML slabs. Built on the
+        # plane's own two array axes (see _TRANSVERSE_AXES / _plane_slice) so it
+        # lines up with the eps/mu slices above.
+        ax0, ax1 = _TRANSVERSE_AXES[self.normal]
+        c0, c1 = (_cell_centers(grid._coords(ax0)),
+                  _cell_centers(grid._coords(ax1)))
+        w = _gaussian_aperture(c0, c1, self.d_pml, self.waist)
         # E = cos·â + sin·b̂;  H = (n̂ × E)/η = (cos·b̂ - sin·â)/η
-        E = {'E' + a_ax: ca * ones, 'E' + b_ax: sa * ones}
-        H = {'H' + a_ax: -sa / eta_a, 'H' + b_ax: ca / eta_b}
+        E = {'E' + a_ax: ca * w, 'E' + b_ax: sa * w}
+        H = {'H' + a_ax: -sa * w / eta_a, 'H' + b_ax: ca * w / eta_b}
         return E, H
 
 
