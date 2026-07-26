@@ -140,6 +140,8 @@ class Simulation:
         self.backend = backend
         self._update_H, self._update_E, self._update_H_pml, self._update_E_pml = \
             _load_backend(backend)
+        for mon in self.monitors:
+            self._autofill_energy_region(mon)
 
     # ------------------------------------------------------------------ #
     # Building up the simulation
@@ -155,8 +157,28 @@ class Simulation:
             raise TypeError(
                 f"Unknown monitor type {type(monitor).__name__}. "
                 f"Expected one of {[t.__name__ for t in _RECORDERS]}.")
+        self._autofill_energy_region(monitor)
         self.monitors.append(monitor)
         return monitor
+
+    def _autofill_energy_region(self, monitor) -> None:
+        """Fill an ``'interior'`` EnergyMonitor's PML geometry from this run's CPML.
+
+        The monitor needs the PML thickness and absorbing faces to know which
+        outer cells to drop, but they live on the ``CPMLArrays``, not the grid.
+        Copy them from ``self.cpml`` unless the user set them explicitly. With no
+        CPML, ``'interior'`` trims nothing (``d_pml=0``) and equals ``'full'``.
+        """
+        if not isinstance(monitor, EnergyMonitor) or monitor.region != 'interior':
+            return
+        if self.cpml is not None:
+            if monitor.d_pml is None:
+                monitor.d_pml = self.cpml.d_pml
+            if monitor.faces is None:
+                monitor.faces = self.cpml.faces
+        else:
+            if monitor.d_pml is None:
+                monitor.d_pml = 0
 
     # ------------------------------------------------------------------ #
     # Running

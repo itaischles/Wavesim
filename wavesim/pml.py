@@ -127,7 +127,9 @@ class CPMLArrays:
     dxd_sH: np.ndarray; dyd_sH: np.ndarray; dzd_sH: np.ndarray   # H-side (dual)
     dxp_sE: np.ndarray; dyp_sE: np.ndarray; dzp_sE: np.ndarray   # E-side (primary)
 
-    d_pml: int             # PML thickness in cells
+    d_pml: int                     # PML thickness in cells
+    # which domain faces carry absorbing CPML (see module-level ALL_FACES).
+    faces: tuple = ('x0', 'x1', 'y0', 'y1', 'z0', 'z1')
 
 
 # ---------------------------------------------------------------------- #
@@ -393,7 +395,7 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
         # Sampled per-cell spacing divisors
         dxd_sH=dxd_sH, dyd_sH=dyd_sH, dzd_sH=dzd_sH,
         dxp_sE=dxp_sE, dyp_sE=dyp_sE, dzp_sE=dzp_sE,
-        d_pml=d_pml,
+        d_pml=d_pml, faces=tuple(faces),
     )
 
 

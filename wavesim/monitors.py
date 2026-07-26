@@ -382,6 +382,9 @@ def record_poynting(monitor: PoyntingMonitor, grid: FDTDGrid) -> PoyntingMonitor
 # EnergyMonitor — total EM energy in the domain
 # ======================================================================= #
 
+_ALL_FACES = ('x0', 'x1', 'y0', 'y1', 'z0', 'z1')
+
+
 @dataclass
 class EnergyMonitor:
     """
@@ -392,24 +395,72 @@ class EnergyMonitor:
     Each cell is weighted by its own local volume (``grid.cell_volume()``), so
     the sum is correct on a non-uniform (rectilinear) grid. On a uniform grid
     ``dV_cell`` is the constant ``dx*dy*dz`` and this reduces to the old result.
+
+    ``region`` selects which cells are summed:
+        - ``'full'``      (default) — the whole grid, including the PML shell.
+        - ``'interior'``  — only the physical domain, dropping the outermost
+          ``d_pml`` cells on every face that carries absorbing CPML. Energy
+          leaking into the PML (where it is absorbed, not conserved) is then
+          excluded, so a stable run's interior energy should decay to ~0.
+
+    For ``region='interior'`` the PML geometry (``d_pml`` and ``faces``) is
+    filled in automatically from the run's ``CPMLArrays`` when the monitor is
+    registered on a :class:`~wavesim.simulation.Simulation`. Set them explicitly
+    to override, or when driving the recorder outside a ``Simulation``. If a run
+    has no CPML, ``'interior'`` trims nothing and equals ``'full'``.
     """
+    region: str = 'full'            # 'full' (incl. PML) or 'interior' (excl. PML)
+    d_pml:  int = None              # PML thickness in cells; None → auto-fill
+    faces:  tuple = None            # faces carrying PML; None → auto-fill
     times:  list = field(default_factory=list)
     values: list = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.region not in ('full', 'interior'):
+            raise ValueError(
+                f"EnergyMonitor.region must be 'full' or 'interior', "
+                f"got {self.region!r}.")
+
+
+def _interior_slices(grid: FDTDGrid, d_pml: int, faces: tuple) -> tuple:
+    """Slices selecting the physical domain, trimming ``d_pml`` PML cells per face.
+
+    A face's outer shell is dropped only when its face key is in ``faces`` *and*
+    the axis is thick enough to actually host a PML slab (``N > 2*d_pml``); a
+    thin axis (e.g. ``Nz=1`` in a 2D slice) has no PML and is never trimmed,
+    matching :func:`wavesim.pml.init_cpml`, which makes such an axis' PML inert.
+    """
+    def axis(N, lo_face, hi_face):
+        if d_pml <= 0 or N <= 2 * d_pml:
+            return slice(0, N)
+        lo = d_pml if lo_face in faces else 0
+        hi = d_pml if hi_face in faces else 0
+        return slice(lo, N - hi)
+
+    return (axis(grid.Nx, 'x0', 'x1'),
+            axis(grid.Ny, 'y0', 'y1'),
+            axis(grid.Nz, 'z0', 'z1'))
 
 
 def record_energy(monitor: EnergyMonitor, grid: FDTDGrid) -> EnergyMonitor:
     """Compute total field energy and append to time series."""
     dV = grid.cell_volume()                       # per-cell (Nx, Ny, Nz)
 
+    if monitor.region == 'interior':
+        sl = _interior_slices(grid, monitor.d_pml or 0,
+                              monitor.faces if monitor.faces is not None else _ALL_FACES)
+    else:
+        sl = (slice(None), slice(None), slice(None))
+
     E_energy = 0.5 * EPS0 * (
-        np.sum(dV * grid.eps_x * grid.Ex**2) +
-        np.sum(dV * grid.eps_y * grid.Ey**2) +
-        np.sum(dV * grid.eps_z * grid.Ez**2)
+        np.sum((dV * grid.eps_x * grid.Ex**2)[sl]) +
+        np.sum((dV * grid.eps_y * grid.Ey**2)[sl]) +
+        np.sum((dV * grid.eps_z * grid.Ez**2)[sl])
     )
     H_energy = 0.5 * MU0 * (
-        np.sum(dV * grid.mu_x * grid.Hx**2) +
-        np.sum(dV * grid.mu_y * grid.Hy**2) +
-        np.sum(dV * grid.mu_z * grid.Hz**2)
+        np.sum((dV * grid.mu_x * grid.Hx**2)[sl]) +
+        np.sum((dV * grid.mu_y * grid.Hy**2)[sl]) +
+        np.sum((dV * grid.mu_z * grid.Hz**2)[sl])
     )
 
     monitor.times.append(grid.time_step * _get_dt(grid))
