@@ -916,11 +916,25 @@ class TEMPort(LineSource):
     launching / terminating the mode. See
     :meth:`~wavesim.mode_solver.TEMMode.build_port_kernel`.
 
-    The port presents ``Z₀`` to the field: the internal series resistance is
-    pre-compensated to ``Z₀ − κ/2`` (κ = modal self-coupling), so a matched line
-    sees a matched source. If ``κ/2`` exceeds ``Z₀`` (a low-impedance mode on a
-    coarse transverse grid) the semi-implicit scheme cannot be stabilised — refine
-    the transverse grid to lower κ.
+    The port presents its internal series resistance ``z_int = Z₀`` to the field
+    in both roles — as a *terminator* (a wave arriving sees ``z_int``) and as a
+    *source* (its own launched wave divides by ``z_int``) — so a matched line sees
+    a matched source with no κ correction. The semi-implicit denominator carries a
+    ``κ/2`` stability term, but it self-cancels for smooth excitation and does not
+    appear in the presented impedance; a spectral mid-line reflection sweep puts
+    the matched (``Γ = −1/3``) value at ``z_int = Z₀`` to within a few percent.
+    (An earlier revision pre-compensated to ``Z₀ − κ/2`` on the theory that an
+    arriving wave sees ``z_int + κ/2``; a clean spectral measurement did not bear
+    that out and the compensation *under*-matched the terminator by ~κ/2.)
+
+    ``voltage`` is the launched **forward-wave** voltage, not the raw Thévenin
+    EMF: ``V_fwd = Vs·Z_load/(z_int + Z_load)`` where ``Z_load`` is what the source
+    drives into — the one-way line ``Z₀`` (directional) or the two halves in
+    parallel ``Z₀/2`` (bidirectional). The port drives its EMF at the reciprocal
+    ``(z_int + Z_load)/Z_load`` so ``voltage(t)`` lands on the line — with
+    ``z_int = Z₀`` the clean, geometry-independent factors 2 (directional) and 3
+    (bidirectional) — matching
+    :meth:`~wavesim.mode_solver.TEMMode.to_source`'s ``amplitude`` convention.
 
     With ``directional=True`` (default) the port also drives a paired H sheet,
     biasing energy into +normal. That sheet sits one cell *behind* the E plane and
@@ -942,10 +956,12 @@ class TEMPort(LineSource):
         A mode from :func:`~wavesim.mode_solver.solve_tem_modes` (solve with
         ``compute_params=True`` for its ``impedance``/Z₀).
     voltage, current : Callable[[float], float], optional
-        Thévenin ``Vs(t)`` or Norton ``Is(t)`` drive (mutually exclusive); omit
-        both for a passive matched termination.
+        Drive (mutually exclusive); omit both for a passive matched termination.
+        ``voltage`` is the launched forward-wave voltage (see above), amplitude-
+        calibrated like ``to_source``. ``current`` is the raw Norton ``Is(t)``.
     impedance : float, optional
-        Series/source impedance in ohms; defaults to the mode's ``Z₀``.
+        Series/source impedance in ohms; defaults to the mode's ``Z₀``. Present
+        this = the line's Z₀ for a matched port (the default already does).
     directional : bool
         Also drive the H sheet for a one-way launch (default True).
     """
@@ -963,6 +979,11 @@ class TEMPort(LineSource):
             raise ValueError(
                 "TEMPort needs a positive impedance: the mode has no Z₀ (solve "
                 "with compute_params=True) or pass impedance= explicitly.")
+        # ``voltage`` is the launched forward-wave voltage, not the raw Thévenin
+        # EMF; the EMF is scaled up by the launch-divider reciprocal (2 directional
+        # / 3 bidirectional) so it lands ``voltage`` volts forward. The scaling is
+        # applied in _build_port alongside the impedance; until then ``waveform``
+        # holds the raw drive.
         drive = voltage if voltage is not None else current
         Source.__init__(self, drive if drive is not None else (lambda t: 0.0))
         self.mode = mode
@@ -970,7 +991,7 @@ class TEMPort(LineSource):
         self.current = current
         self._z0 = float(z0)
         self.directional = bool(directional)
-        self.impedance = None       # finalised (pre-compensated) in _build_port
+        self.impedance = None       # finalised in _build_port (= Z₀)
         self.p0 = self.p1 = None    # not a straight-line port
         self.times: list = []
         self.voltages: list = []
@@ -987,14 +1008,26 @@ class TEMPort(LineSource):
         kernel = self.mode.build_port_kernel(
             grid, directional=self.directional, frequency=freq)
         self._h_lag_steps = -kernel.get('h_tau', 0.0) / grid.dt
-        half_kappa = 0.5 * kernel['kappa']
-        z_int = self._z0 - half_kappa
-        if not z_int > 0:
-            raise ValueError(
-                f"TEM port κ/2 = {half_kappa:.4g} Ω exceeds the target Z₀ = "
-                f"{self._z0:.4g} Ω; the semi-implicit lumped scheme is unstable "
-                f"there — refine the transverse grid to lower κ.")
-        self.impedance = z_int
+        # The port presents its internal series resistance z_int = Z₀ to the field
+        # in BOTH roles — as a terminator (a wave arriving sees z_int) and as a
+        # source (its own launched wave divides by z_int). The semi-implicit
+        # denominator's κ/2 is an internal stability term that self-cancels for
+        # smooth excitation and does NOT appear in the presented impedance: a
+        # spectral mid-line reflection sweep puts the matched (Γ = −1/3) value at
+        # z_int = Z₀ to within a few %. So no κ/2 pre-compensation, and with
+        # z_int = Z₀ > 0 the scheme is stable on any grid.
+        self.impedance = self._z0
+        z_int = self.impedance
+        # Forward-volts calibration: the port's own launched wave divides by z_int,
+        #   V_fwd = Vs·Z_load/(z_int + Z_load),
+        # with Z_load = Z₀ (directional, one-way line) or Z₀/2 (bidirectional, the
+        # two halves in parallel). Drive the EMF at the reciprocal so ``voltage``
+        # lands forward; with z_int = Z₀ these are the clean factors 2 and 3.
+        if self.voltage is not None:
+            z_load = self._z0 if self.directional else 0.5 * self._z0
+            scale = (z_int + z_load) / z_load
+            raw = self.voltage
+            self.waveform = lambda t, _r=raw, _s=scale: _s * _r(t)
         return kernel
 
     def inject(self, grid: FDTDGrid, t: float) -> None:
