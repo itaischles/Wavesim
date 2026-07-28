@@ -226,6 +226,98 @@ class TEMMode:
         return _ModalLaunch(self, waveform, amplitude=amplitude,
                             directional=('H' in fields))
 
+    def _staggered_port_fields(self, grid: FDTDGrid):
+        """Discrete (Yee-staggered) transverse mode fields for the port kernel.
+
+        Returns ``(E, H)``, each a ``{component: full-plane 2D array}`` mapping,
+        with ``ê`` built as a **forward difference of φ landed on the Yee edges**:
+        ``Ex[i,j] = −(φ[i+1,j] − φ[i,j]) / dxd[i]`` (dual/centre-to-centre width),
+        which is exactly where :func:`wavesim.update.update_E` reads Ex. This is
+        the discretisation that makes ``ê`` a null vector of the grid's transverse
+        divergence — the collocated ``np.gradient`` field in ``self.E`` is not, and
+        injecting it charges the domain. ``Ĥ = (n̂ × ê)/η`` is rebuilt from the same
+        staggered ``ê`` so the directional E/H pairing stays consistent.
+        """
+        cfg = _NORMAL_CFG[self.normal]
+        phi = self.phi
+        Na, Nb = phi.shape
+        dual = {'x': grid.dxd, 'y': grid.dyd, 'z': grid.dzd}
+        da = dual[cfg['axes'][0]]
+        db = dual[cfg['axes'][1]]
+        Ea = np.zeros_like(phi)
+        Eb = np.zeros_like(phi)
+        Ea[:-1, :] = -(phi[1:, :] - phi[:-1, :]) / da[:Na - 1][:, None]
+        Eb[:, :-1] = -(phi[:, 1:] - phi[:, :-1]) / db[:Nb - 1][None, :]
+        pec = self.pec
+        Ea[pec] = 0.0
+        Eb[pec] = 0.0
+
+        # η = η₀·√(μ_r/ε_r) on the plane, exactly as :func:`_build_mode`.
+        k = self.slice_index
+        eps_a = _slice(getattr(grid, cfg['eps'][0]), self.normal, k)
+        mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
+        eta = ETA0 * np.sqrt(mu_a / np.where(eps_a > 0, eps_a, 1.0))
+        sa, sb = cfg['h_sign']
+        Ha = sa * Eb / eta
+        Hb = sb * Ea / eta
+        Ha[pec] = 0.0
+        Hb[pec] = 0.0
+
+        E = {cfg['E'][0]: Ea, cfg['E'][1]: Eb}
+        H = {cfg['H'][0]: Ha, cfg['H'][1]: Hb}
+        return E, H
+
+    def numerical_admittance_scale(self, grid: FDTDGrid) -> float:
+        """Discrete numerical-admittance correction ``s`` for a modal impedance
+        sheet (:class:`~wavesim.sources.ModalPort`).
+
+        A matched impedance sheet writes ghost H ``= s·(1/η)·(n̂×ê)·V``. For the
+        continuum mode ``s = 1`` exactly; on the grid it departs from 1 only
+        through **transverse-discretisation error** (staircased cross-section,
+        electrostatic ``ê`` vs the true discrete propagating mode), shrinking back
+        toward 1 as the cross-section is refined. It is derived here from power
+        balance rather than tuned: the sheet dissipates ``P = s·G·V²`` with the
+        **discrete modal conductance**
+
+            ``G = Σ_cells (ê² / η)·dA``   (both transverse E components),
+
+        and a matched wave of modal voltage ``V`` carries ``P = V²/Z₀``, so a
+        no-reflection sheet needs ``s = 1/(Z₀·G)``. Both ``Z₀`` (the energy-
+        integral characteristic impedance) and ``G`` are computed on the *same*
+        staggered fields the sheet uses, so their discretisation errors partly
+        cancel and ``s`` stays close to 1 (≈ 1.1 on a coax at 12 cells across the
+        gap, → 1 under transverse refinement).
+
+        Requires the mode's ``impedance`` (solve with ``compute_params=True``).
+        """
+        if self.impedance is None or not self.impedance > 0:
+            raise ValueError(
+                "numerical_admittance_scale needs the mode's Z₀; solve with "
+                "compute_params=True or pass admittance_scale= to ModalPort.")
+        cfg = _NORMAL_CFG[self.normal]
+        E_stag, _H = self._staggered_port_fields(grid)
+        k = self.slice_index
+        # Transverse per-cell primary widths → cell area dA on the plane.
+        prim = {'x': grid.dxp, 'y': grid.dyp, 'z': grid.dzp}
+        wa = prim[cfg['axes'][0]]
+        wb = prim[cfg['axes'][1]]
+        dA = wa[:, None] * wb[None, :]
+        mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
+        G = 0.0
+        eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+        for comp in cfg['E']:
+            ehat = E_stag[comp]
+            a, b = np.nonzero(ehat)
+            if a.size == 0:
+                continue
+            ii, jj, kk = _plane_to_grid(self.normal, k, a, b)
+            epsr = eps_of[comp][ii, jj, kk]
+            eta = ETA0 * np.sqrt(mu_a[a, b] / np.where(epsr > 0, epsr, 1.0))
+            G += float(np.sum(ehat[a, b] ** 2 / eta * dA[a, b]))
+        if G <= 0.0:
+            raise ValueError("Mode has no transverse E energy; cannot scale.")
+        return 1.0 / (self.impedance * G)
+
     def build_port_kernel(self, grid: FDTDGrid, *,
                           directional: bool = True,
                           frequency: float = None) -> dict:
@@ -291,6 +383,16 @@ class TEMMode:
         eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
         k = self.slice_index
 
+        # Port fields are the DISCRETE (Yee-staggered) mode, not the collocated
+        # ``self.E`` used for plotting / per-unit-length energy. Building ê as a
+        # forward difference of φ landed on the Yee edges makes it an exact null
+        # vector of the grid's transverse divergence (∇·(ε ê) = 0 to round-off in
+        # the dielectric), so ``E += κ·ê·I`` deposits NO charge — even under a
+        # DC-containing pulse. The collocated centred-gradient field is ~20%
+        # divergent on the Yee grid and would slowly charge the domain. See
+        # :meth:`_staggered_port_fields`.
+        E_stag, H_stag = self._staggered_port_fields(grid)
+
         # Gather nonzero plane cells per E component. ``S = Σ ε_r Ê²`` normalises
         # the read-back projection (dimensionless, so V*=1 for the pure mode);
         # ``Sv = Σ dV_c ε_r Ê²`` volume-weights the energy for κ (per-cell local
@@ -299,7 +401,7 @@ class TEMMode:
         S = 0.0
         Sv = 0.0
         for comp in cfg['E']:
-            Ehat2d = self.E[comp]
+            Ehat2d = E_stag[comp]
             a, b = np.nonzero(Ehat2d)
             if a.size == 0:
                 continue
@@ -333,7 +435,7 @@ class TEMMode:
             dn = float(_normal_width(grid, self.normal)[k - 1])
             h_tau = _launch_time_shift(grid.dt, dn, self.v_phase, frequency)
             for comp in cfg['H']:
-                Hhat2d = self.H[comp]
+                Hhat2d = H_stag[comp]
                 a, b = np.nonzero(Hhat2d)
                 if a.size == 0:
                     continue

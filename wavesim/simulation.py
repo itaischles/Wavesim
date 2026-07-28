@@ -131,12 +131,14 @@ class Simulation:
                  sources: Iterable[Source] = (),
                  monitors: Iterable = (),
                  pec_faces: tuple = (),
+                 boundaries: Iterable = (),
                  backend: str = 'numpy') -> None:
         self.grid = grid
         self.cpml = cpml
         self.sources = list(sources)
         self.monitors = list(monitors)
         self.pec_faces = tuple(pec_faces)
+        self.boundaries = list(boundaries)
         self.backend = backend
         self._update_H, self._update_E, self._update_H_pml, self._update_E_pml = \
             _load_backend(backend)
@@ -150,6 +152,17 @@ class Simulation:
         """Register a source; returns it for convenience."""
         self.sources.append(source)
         return source
+
+    def add_boundary(self, boundary):
+        """Register an absorbing/port boundary; returns it for convenience.
+
+        Boundaries run **between the H and E updates** each step (unlike sources,
+        which run after the E update), because a modal impedance-sheet port sets
+        the ghost tangential H that the very next E update consumes — a source
+        hook would be clobbered by the following step's H update before it is
+        ever used. See :class:`~wavesim.sources.ModalPort`."""
+        self.boundaries.append(boundary)
+        return boundary
 
     def add_monitor(self, monitor):
         """Register a monitor; returns it so you can read its data later."""
@@ -192,6 +205,11 @@ class Simulation:
         grid = self._update_H(grid)
         if self.cpml is not None:
             grid, self.cpml = self._update_H_pml(grid, self.cpml)
+
+        # 2b. Boundaries — modal impedance-sheet ports set the ghost tangential H
+        # here, *between* the H and E updates, so the E update below consumes it.
+        for bnd in self.boundaries:
+            bnd.apply(grid, t)
 
         # 3-4. E update (+ CPML correction)
         grid = self._update_E(grid)
