@@ -1111,6 +1111,150 @@ class _ModalLaunch(LineSource):
         self._inject_directional_h(grid)
 
 
+class ModalPort:
+    """One-way modal impedance-sheet port: a TEM absorber / launcher on a face.
+
+    Where a :class:`TEMPort` is a *lumped, distributed* Thévenin drive injected on
+    an interior plane, a ``ModalPort`` is an **impedance-sheet boundary** placed on
+    a domain face. Each step it sets the ghost tangential H just outside the face
+    to the value a matched continuation of the mode would carry, so the face
+    absorbs the mode with **no reflection and no DC error** — replacing PML for a
+    closed cross-section, and (unlike PML) exact at DC. With ``amplitude > 0`` the
+    *same* sheet also launches the mode inward, so one object both drives and
+    terminates a port (the CST "waveguide port" model).
+
+    It is registered with :meth:`~wavesim.simulation.Simulation.add_boundary`, not
+    ``add_source``: the sheet writes the ghost H that the *next* E-update consumes,
+    so it must run **between** the H and E updates. A source hook (after the E
+    update) would be clobbered by the following step's H update before it is ever
+    read.
+
+    The rule, per face cell, is
+
+        ``H_ghost = ±s · Y₀ · (V̄ − 2a) · (n̂ × ê)``
+
+    where ``ê`` is the 1 V-normalised staggered mode E-profile
+    (:meth:`~wavesim.mode_solver.TEMMode._staggered_port_fields`), ``Y₀ = 1/η`` the
+    local wave admittance, ``V̄ = ½(Vⁿ + Vⁿ⁻¹)`` the time-centred modal voltage
+    (ε-weighted overlap projection, :meth:`build_port_kernel`), ``a =
+    amplitude·waveform(t)`` the drive, and ``s`` the numerical-admittance
+    correction ``admittance_scale``. The ``−2a`` term makes the sheet radiate a
+    forward wave of ``a`` volts inward *and* absorb whatever returns, from one
+    expression. The sign ``±`` and the ghost-H plane index depend on the face:
+    the high-index face (e.g. ``z1``) writes the ghost H at the mode's own index
+    ``k`` with ``+``; the low-index face (``z0``) writes it at ``k-1`` with ``−``
+    (the Yee z-curl does not update the ``k=0`` E-plane, so a low face must sit at
+    least one cell in).
+
+    Parameters
+    ----------
+    mode : TEMMode
+        A mode from :func:`~wavesim.mode_solver.solve_tem_modes` (``compute_params
+        =True`` gives its ``impedance``, not required for a pure absorber). Solve
+        it *on the face plane* you want to terminate.
+    amplitude : float
+        Forward-wave launch voltage in volts (0 ⇒ pure absorber). Calibrated like
+        :meth:`~wavesim.mode_solver.TEMMode.to_source`: ``amplitude=1`` launches a
+        wave a downstream :class:`~wavesim.monitors.VoltageMonitor` reads as
+        ``waveform(t)`` volts.
+    waveform : Callable[[float], float], optional
+        Temporal profile of the launch; required if ``amplitude != 0``.
+    face : str, optional
+        ``'z0'``/``'z1'`` (or ``x``/``y`` variants). ``None`` (default) picks the
+        low/high face from the mode's ``slice_index`` relative to the grid size.
+    admittance_scale : float, optional
+        The discrete numerical-admittance correction ``s``. ``None`` (default)
+        derives it from the mode on the grid (see
+        :meth:`~wavesim.mode_solver.TEMMode.numerical_admittance_scale`); pass a
+        float to override. It is ``1.0`` for an ideal 1-D mode and departs from it
+        only through transverse-discretisation error, shrinking toward 1 as the
+        cross-section is refined.
+    """
+
+    def __init__(self, mode, *, amplitude: float = 0.0,
+                 waveform: Callable[[float], float] | None = None,
+                 face: str | None = None,
+                 admittance_scale: float | None = None) -> None:
+        if amplitude != 0.0 and waveform is None:
+            raise ValueError(
+                "ModalPort with amplitude != 0 needs a waveform= to launch.")
+        self.mode = mode
+        self.amplitude = float(amplitude)
+        self.waveform = waveform
+        self.face = face
+        self._scale_override = admittance_scale
+        self._ready = False
+        self._v_prev = 0.0
+        self.times: list = []
+        self.voltages: list = []
+
+    # -- one-time compile ---------------------------------------------------- #
+    def _setup(self, grid: FDTDGrid) -> None:
+        from wavesim.mode_solver import _plane_to_grid, _NORMAL_CFG
+
+        normal = self.mode.normal
+        k = self.mode.slice_index
+        n_along = {'x': grid.Nx, 'y': grid.Ny, 'z': grid.Nz}[normal]
+
+        # Resolve the face → outward direction. High-index face (z1-like) has the
+        # ghost H at the mode's own index k and sign +; low-index face (z0-like)
+        # at k-1 and sign − (see the class docstring for the Yee-stencil reason).
+        if self.face is not None:
+            outward = +1 if self.face.endswith('1') else -1
+        else:
+            outward = +1 if k >= n_along // 2 else -1
+        if outward > 0:
+            self._h_k = k
+            self._sign = +1.0
+        else:
+            if k < 1:
+                raise ValueError(
+                    f"A low-index ModalPort needs its ghost-H plane one cell "
+                    f"inside the domain, but the mode sits at {normal}-index {k}. "
+                    f"Solve the mode at least one cell in.")
+            self._h_k = k - 1
+            self._sign = -1.0
+
+        # V read-back edges (ε-weighted modal projection at the face plane k).
+        ker = self.mode.build_port_kernel(grid, directional=False)
+        self._edges = ker['edges']
+
+        # Staggered H pattern (n̂ × ê)/η, mapped to grid indices on the ghost plane.
+        _E, H = self.mode._staggered_port_fields(grid)
+        self._h = {}
+        for comp, arr2d in H.items():
+            a, b = np.nonzero(arr2d)
+            if a.size == 0:
+                continue
+            ii, jj, kk = _plane_to_grid(normal, self._h_k, a, b)
+            self._h[comp] = (ii, jj, kk, arr2d[a, b])
+
+        # Amplitude calibration of the launch. ``V̄ − 2a`` radiates a forward wave
+        # whose modal voltage equals ``a`` for a matched sheet, so ``amplitude`` is
+        # already the forward volts — no extra factor (validated in tests).
+        if self._scale_override is not None:
+            self._scale = float(self._scale_override)
+        else:
+            self._scale = self.mode.numerical_admittance_scale(grid)
+        self._ready = True
+
+    # -- per-step boundary hook (runs between update_H and update_E) ---------- #
+    def apply(self, grid: FDTDGrid, t: float) -> None:
+        if not self._ready:
+            self._setup(grid)
+        V = 0.0
+        for comp, (ii, jj, kk, w, coef) in self._edges.items():
+            V += float(np.dot(getattr(grid, comp)[ii, jj, kk], w))
+        a = self.amplitude * (self.waveform(t) if self.waveform is not None else 0.0)
+        v_centred = 0.5 * (V + self._v_prev)
+        amp = self._sign * self._scale * (v_centred - 2.0 * a)
+        for comp, (ii, jj, kk, vals) in self._h.items():
+            getattr(grid, comp)[ii, jj, kk] = amp * vals
+        self._v_prev = V
+        self.times.append(t)
+        self.voltages.append(V)
+
+
 class SpicePort(LineSource):
     """Lumped port coupled to an ngspice circuit (SPICE co-simulation).
 
