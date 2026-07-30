@@ -27,11 +27,9 @@ detector.
 
 Conformal mode (``--conformal``) runs the same case with the analytic cut-cell
 fractions from :mod:`conformal_shapes`, which is how V3-V5 are re-measured after
-S5. It forces ``backend='numpy'``: **S2 has landed only in the NumPy reference**,
-so the Numba and CUDA H updates still integrate the full face area while
-``apply_pec_mask`` zeroes E by the conformal rule — E and H would see different
-geometry and the answer would be quietly wrong rather than slow. Drop the
-override once phase 4 lands.
+S5. It runs on Numba like everything else — the conformal H update landed there
+in phase 4, and ``tests/test_conformal_backend.py`` pins it bit-identical to the
+NumPy reference. CUDA has no conformal kernel and refuses such a grid outright.
 """
 
 import sys
@@ -95,10 +93,7 @@ def run(cell, fmax=FMAX, steps_factor=6.0, verbose=True, conformal=False,
         backend=None, waveform=None):
     """One resolution: returns the §7 row plus the §8 V/I purity split."""
     grid, cx, cy = build(cell, conformal=conformal)
-    # Conformal geometry is honoured only by the NumPy H update until phase 4;
-    # see the module docstring. Silently stepping it on Numba would mismatch E
-    # and H, which is a wrong answer rather than a slow one.
-    backend = backend or ('numpy' if conformal else 'numba')
+    backend = backend or 'numba'
 
     # Modes on the two end planes. The launch plane sits one cell in from the
     # low face: a low-index sheet writes its ghost H at k-1, so k=0 is unusable.

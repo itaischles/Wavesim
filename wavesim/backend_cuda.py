@@ -346,8 +346,28 @@ def _scalars(grid):
             T(grid.dx), T(grid.dy), T(grid.dz))
 
 
+def _refuse_conformal(grid: FDTDGrid) -> None:
+    """Reject a cut-cell grid — the CUDA kernels only know the staircase form.
+
+    Refusing rather than silently staircasing is the whole point. The H update
+    would integrate the full face area while ``apply_pec_mask`` zeroes E by the
+    conformal rule, so E and H would see different conductors: a wrong answer
+    that looks like a working run. That is precisely the failure mode the
+    homogeneous-fill invariant exists to catch, and it must not be reachable by
+    accident.
+    """
+    if grid.is_conformal:
+        raise NotImplementedError(
+            "The CUDA backend does not implement conformal (Dey-Mittra) PEC: "
+            "its H update would integrate the full face area while E is masked "
+            "by the cut geometry, which is a silently wrong answer rather than "
+            "a slow one. Use backend='numba' (or 'numpy'), or drop the "
+            "pec_edge_open_* / pec_face_open_* arrays to run staircased.")
+
+
 def update_H(grid: FDTDGrid) -> FDTDGrid:
     """CUDA drop-in for :func:`wavesim.update.update_H`."""
+    _refuse_conformal(grid)
     g = grid
     cH, _cE, dx, dy, dz = _scalars(g)
     dEx, dEy, dEz = (cuda.to_device(g.Ex), cuda.to_device(g.Ey),
@@ -388,6 +408,7 @@ def _dev_ravel(a, dtype):
 
 def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays]:
     """CUDA drop-in for :func:`wavesim.pml.update_H_pml`."""
+    _refuse_conformal(grid)
     g = grid
     dtype = g.Hx.dtype
     cH, _cE, dx, dy, dz = _scalars(g)

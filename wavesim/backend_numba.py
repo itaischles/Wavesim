@@ -49,6 +49,7 @@ import numpy as np
 from numba import njit, prange
 
 from wavesim.grid import FDTDGrid
+from wavesim.pec import conformal_geometry
 from wavesim.pml import CPMLArrays
 from wavesim.constants import MU0, EPS0
 
@@ -108,6 +109,63 @@ def _update_H(Ex, Ey, Ez, Hx, Hy, Hz,
 
 
 @njit(**_NJIT)
+def _update_H_conformal(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z, dt,
+                        Lx, Ly, Lz, inv_Ax, inv_Ay, inv_Az, Nx, Ny, Nz):
+    """Dey–Mittra Faraday: the same contour, covered parts removed.
+
+    A **separate kernel** rather than a flag inside :func:`_update_H`, because
+    this is the hot loop: the conformal form costs six extra array reads per
+    face (~20–40% on the H update) and a model with no conductors must not pay
+    it. The dispatch happens once, in the :func:`update_H` wrapper.
+
+    ``E·L`` is formed inline instead of materialising the three ``E*L`` arrays
+    the NumPy reference builds. Each E value is read by two contours, so that
+    trades one extra multiply for three full-volume temporaries — the right way
+    round for a bandwidth-bound kernel. The arithmetic grouping is otherwise
+    kept identical to :func:`wavesim.update._update_H_conformal` so the two
+    agree to the last ULP (``tests/test_conformal_backend.py``).
+    """
+    if Nz > 1:
+        # Hx[:, :-1, :-1] -= coef * inv_Ax * (d(Ez·Lz)/dy - d(Ey·Ly)/dz)
+        for i in prange(Nx):
+            for j in range(Ny - 1):
+                for k in range(Nz - 1):
+                    dEzL_y = Ez[i, j + 1, k] * Lz[i, j + 1, k] - Ez[i, j, k] * Lz[i, j, k]
+                    dEyL_z = Ey[i, j, k + 1] * Ly[i, j, k + 1] - Ey[i, j, k] * Ly[i, j, k]
+                    Hx[i, j, k] -= (dt / (_MU0 * mu_x[i, j, k])
+                                    * inv_Ax[i, j, k]) * (dEzL_y - dEyL_z)
+
+        # Hy[:-1, :, :-1] -= coef * inv_Ay * (d(Ex·Lx)/dz - d(Ez·Lz)/dx)
+        for i in prange(Nx - 1):
+            for j in range(Ny):
+                for k in range(Nz - 1):
+                    dExL_z = Ex[i, j, k + 1] * Lx[i, j, k + 1] - Ex[i, j, k] * Lx[i, j, k]
+                    dEzL_x = Ez[i + 1, j, k] * Lz[i + 1, j, k] - Ez[i, j, k] * Lz[i, j, k]
+                    Hy[i, j, k] -= (dt / (_MU0 * mu_y[i, j, k])
+                                    * inv_Ay[i, j, k]) * (dExL_z - dEzL_x)
+    else:
+        for i in prange(Nx):
+            for j in range(Ny - 1):
+                dEzL_y = Ez[i, j + 1, 0] * Lz[i, j + 1, 0] - Ez[i, j, 0] * Lz[i, j, 0]
+                Hx[i, j, 0] -= (dt / (_MU0 * mu_x[i, j, 0])
+                                * inv_Ax[i, j, 0]) * dEzL_y
+        for i in prange(Nx - 1):
+            for j in range(Ny):
+                dEzL_x = Ez[i + 1, j, 0] * Lz[i + 1, j, 0] - Ez[i, j, 0] * Lz[i, j, 0]
+                Hy[i, j, 0] -= (dt / (_MU0 * mu_y[i, j, 0])
+                                * inv_Ay[i, j, 0]) * (-dEzL_x)
+
+    # Hz[:-1, :-1, :] -= coef * inv_Az * (d(Ey·Ly)/dx - d(Ex·Lx)/dy)
+    for i in prange(Nx - 1):
+        for j in range(Ny - 1):
+            for k in range(Nz):
+                dEyL_x = Ey[i + 1, j, k] * Ly[i + 1, j, k] - Ey[i, j, k] * Ly[i, j, k]
+                dExL_y = Ex[i, j + 1, k] * Lx[i, j + 1, k] - Ex[i, j, k] * Lx[i, j, k]
+                Hz[i, j, k] -= (dt / (_MU0 * mu_z[i, j, k])
+                                * inv_Az[i, j, k]) * (dEyL_x - dExL_y)
+
+
+@njit(**_NJIT)
 def _update_E(Ex, Ey, Ez, Hx, Hy, Hz,
               eps_x, eps_y, eps_z, dt, dxd, dyd, dzd, Nx, Ny, Nz):
     # Every E derivative differences an H field sitting at a cell CENTRE along the
@@ -159,10 +217,20 @@ def _update_E(Ex, Ey, Ez, Hx, Hy, Hz,
 def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
                   dt, dxp, dyp, dzp, Nx, Ny, Nz,
                   sx, sy, sz, bxH, cxH, byH, cyH, bzH, czH,
-                  psi_Ez_y, psi_Ey_z, psi_Ex_z, psi_Ez_x, psi_Ey_x, psi_Ex_y):
+                  psi_Ez_y, psi_Ey_z, psi_Ex_z, psi_Ez_x, psi_Ey_x, psi_Ex_y,
+                  conformal, Lx, Ly, Lz, inv_Ax, inv_Ay, inv_Az):
     # dxp/dyp/dzp are the PRIMARY widths sampled at the slab indices (per-slab, in
     # sel_*H order), so they index by the slab counter p — matching update_H's
     # per-cell primary divisor. On a uniform grid they are the constant PML spacing.
+    #
+    # Conformal PEC (see wavesim.pml.update_H_pml): only the SIX derivatives
+    # change, from ``(hi - lo)/dp`` to ``(hi·L_hi - lo·L_lo)·inv_A``; the psi
+    # recursion, the signs and the dt/(MU0·mu) correction are untouched. Unlike
+    # the interior kernel this branches on a flag instead of getting its own
+    # copy — the branch is hoisted out of every innermost loop so a staircase
+    # run pays nothing for it, and duplicating 100 lines of slab bookkeeping to
+    # vary six of them would be the worse trade. When ``conformal`` is False the
+    # L / inv_A arguments are empty arrays and are never indexed.
     n_xH = sx.shape[0]
     n_yH = sy.shape[0]
     n_zH = sz.shape[0]
@@ -172,6 +240,12 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
     for i in prange(Nx):
         for p in range(n_yH):
             j = sy[p]
+            if conformal:
+                for k in range(Nz):
+                    dEz_dy = (Ez[i, j + 1, k] * Lz[i, j + 1, k]
+                              - Ez[i, j, k] * Lz[i, j, k]) * inv_Ax[i, j, k]
+                    psi_Ez_y[i, p, k] = byH[p] * psi_Ez_y[i, p, k] + cyH[p] * dEz_dy
+                continue
             for k in range(Nz):
                 dEz_dy = (Ez[i, j + 1, k] - Ez[i, j, k]) / dyp[p]
                 psi_Ez_y[i, p, k] = byH[p] * psi_Ez_y[i, p, k] + cyH[p] * dEz_dy
@@ -184,6 +258,13 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
         # psi_Ey_z[i, j, p], k = sz[p]; correct Hx[:, :-1, sz]
         for i in prange(Nx):
             for j in range(Ny):
+                if conformal:
+                    for p in range(n_zH):
+                        k = sz[p]
+                        dEy_dz = (Ey[i, j, k + 1] * Ly[i, j, k + 1]
+                                  - Ey[i, j, k] * Ly[i, j, k]) * inv_Ax[i, j, k]
+                        psi_Ey_z[i, j, p] = bzH[p] * psi_Ey_z[i, j, p] + czH[p] * dEy_dz
+                    continue
                 for p in range(n_zH):
                     k = sz[p]
                     dEy_dz = (Ey[i, j, k + 1] - Ey[i, j, k]) / dzp[p]
@@ -204,6 +285,12 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
     for j in prange(Ny):
         for p in range(n_xH):
             i = sx[p]
+            if conformal:
+                for k in range(Nz):
+                    dEz_dx = (Ez[i + 1, j, k] * Lz[i + 1, j, k]
+                              - Ez[i, j, k] * Lz[i, j, k]) * inv_Ay[i, j, k]
+                    psi_Ez_x[p, j, k] = bxH[p] * psi_Ez_x[p, j, k] + cxH[p] * dEz_dx
+                continue
             for k in range(Nz):
                 dEz_dx = (Ez[i + 1, j, k] - Ez[i, j, k]) / dxp[p]
                 psi_Ez_x[p, j, k] = bxH[p] * psi_Ez_x[p, j, k] + cxH[p] * dEz_dx
@@ -216,6 +303,13 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
         # psi_Ex_z[i, j, p], k = sz[p]; correct Hy[:-1, :, sz]
         for i in prange(Nx):
             for j in range(Ny):
+                if conformal:
+                    for p in range(n_zH):
+                        k = sz[p]
+                        dEx_dz = (Ex[i, j, k + 1] * Lx[i, j, k + 1]
+                                  - Ex[i, j, k] * Lx[i, j, k]) * inv_Ay[i, j, k]
+                        psi_Ex_z[i, j, p] = bzH[p] * psi_Ex_z[i, j, p] + czH[p] * dEx_dz
+                    continue
                 for p in range(n_zH):
                     k = sz[p]
                     dEx_dz = (Ex[i, j, k + 1] - Ex[i, j, k]) / dzp[p]
@@ -236,6 +330,12 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
     for j in prange(Ny):
         for p in range(n_xH):
             i = sx[p]
+            if conformal:
+                for k in range(Nz):
+                    dEy_dx = (Ey[i + 1, j, k] * Ly[i + 1, j, k]
+                              - Ey[i, j, k] * Ly[i, j, k]) * inv_Az[i, j, k]
+                    psi_Ey_x[p, j, k] = bxH[p] * psi_Ey_x[p, j, k] + cxH[p] * dEy_dx
+                continue
             for k in range(Nz):
                 dEy_dx = (Ey[i + 1, j, k] - Ey[i, j, k]) / dxp[p]
                 psi_Ey_x[p, j, k] = bxH[p] * psi_Ey_x[p, j, k] + cxH[p] * dEy_dx
@@ -248,6 +348,12 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
     for i in prange(Nx):
         for p in range(n_yH):
             j = sy[p]
+            if conformal:
+                for k in range(Nz):
+                    dEx_dy = (Ex[i, j + 1, k] * Lx[i, j + 1, k]
+                              - Ex[i, j, k] * Lx[i, j, k]) * inv_Az[i, j, k]
+                    psi_Ex_y[i, p, k] = byH[p] * psi_Ex_y[i, p, k] + cyH[p] * dEx_dy
+                continue
             for k in range(Nz):
                 dEx_dy = (Ex[i, j + 1, k] - Ex[i, j, k]) / dyp[p]
                 psi_Ex_y[i, p, k] = byH[p] * psi_Ex_y[i, p, k] + cyH[p] * dEx_dy
@@ -364,8 +470,23 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
 # ====================================================================== #
 # Thin wrappers — signature-compatible with update.py / pml.py
 # ====================================================================== #
+_NO_ARRAY = np.zeros((0, 0, 0))     # placeholder for the unused conformal args
+
+
 def update_H(grid: FDTDGrid) -> FDTDGrid:
-    """Numba-accelerated drop-in for :func:`wavesim.update.update_H`."""
+    """Numba-accelerated drop-in for :func:`wavesim.update.update_H`.
+
+    Dispatches to the cut-cell kernel when the grid carries conformal geometry,
+    exactly as the NumPy reference does — the two must not diverge, or E and H
+    see different conductors and the run is wrong rather than merely inaccurate.
+    """
+    if grid.is_conformal:
+        g = conformal_geometry(grid)
+        _update_H_conformal(grid.Ex, grid.Ey, grid.Ez, grid.Hx, grid.Hy, grid.Hz,
+                            grid.mu_x, grid.mu_y, grid.mu_z, grid.dt,
+                            g.Lx, g.Ly, g.Lz, g.inv_Ax, g.inv_Ay, g.inv_Az,
+                            grid.Nx, grid.Ny, grid.Nz)
+        return grid
     _update_H(grid.Ex, grid.Ey, grid.Ez, grid.Hx, grid.Hy, grid.Hz,
               grid.mu_x, grid.mu_y, grid.mu_z,
               grid.dt, grid.dxp, grid.dyp, grid.dzp, grid.Nx, grid.Ny, grid.Nz)
@@ -399,8 +520,23 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
         _ravel(cpml.byH_s), _ravel(cpml.cyH_s),
         _ravel(cpml.bzH_s), _ravel(cpml.czH_s),
         cpml.psi_Ez_y, cpml.psi_Ey_z, cpml.psi_Ex_z,
-        cpml.psi_Ez_x, cpml.psi_Ey_x, cpml.psi_Ex_y)
+        cpml.psi_Ez_x, cpml.psi_Ey_x, cpml.psi_Ex_y,
+        *_conformal_pml_args(grid))
     return grid, cpml
+
+
+def _conformal_pml_args(grid: FDTDGrid):
+    """``(conformal, Lx, Ly, Lz, inv_Ax, inv_Ay, inv_Az)`` for the PML kernel.
+
+    A conductor may cross the absorbing shell, and staircasing it there while
+    the interior is conformal would put a geometry step right at the absorber —
+    itself a reflection source. The placeholders keep the kernel's Numba
+    signature (and so its cached compilation) identical in both cases.
+    """
+    if not grid.is_conformal:
+        return (False,) + (_NO_ARRAY,) * 6
+    g = conformal_geometry(grid)
+    return True, g.Lx, g.Ly, g.Lz, g.inv_Ax, g.inv_Ay, g.inv_Az
 
 
 def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays]:
