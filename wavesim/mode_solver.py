@@ -774,6 +774,39 @@ def _node_dual(w: np.ndarray) -> np.ndarray:
     return out
 
 
+def _face_eps(eps: np.ndarray, pec, axis: int) -> np.ndarray:
+    """Permittivity of each face — the stored edge value, not an average.
+
+    ``eps_a[i,j]`` **is** ``eps_x[i,j]``, the permittivity wavesim keeps on the
+    Ex edge joining node ``i`` to node ``i+1`` — precisely the face being
+    weighted. Averaging it with its neighbour, as this did before S5c, smears
+    data that is already in the right place: on a two-layer parallel plate the
+    material interface then lands mid-face and the capacitance comes out 0.82%
+    wrong, against **exact** when the stored value is used.
+
+    A face straddling the conductor surface is the exception. ε there is not a
+    material property — it is whatever the voxeliser left inside the metal
+    (1.0) — so such a face borrows the ε of the next face **outward**, which
+    lies wholly in the dielectric. That is the old cell-wise one-sided rule
+    shifted onto the edges where it belongs, and it is load-bearing: it is what
+    keeps the filled and air operators exact scalar multiples of one another,
+    hence φ = φ_air and ε_eff = ε_r to round-off. Dropping it (direct ε alone)
+    reads 2.273 on a homogeneous coax against a true 2.300.
+    """
+    n = eps.shape[axis]
+    part = (lambda a, s: a[s]) if axis == 0 else (lambda a, s: a[:, s])
+    face = part(eps, np.s_[:n - 1]).copy()
+    if pec is None or face.size == 0:
+        return face
+    lo, hi = part(pec, np.s_[:n - 1]), part(pec, np.s_[1:n])
+    outward_hi = part(eps, np.s_[1:n])                       # face i+1
+    outward_lo = np.concatenate(                             # face i-1, clamped
+        [part(eps, np.s_[:1]), part(eps, np.s_[:n - 2])], axis=axis)
+    face = np.where(lo & ~hi, outward_hi, face)
+    face = np.where(hi & ~lo, outward_lo, face)
+    return face
+
+
 def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
     """Per-face conductances of the ε-weighted transverse Laplacian.
 
@@ -798,15 +831,8 @@ def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
     even that exactly-solvable case comes out wrong
     (``tests/test_mode_solver_spacing.py``).
 
-    **Face permittivity** is the arithmetic mean of the two adjoining cells,
-    EXCEPT where one of them is PEC. ε inside a conductor is not a material
-    property — it is whatever the voxeliser happened to leave there (1.0) — so
-    averaging it in makes conductor-adjacent faces carry a different ε ratio
-    than interior faces. The filled and air systems then stop being scalar
-    multiples of one another, φ ≠ φ_air, and the exact cancellation in
-    ε_eff = C/C_air breaks. Taking the free cell's ε one-sided is both
-    physically right (the dielectric runs up to the conductor surface) and
-    restores A_filled = ε_r·A_air for a homogeneous fill.
+    **Face permittivity** comes from :func:`_face_eps` — the stored edge value,
+    used directly rather than averaged.
 
     **Conformal PEC**: ``f_a``/``f_b`` scale the centre distance down to the
     *open* edge length, ``L = f·primary width``, so the coefficient grows as
@@ -829,17 +855,6 @@ def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
     DA = _node_dual(da_w)[:, None]              # (Na, 1) dual a-widths (b-face)
     DB = _node_dual(db_w)[None, :]              # (1, Nb) dual b-widths (a-face)
 
-    def _eps_face(eps, src, nbr):
-        ef = 0.5 * (eps[src] + eps[nbr])
-        if pec is not None:
-            pec_src, pec_nbr = pec[src], pec[nbr]
-            ef = np.where(pec_nbr & ~pec_src, eps[src], ef)
-            ef = np.where(pec_src & ~pec_nbr, eps[nbr], ef)
-        return ef
-
-    sa, na = np.s_[0:Na - 1, :], np.s_[1:Na, :]
-    sb, nb = np.s_[:, 0:Nb - 1], np.s_[:, 1:Nb]
-
     # Coupling distance: the node-to-node separation, i.e. the PRIMARY width of
     # the edge joining them — and under conformal PEC only its open part.
     la = np.broadcast_to(da_w[:Na - 1, None], (max(Na - 1, 0), Nb)).astype(np.float64)
@@ -849,9 +864,9 @@ def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
         lb = lb * f_b[:, :Nb - 1]
 
     ca = np.divide(np.broadcast_to(DB, la.shape), la,
-                   out=np.zeros_like(la), where=la > 0.0) * _eps_face(eps_a, sa, na)
+                   out=np.zeros_like(la), where=la > 0.0) * _face_eps(eps_a, pec, 0)
     cb = np.divide(np.broadcast_to(DA, lb.shape), lb,
-                   out=np.zeros_like(lb), where=lb > 0.0) * _eps_face(eps_b, sb, nb)
+                   out=np.zeros_like(lb), where=lb > 0.0) * _face_eps(eps_b, pec, 1)
     return ca, cb
 
 

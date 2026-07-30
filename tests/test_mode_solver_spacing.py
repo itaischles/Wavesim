@@ -1,4 +1,4 @@
-"""S5b — primary/dual pairing in the mode solver's Laplacian.
+"""S5b/S5c — the node picture's two consequences for the mode solver.
 
 S0 found the solver's H update dividing by dual widths where the Faraday
 contour says primary. The same inversion was living in ``mode_solver.py``: φ
@@ -17,6 +17,12 @@ between the plates is uniform, so φ must be piecewise linear in the plate-norma
 coordinate whatever the grading. Getting that wrong is not a truncation error
 that shrinks under refinement — it is wrong at every resolution, which makes it
 a zero-tolerance assertion rather than an extrapolated slope.
+
+The same picture settles where the face permittivity comes from (S5c): the
+stored ``eps_x[i,j]`` already *is* the value on the edge being weighted, so
+averaging it with a neighbour smears data that is in the right place. Adding a
+second dielectric layer to the same parallel plate makes that exactly solvable
+too, and it is only exact once the stored value is used directly.
 """
 
 import numpy as np
@@ -226,3 +232,95 @@ def test_node_dual_matches_the_grids_own_dual_widths():
     wd = _node_dual(grid.dxp)
     assert np.array_equal(wd[1:], grid.dxd[:-1])
     assert wd[0] == 0.5 * grid.dxp[0]
+
+
+# ---------------------------------------------------------------------- #
+# S5c — the face permittivity is the edge's own stored value
+# ---------------------------------------------------------------------- #
+
+def _layered_plate(n=40, eps_r=4.0, width=8e-3):
+    """Parallel plate with two dielectric layers meeting exactly at a node.
+
+    ``eps_y[i,j]`` is the permittivity ON the Ey edge from node j to node j+1,
+    so writing the two layers into the edge arrays puts the material interface
+    exactly on node ``mid`` — no face straddles it, and the series capacitance
+    is therefore exactly representable.
+    """
+    ax = _graded(n, width)
+    grid = create_grid_rectilinear(ax, ax, np.arange(4) * 1e-3)
+    ws.set_vacuum(grid)
+    lo, hi = int(0.2 * n), int(0.8 * n)
+    mid = (lo + hi) // 2
+    j = np.arange(grid.Ny)[None, :, None]
+    grid.pec_mask = np.broadcast_to((j <= lo) | (j >= hi),
+                                    (grid.Nx, grid.Ny, grid.Nz)).copy()
+    grid.eps_y[:, lo:mid, :] = eps_r
+    grid.eps_x[:, lo:mid + 1, :] = eps_r
+    return grid, lo, mid, hi, eps_r
+
+
+def test_layered_plate_gives_the_exact_series_capacitance():
+    """1/C = 1/C₁ + 1/C₂, exactly.
+
+    Averaging the face permittivity puts an ε of 2.5 on the face bridging the
+    ε_r = 4 and ε_r = 1 layers, which is not a property of either; the
+    capacitance then reads **0.82% low**. Using the stored edge value — which is
+    already the permittivity of that face — is exact.
+    """
+    grid, lo, mid, hi, eps_r = _layered_plate()
+    mode = _solve(grid)
+    C = _fv_energy(mode.phi, _slice(grid.eps_x, 'z', 1), _slice(grid.eps_y, 'z', 1),
+                   grid.dxp, grid.dyp, mode.pec, None, None)
+    W = _node_dual(grid.dxp).sum()
+    d1 = grid.y[mid] - grid.y[lo]
+    d2 = grid.y[hi] - grid.y[mid]
+    assert C == pytest.approx(EPS0 * W / (d1 / eps_r + d2), rel=1e-12)
+
+
+def test_averaging_the_face_permittivity_fails_that_test():
+    """Pins S5c the way the tests above pin S5b."""
+    def averaged(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
+        """The pre-S5c face permittivity: mean of the two adjoining values,
+        with the one-sided PEC rule applied cell-wise."""
+        Na, Nb = eps_a.shape
+        DA, DB = _node_dual(da_w)[:, None], _node_dual(db_w)[None, :]
+        la = np.broadcast_to(da_w[:Na - 1, None], (Na - 1, Nb)).astype(float)
+        lb = np.broadcast_to(db_w[None, :Nb - 1], (Na, Nb - 1)).astype(float)
+
+        def mean_eps(eps, axis):
+            n = eps.shape[axis]
+            part = (lambda a, s: a[s]) if axis == 0 else (lambda a, s: a[:, s])
+            ef = 0.5 * (part(eps, np.s_[:n - 1]) + part(eps, np.s_[1:n]))
+            lo_, hi_ = part(pec, np.s_[:n - 1]), part(pec, np.s_[1:n])
+            ef = np.where(hi_ & ~lo_, part(eps, np.s_[:n - 1]), ef)
+            return np.where(lo_ & ~hi_, part(eps, np.s_[1:n]), ef)
+
+        return (DB / la * mean_eps(eps_a, 0), DA / lb * mean_eps(eps_b, 1))
+
+    grid, lo, mid, hi, eps_r = _layered_plate()
+    from wavesim import mode_solver as ms
+    orig = ms._face_coefs
+    try:
+        ms._face_coefs = averaged
+        m = _solve(grid)
+        C = _fv_energy(m.phi, _slice(grid.eps_x, 'z', 1), _slice(grid.eps_y, 'z', 1),
+                       grid.dxp, grid.dyp, m.pec, None, None)
+    finally:
+        ms._face_coefs = orig
+    W = _node_dual(grid.dxp).sum()
+    exact = EPS0 * W / ((grid.y[mid] - grid.y[lo]) / eps_r
+                        + (grid.y[hi] - grid.y[mid]))
+    assert abs(C / exact - 1) > 5e-3, "averaging no longer costs anything?"
+
+
+def test_homogeneous_fill_still_exact_without_the_cell_wise_rule():
+    """V1 guard for S5c. The one-sided rule is load-bearing and had to move onto
+    the edges rather than be dropped: with direct ε alone a homogeneous coax
+    reads ε_eff = 2.273 against a true 2.300, because faces straddling the metal
+    pick up the ε = 1 the voxeliser left inside the conductor."""
+    from test_homogeneous_fill import _coax_grid
+    for n in (33, 66):
+        grid, _ds = _coax_grid(n, 2.3)
+        mode = solve_tem_modes(grid, normal='z', position=grid.zc[1],
+                               compute_params=True)[0]
+        assert mode.eps_eff == pytest.approx(2.3, rel=1e-12)
