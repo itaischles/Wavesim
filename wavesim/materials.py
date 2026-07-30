@@ -58,18 +58,36 @@ def set_dielectric(grid: FDTDGrid,
     grid.mu_z[:]  = 1.0
     return grid
 
+_CONFORMAL_KEYS = ('pec_edge_open_x', 'pec_edge_open_y', 'pec_edge_open_z',
+                   'pec_face_open_x', 'pec_face_open_y', 'pec_face_open_z')
+
+
 def set_material_arrays(grid: FDTDGrid,
                         eps_x: np.ndarray, eps_y: np.ndarray, eps_z: np.ndarray,
                         mu_x:  np.ndarray, mu_y:  np.ndarray, mu_z:  np.ndarray,
-                        pec_mask: np.ndarray = None) -> FDTDGrid:
+                        pec_mask: np.ndarray = None,
+                        pec_edge_open_x: np.ndarray = None,
+                        pec_edge_open_y: np.ndarray = None,
+                        pec_edge_open_z: np.ndarray = None,
+                        pec_face_open_x: np.ndarray = None,
+                        pec_face_open_y: np.ndarray = None,
+                        pec_face_open_z: np.ndarray = None) -> FDTDGrid:
     """
     Directly assign pre-computed material arrays to the grid.
 
-    This is the function the future CAD importer will call after voxelising
-    a FreeCAD geometry into NumPy arrays.
+    This is the function the FreeCAD CAD importer calls after voxelising a
+    geometry into NumPy arrays.
 
     All arrays must have shape (Nx, Ny, Nz).
     If pec_mask is provided it is written into grid.pec_mask.
+
+    Conformal PEC
+    -------------
+    The six ``pec_*_open_*`` arrays are the open-fraction geometry described in
+    :class:`~wavesim.grid.FDTDGrid` — dimensionless, in [0, 1], all six together
+    or none at all. Passing them switches the solver onto the conformal
+    (Dey–Mittra) path; omitting them (the default) leaves every existing code
+    path untouched and bit-identical.
     """
     shape = (grid.Nx, grid.Ny, grid.Nz)
     for name, arr in [('eps_x', eps_x), ('eps_y', eps_y), ('eps_z', eps_z),
@@ -88,6 +106,27 @@ def set_material_arrays(grid: FDTDGrid,
         if pec_mask.shape != shape:
             raise ValueError(f"pec_mask: expected shape {shape}, got {pec_mask.shape}")
         grid.pec_mask = pec_mask.astype(bool)
+
+    conformal = dict(zip(_CONFORMAL_KEYS,
+                         (pec_edge_open_x, pec_edge_open_y, pec_edge_open_z,
+                          pec_face_open_x, pec_face_open_y, pec_face_open_z)))
+    given = [k for k, v in conformal.items() if v is not None]
+    if given:
+        # All six or none: a partial set would silently mix conformal edges with
+        # staircase faces (or the reverse), and E and H would see different
+        # geometry — the exact failure mode the edge dilation was added to fix.
+        missing = [k for k in _CONFORMAL_KEYS if conformal[k] is None]
+        if missing:
+            raise ValueError(
+                "conformal PEC arrays must be supplied as a complete set of six; "
+                f"missing {missing}")
+        for name in _CONFORMAL_KEYS:
+            arr = np.ascontiguousarray(conformal[name], dtype=np.float64)
+            if arr.shape != shape:
+                raise ValueError(f"{name}: expected shape {shape}, got {arr.shape}")
+            if not np.all((arr >= 0.0) & (arr <= 1.0)):
+                raise ValueError(f"{name}: open fractions must lie in [0, 1]")
+            setattr(grid, name, arr)
 
     return grid
 

@@ -13,8 +13,13 @@ Correct timestep order (from the main loop):
     E update → CPML E correction → apply_pec_faces → apply_pec_mask → monitors
 
 PEC enforcement must come after every E update, including after CPML corrections.
+
+Conformal (Dey–Mittra) PEC adds a third thing: conformal_geometry(), which turns
+the dimensionless open-fraction arrays carried on the grid into the metre-valued
+open edge lengths and open face areas the conformal H update integrates over.
 """
 
+from dataclasses import dataclass
 import numpy as np
 from wavesim.grid import FDTDGrid
 
@@ -134,3 +139,92 @@ def apply_pec_mask(grid: FDTDGrid) -> FDTDGrid:
     grid.Ez[ez] = 0.0
 
     return grid
+
+
+# ======================================================================= #
+# Conformal (Dey–Mittra) PEC geometry
+# ======================================================================= #
+
+@dataclass(frozen=True)
+class ConformalGeometry:
+    """Metre-valued cut-cell geometry derived from the grid's open fractions.
+
+    All arrays have shape ``(Nx, Ny, Nz)``.
+
+    ``Lx``/``Ly``/``Lz`` — open length (m) of the E edges ``Ex``/``Ey``/``Ez``.
+    ``Ax``/``Ay``/``Az`` — open area (m²) of the H faces ``Hx``/``Hy``/``Hz``.
+
+    An entry of zero is a fully covered edge or face; ``Ax`` etc. are areas, not
+    reciprocals, precisely so that the ``1/A_open → ∞`` question stays with the
+    update kernel and the small-cut threshold (S4) rather than being baked in
+    here.
+    """
+    Lx: np.ndarray
+    Ly: np.ndarray
+    Lz: np.ndarray
+    Ax: np.ndarray
+    Ay: np.ndarray
+    Az: np.ndarray
+
+
+def build_conformal_geometry(grid: FDTDGrid) -> ConformalGeometry:
+    """Open fractions × grid spacing → open lengths and areas (uncached).
+
+    Primary widths throughout, because the Faraday contour of an H face is
+    bounded by *nodes*: the ``Hz[i,j,k]`` face spans nodes ``(i..i+1, j..j+1)``,
+    so its sides are the E edges ``Ex`` (length ``dxp[i]``) and ``Ey`` (length
+    ``dyp[j]``) and its area is ``dxp[i]·dyp[j]``. This is the same convention
+    the workbench voxeliser uses to define an edge (node ``(i,j,k)`` → node
+    ``(i+1,j,k)``), so there is exactly one geometric definition across the
+    process boundary.
+    """
+    dxp = grid.dxp[:, None, None]
+    dyp = grid.dyp[None, :, None]
+    dzp = grid.dzp[None, None, :]
+
+    return ConformalGeometry(
+        Lx=grid.pec_edge_open_x * dxp,
+        Ly=grid.pec_edge_open_y * dyp,
+        Lz=grid.pec_edge_open_z * dzp,
+        Ax=grid.pec_face_open_x * (dyp * dzp),
+        Ay=grid.pec_face_open_y * (dzp * dxp),
+        Az=grid.pec_face_open_z * (dxp * dyp),
+    )
+
+
+def conformal_geometry(grid: FDTDGrid):
+    """Cached :class:`ConformalGeometry` for ``grid``, or ``None`` if staircase.
+
+    Cached on the grid and keyed on the *identity* of the six fraction arrays,
+    the same scheme (and the same caveat) as the PEC edge-mask cache in
+    :func:`apply_pec_mask`: replacing an array invalidates the cache
+    automatically, mutating one **in place** does not — clear
+    ``grid._conformal_cache`` yourself if you need to do that mid-run.
+    """
+    if not grid.is_conformal:
+        return None
+
+    key = (grid.pec_edge_open_x, grid.pec_edge_open_y, grid.pec_edge_open_z,
+           grid.pec_face_open_x, grid.pec_face_open_y, grid.pec_face_open_z)
+
+    cache = getattr(grid, '_conformal_cache', None)
+    if cache is None or len(cache[0]) != len(key) or \
+            any(a is not b for a, b in zip(cache[0], key)):
+        cache = (key, build_conformal_geometry(grid))
+        grid._conformal_cache = cache
+    return cache[1]
+
+
+def count_cut_cells(grid: FDTDGrid) -> int:
+    """Number of H faces that are partially — not fully — covered by conductor.
+
+    The sanity number echoed as ``summary["cut_cells"]``; zero means the
+    conformal path has nothing to do that the staircase path would not.
+    """
+    if not grid.is_conformal:
+        return 0
+    total = 0
+    for name in ('pec_face_open_x', 'pec_face_open_y', 'pec_face_open_z'):
+        f = getattr(grid, name)
+        total += int(np.count_nonzero((f > 0.0) & (f < 1.0)))
+    return total

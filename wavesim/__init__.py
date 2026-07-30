@@ -39,7 +39,8 @@ from wavesim.subpixel import (
 from wavesim.pml import (
     CPMLArrays, init_cpml, update_H_pml, update_E_pml, ALL_FACES,
 )
-from wavesim.pec import apply_pec_faces, apply_pec_mask
+from wavesim.pec import (apply_pec_faces, apply_pec_mask,
+                         ConformalGeometry, conformal_geometry, count_cut_cells)
 from wavesim.sources import (
     Waveform, GaussianPulse, Sinusoid,
     Source, PointSource, ArraySource, PlaneSource, GaussianBeam,
@@ -99,6 +100,7 @@ __all__ = [
     "CPMLArrays", "init_cpml", "update_H_pml", "update_E_pml", "ALL_FACES",
     # pec
     "apply_pec_faces", "apply_pec_mask",
+    "ConformalGeometry", "conformal_geometry", "count_cut_cells",
     # sources
     "Waveform", "GaussianPulse", "Sinusoid",
     "Source", "PointSource", "ArraySource", "PlaneSource", "GaussianBeam",

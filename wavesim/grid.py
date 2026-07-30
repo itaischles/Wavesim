@@ -127,9 +127,46 @@ class FDTDGrid:
     pec_mask: np.ndarray = field(default=None)
 
     # ------------------------------------------------------------------ #
+    # Conformal (Dey–Mittra) PEC — shape (Nx, Ny, Nz), dimensionless ∈ [0,1]
+    #
+    # ``pec_edge_open_x[i,j,k]`` is the fraction of the Yee E-edge ``Ex[i,j,k]``
+    # (node (i,j,k) → (i+1,j,k)) that is NOT inside a conductor; likewise _y/_z.
+    # ``pec_face_open_z[i,j,k]`` is the fraction of the Yee H-face ``Hz[i,j,k]``
+    # (nodes (i..i+1, j..j+1) at node-plane k) that is not inside a conductor;
+    # likewise _x/_y. Component naming follows eps_*/mu_*: ``_x`` is what Ex /
+    # Hx sees.
+    #
+    # Fractions, not metres: the solver multiplies by its own dxp/dyp/dzp, so
+    # the geometry has exactly one owner and the convention survives a
+    # non-uniform grid. See wavesim.pec.conformal_geometry.
+    #
+    # All six are set together or not at all. ``None`` (the default) selects the
+    # legacy staircase path, which is bit-identical to the pre-conformal solver.
+    # ``pec_mask`` remains the fully-covered test and is unaffected.
+    # ------------------------------------------------------------------ #
+    pec_edge_open_x: np.ndarray = field(default=None)
+    pec_edge_open_y: np.ndarray = field(default=None)
+    pec_edge_open_z: np.ndarray = field(default=None)
+    pec_face_open_x: np.ndarray = field(default=None)
+    pec_face_open_y: np.ndarray = field(default=None)
+    pec_face_open_z: np.ndarray = field(default=None)
+
+    # ------------------------------------------------------------------ #
     # Simulation time
     # ------------------------------------------------------------------ #
     time_step: int = 0
+
+    # ------------------------------------------------------------------ #
+    # Conformal PEC predicate
+    # ------------------------------------------------------------------ #
+    @property
+    def is_conformal(self) -> bool:
+        """True when conformal PEC fraction arrays are present.
+
+        The single place the conformal/staircase branch is decided, so callers
+        never have to remember which of the six arrays to test.
+        """
+        return self.pec_face_open_x is not None
 
     # ------------------------------------------------------------------ #
     # Coordinate conversion — metres -> cell index
