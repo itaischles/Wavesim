@@ -262,6 +262,58 @@ def test_conformal_launch_profile_is_exactly_symmetric():
     assert _mirror_asymmetry(_coax(0.5e-3, 'staircase')) > 0.5
 
 
+def _circulation(H, grid, ic, jc, m):
+    """``∮Ĥ·dl`` on a square Yee contour of half-width ``m`` cells.
+
+    ``Hx[i,j]`` is an x-directed edge from node i to i+1 at node j, ``Hy[i,j]``
+    a y-directed edge from node j to j+1 at node i, so this rectangle closes
+    exactly on the staggered grid.
+    """
+    i = np.arange(ic - m, ic + m)
+    j = np.arange(jc - m, jc + m)
+    return ((H['Hx'][i, jc - m] * grid.dxp[i]).sum()
+            + (H['Hy'][ic + m, j] * grid.dyp[j]).sum()
+            - (H['Hx'][i, jc + m] * grid.dxp[i]).sum()
+            - (H['Hy'][ic - m, j] * grid.dyp[j]).sum())
+
+
+def test_launched_h_sheet_carries_the_exact_modal_current():
+    """``∮Ĥ·dl`` = V/Z₀ on every contour enclosing the inner conductor.
+
+    Ampère says the enclosed current is the same on any such loop, so this is
+    two properties in one: the launch impresses the *right* current, and its Ĥ
+    is curl-free in the gap. Measured on the reference coax at 0.5 mm:
+
+        staircase   1.0758 → 1.0720 of V/Z₀ as the loop grows (7% high, drifting)
+        conformal   1.0004 → 1.0004                           (loop-independent)
+
+    The drift is the interesting half. A staircase Ĥ carries spurious
+    distributed curl in what should be empty gap, so the enclosed current
+    depends on where you measure it — the field is not a valid magnetostatic
+    one. That is also why only the conformal launch traps a DC current (R8 in
+    the plan): its deposited static field is genuinely curl-free, hence a null
+    mode of the leapfrog that nothing removes, while the staircase one has curl,
+    couples to E, and decays.
+    """
+    cell = 0.5e-3
+    ic = jc = int(round(0.5 * int(round(2 * B_OUT / cell))))
+    ratios = {}
+    for geometry in ('staircase', 'conformal'):
+        grid = _coax(cell, geometry)
+        mode = _mode(grid)
+        _E, H = mode._staggered_port_fields(grid)
+        ratios[geometry] = [_circulation(H, grid, ic, jc, m) * mode.impedance
+                            for m in (8, 10, 12)]
+
+    conf = np.array(ratios['conformal'])
+    assert np.abs(conf - 1.0).max() < 5e-3, f"modal current off by {conf}"
+    assert np.ptp(conf) < 1e-3, f"conformal Ĥ not curl-free in the gap: {conf}"
+
+    stair = np.array(ratios['staircase'])
+    assert np.abs(stair - 1.0).min() > 0.05        # ~7% high
+    assert np.ptp(stair) > 10 * np.ptp(conf)       # and drifting with the loop
+
+
 def test_admittance_scale_is_unity_for_a_homogeneous_fill():
     """``s = 1/(Z₀·G)`` collapses to 1 — the two are now the same integral.
 
