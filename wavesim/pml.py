@@ -63,6 +63,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from wavesim.grid import FDTDGrid
+from wavesim.pec import conformal_geometry
 from wavesim.constants import EPS0, MU0, ETA0
 
 
@@ -412,6 +413,16 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     carries only the active PML indices sel_*H, so the recursion and correction
     are restricted to those indices via fancy indexing — bit-identical to the
     full-volume formulation since every dropped cell held 0.
+
+    Conformal PEC
+    -------------
+    A conductor may cross the absorbing shell (microstrip, waveguide wall, coax
+    shield), and staircasing it there while the interior is conformal would put a
+    geometry step right at the absorber — itself a reflection source. Since the
+    CPML correction is purely additive on top of update_H and the conformal curl
+    stays separable per axis, the fix is simply to feed the psi recursion the
+    conformal derivative. Everything below the derivative — the recursion, the
+    signs, the dt/(MU0*mu) correction — is untouched.
     """
     dt = grid.dt
     Nz = grid.Nz
@@ -421,16 +432,36 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     # these are the constant PML spacing → bit-identical to the old scalar /ds.
     dxp, dyp, dzp = cpml.dxp_sH, cpml.dyp_sH, cpml.dzp_sH
 
+    conf = conformal_geometry(grid)
+
+    def dE(F, L_name, invA_name, axis, sel, dp):
+        """One E-derivative of the H-side curl, over the slab ``sel`` on ``axis``.
+
+        Staircase:  (F[sel+1] − F[sel]) / dp
+        Conformal:  (F[sel+1]·L[sel+1] − F[sel]·L[sel]) · (1/A_open[sel])
+
+        which is the same contour-integral edge pair as the interior kernel, so
+        the two agree cell-for-cell across the PML interface.
+        """
+        lo = np.take(F, sel, axis=axis)
+        hi = np.take(F, sel + 1, axis=axis)
+        if conf is None:
+            return (hi - lo) / dp
+        L = getattr(conf, L_name)
+        return (hi * np.take(L, sel + 1, axis=axis)
+                - lo * np.take(L, sel, axis=axis)) \
+            * np.take(getattr(conf, invA_name), sel, axis=axis)
+
     # ---------- Hx  (curl term: dEz/dy - dEy/dz) ----------
     # dEz/dy lives at the Hx location -> non-staggered (H) profile along y.
-    dEz_dy = (grid.Ez[:, sy + 1, :] - grid.Ez[:, sy, :]) / dyp        # (Nx, n_yH, Nz)
+    dEz_dy = dE(grid.Ez, 'Lz', 'inv_Ax', 1, sy, dyp)                  # (Nx, n_yH, Nz)
     cpml.psi_Ez_y = cpml.byH_s * cpml.psi_Ez_y + cpml.cyH_s * dEz_dy
 
     if Nz > 1:
         grid.Hx[:, sy, :-1] -= (dt / (MU0 * grid.mu_x[:, sy, :-1])) \
             * cpml.psi_Ez_y[:, :, :-1]
 
-        dEy_dz = (grid.Ey[:, :, sz + 1] - grid.Ey[:, :, sz]) / dzp    # (Nx, Ny, n_zH)
+        dEy_dz = dE(grid.Ey, 'Ly', 'inv_Ax', 2, sz, dzp)              # (Nx, Ny, n_zH)
         cpml.psi_Ey_z = cpml.bzH_s * cpml.psi_Ey_z + cpml.czH_s * dEy_dz
         grid.Hx[:, :-1, sz] += (dt / (MU0 * grid.mu_x[:, :-1, sz])) \
             * cpml.psi_Ey_z[:, :-1, :]
@@ -439,14 +470,14 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
 
     # ---------- Hy  (curl term: dEx/dz - dEz/dx) ----------
     # dEz/dx lives at the Hy location -> non-staggered (H) profile along x.
-    dEz_dx = (grid.Ez[sx + 1, :, :] - grid.Ez[sx, :, :]) / dxp        # (n_xH, Ny, Nz)
+    dEz_dx = dE(grid.Ez, 'Lz', 'inv_Ay', 0, sx, dxp)                  # (n_xH, Ny, Nz)
     cpml.psi_Ez_x = cpml.bxH_s * cpml.psi_Ez_x + cpml.cxH_s * dEz_dx
 
     if Nz > 1:
         grid.Hy[sx, :, :-1] += (dt / (MU0 * grid.mu_y[sx, :, :-1])) \
             * cpml.psi_Ez_x[:, :, :-1]
 
-        dEx_dz = (grid.Ex[:, :, sz + 1] - grid.Ex[:, :, sz]) / dzp    # (Nx, Ny, n_zH)
+        dEx_dz = dE(grid.Ex, 'Lx', 'inv_Ay', 2, sz, dzp)              # (Nx, Ny, n_zH)
         cpml.psi_Ex_z = cpml.bzH_s * cpml.psi_Ex_z + cpml.czH_s * dEx_dz
         grid.Hy[:-1, :, sz] -= (dt / (MU0 * grid.mu_y[:-1, :, sz])) \
             * cpml.psi_Ex_z[:-1, :, :]
@@ -455,13 +486,13 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
 
     # ---------- Hz  (curl term: dEy/dx - dEx/dy) ----------
     # dEy/dx lives at the Hz location -> non-staggered (H) profile along x.
-    dEy_dx = (grid.Ey[sx + 1, :, :] - grid.Ey[sx, :, :]) / dxp        # (n_xH, Ny, Nz)
+    dEy_dx = dE(grid.Ey, 'Ly', 'inv_Az', 0, sx, dxp)                  # (n_xH, Ny, Nz)
     cpml.psi_Ey_x = cpml.bxH_s * cpml.psi_Ey_x + cpml.cxH_s * dEy_dx
     grid.Hz[sx, :-1, :] -= (dt / (MU0 * grid.mu_z[sx, :-1, :])) \
         * cpml.psi_Ey_x[:, :-1, :]
 
     # dEx/dy lives at the Hz location -> non-staggered (H) profile along y.
-    dEx_dy = (grid.Ex[:, sy + 1, :] - grid.Ex[:, sy, :]) / dyp        # (Nx, n_yH, Nz)
+    dEx_dy = dE(grid.Ex, 'Lx', 'inv_Az', 1, sy, dyp)                  # (Nx, n_yH, Nz)
     cpml.psi_Ex_y = cpml.byH_s * cpml.psi_Ex_y + cpml.cyH_s * dEx_dy
     grid.Hz[:-1, sy, :] += (dt / (MU0 * grid.mu_z[:-1, sy, :])) \
         * cpml.psi_Ex_y[:-1, :, :]

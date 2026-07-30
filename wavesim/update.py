@@ -40,12 +40,21 @@ guarded by a plain `if Nz > 1`, and is bit-identical to this reference.
 import numpy as np
 from wavesim.grid import FDTDGrid
 from wavesim.constants import MU0, EPS0
+from wavesim.pec import conformal_geometry
 
 
 def update_H(grid: FDTDGrid) -> FDTDGrid:
     """
     Advance H fields by half a timestep using the full 3D curl of E.
+
+    Dispatches to the conformal (Dey–Mittra) cut-cell form when the grid carries
+    open-fraction geometry. The staircase branch below is left exactly as it was
+    — a model with no conductors must not pay for the six extra array reads per
+    face that the conformal form costs.
     """
+    if grid.is_conformal:
+        return _update_H_conformal(grid)
+
     dt = grid.dt
     # Every H derivative differences an E field that sits on an integer NODE along
     # the differenced axis (Ez[i,j,k] is at y[j]; Ey[i,j,k] is at x[i]), so the
@@ -93,6 +102,80 @@ def update_H(grid: FDTDGrid) -> FDTDGrid:
 
     grid.Hz[:-1, :-1, :] -= (dt / (MU0 * grid.mu_z[:-1, :-1, :])) * (
         dEy_dx[:, :-1, :] - dEx_dy[:-1, :, :]
+    )
+
+    return grid
+
+
+def _update_H_conformal(grid: FDTDGrid) -> FDTDGrid:
+    """Faraday on cut cells: the same contour integral, with the covered parts of
+    the contour removed and the *open* face area as the denominator.
+
+        Hz[i,j,k] -= (dt/(μ·A_open)) · [ Ey[i+1,j,k]·Ly[i+1,j,k] − Ey[i,j,k]·Ly[i,j,k]
+                                       − Ex[i,j+1,k]·Lx[i,j+1,k] + Ex[i,j,k]·Lx[i,j,k] ]
+
+    with Hx and Hy the cyclic permutations. ``L`` is the open length of the E edge
+    (metres) and ``A_open`` the open area of the H face.
+
+    Where nothing is cut, ``L`` is the full primary width and ``A_open`` the full
+    face area, and every term reduces **algebraically** to the staircase branch.
+    Not bit-identically, though: this form evaluates ``(E₁·d − E₀·d)/(d·d')``
+    where the staircase branch evaluates ``(E₁ − E₀)/d'``, and floating-point
+    multiplication does not distribute exactly. Measured agreement is 1–2 ULP
+    (``tests/test_conformal_update.py``). Exact bit-identity is the property of
+    the *absent* case — no fraction arrays at all, which dispatches to the
+    staircase branch above and cannot differ by construction.
+
+    E on a partially covered edge is the unknown representing the field on the
+    *open* part of that edge, so the E update needs no conformal form at all.
+    """
+    dt = grid.dt
+    g = conformal_geometry(grid)
+
+    # Flux-weighted edge fields: the E·dl contributions, ready to difference.
+    ExL = grid.Ex * g.Lx
+    EyL = grid.Ey * g.Ly
+    EzL = grid.Ez * g.Lz
+
+    # ------------------------------------------------------------------
+    # Hx — contour (Ez[i,j,k], Ez[i,j+1,k], Ey[i,j,k], Ey[i,j,k+1])
+    # ------------------------------------------------------------------
+    dEzL_y = EzL[:, 1:, :] - EzL[:, :-1, :]
+
+    if grid.Nz > 1:
+        dEyL_z = EyL[:, :, 1:] - EyL[:, :, :-1]
+        grid.Hx[:, :-1, :-1] -= (dt / (MU0 * grid.mu_x[:, :-1, :-1])
+                                 * g.inv_Ax[:, :-1, :-1]) * (
+            dEzL_y[:, :, :-1] - dEyL_z[:, :-1, :]
+        )
+    else:
+        grid.Hx[:, :-1, :] -= (dt / (MU0 * grid.mu_x[:, :-1, :])
+                               * g.inv_Ax[:, :-1, :]) * dEzL_y
+
+    # ------------------------------------------------------------------
+    # Hy — contour (Ex[i,j,k], Ex[i,j,k+1], Ez[i,j,k], Ez[i+1,j,k])
+    # ------------------------------------------------------------------
+    dEzL_x = EzL[1:, :, :] - EzL[:-1, :, :]
+
+    if grid.Nz > 1:
+        dExL_z = ExL[:, :, 1:] - ExL[:, :, :-1]
+        grid.Hy[:-1, :, :-1] -= (dt / (MU0 * grid.mu_y[:-1, :, :-1])
+                                 * g.inv_Ay[:-1, :, :-1]) * (
+            dExL_z[:-1, :, :] - dEzL_x[:, :, :-1]
+        )
+    else:
+        grid.Hy[:-1, :, :] -= (dt / (MU0 * grid.mu_y[:-1, :, :])
+                               * g.inv_Ay[:-1, :, :]) * (-dEzL_x)
+
+    # ------------------------------------------------------------------
+    # Hz — contour (Ey[i,j,k], Ey[i+1,j,k], Ex[i,j,k], Ex[i,j+1,k])
+    # ------------------------------------------------------------------
+    dEyL_x = EyL[1:, :, :] - EyL[:-1, :, :]
+    dExL_y = ExL[:, 1:, :] - ExL[:, :-1, :]
+
+    grid.Hz[:-1, :-1, :] -= (dt / (MU0 * grid.mu_z[:-1, :-1, :])
+                             * g.inv_Az[:-1, :-1, :]) * (
+        dEyL_x[:, :-1, :] - dExL_y[:-1, :, :]
     )
 
     return grid

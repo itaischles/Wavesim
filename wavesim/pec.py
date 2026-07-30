@@ -153,11 +153,16 @@ class ConformalGeometry:
 
     ``Lx``/``Ly``/``Lz`` — open length (m) of the E edges ``Ex``/``Ey``/``Ez``.
     ``Ax``/``Ay``/``Az`` — open area (m²) of the H faces ``Hx``/``Hy``/``Hz``.
+    ``inv_Ax``/``inv_Ay``/``inv_Az`` — ``1/A_open`` (m⁻²) for the update kernels.
 
-    An entry of zero is a fully covered edge or face; ``Ax`` etc. are areas, not
-    reciprocals, precisely so that the ``1/A_open → ∞`` question stays with the
-    update kernel and the small-cut threshold (S4) rather than being baked in
-    here.
+    An entry of zero in ``L`` or ``A`` is a fully covered edge or face. The
+    reciprocal is **guarded**: a fully covered face gets ``inv_A = 0`` rather
+    than an infinity, which freezes H there — correct, since the face lies
+    wholly inside the conductor and all four of its edges are zeroed too, so the
+    contour integral is 0 and the update would otherwise be 0/0.
+
+    The guard is also where the small-cut area threshold (S4) belongs: treating a
+    sliver face as fully PEC is exactly ``inv_A = 0`` for that face.
     """
     Lx: np.ndarray
     Ly: np.ndarray
@@ -165,6 +170,9 @@ class ConformalGeometry:
     Ax: np.ndarray
     Ay: np.ndarray
     Az: np.ndarray
+    inv_Ax: np.ndarray
+    inv_Ay: np.ndarray
+    inv_Az: np.ndarray
 
 
 def build_conformal_geometry(grid: FDTDGrid) -> ConformalGeometry:
@@ -182,14 +190,24 @@ def build_conformal_geometry(grid: FDTDGrid) -> ConformalGeometry:
     dyp = grid.dyp[None, :, None]
     dzp = grid.dzp[None, None, :]
 
+    Ax = grid.pec_face_open_x * (dyp * dzp)
+    Ay = grid.pec_face_open_y * (dzp * dxp)
+    Az = grid.pec_face_open_z * (dxp * dyp)
+
     return ConformalGeometry(
         Lx=grid.pec_edge_open_x * dxp,
         Ly=grid.pec_edge_open_y * dyp,
         Lz=grid.pec_edge_open_z * dzp,
-        Ax=grid.pec_face_open_x * (dyp * dzp),
-        Ay=grid.pec_face_open_y * (dzp * dxp),
-        Az=grid.pec_face_open_z * (dxp * dyp),
+        Ax=Ax, Ay=Ay, Az=Az,
+        inv_Ax=_guarded_inverse(Ax),
+        inv_Ay=_guarded_inverse(Ay),
+        inv_Az=_guarded_inverse(Az),
     )
+
+
+def _guarded_inverse(area: np.ndarray) -> np.ndarray:
+    """``1/area`` where the face is open, ``0`` where it is fully covered."""
+    return np.divide(1.0, area, out=np.zeros_like(area), where=area > 0.0)
 
 
 def conformal_geometry(grid: FDTDGrid):
