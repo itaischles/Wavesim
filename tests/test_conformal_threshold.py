@@ -1,9 +1,9 @@
 """S4 — the small-cut area threshold, and the conformal reference case.
 
-``dt/(μ·A_open)`` diverges as a cut cell shrinks, so faces whose open fraction
-falls below ``grid.conformal_area_threshold`` are treated as fully PEC. The
-timestep is deliberately left alone: reducing dt would perturb every existing
-result and ``summary["dt"]``.
+``dt/(μ·A_open)`` diverges as a cut cell shrinks, so a face whose open fraction
+falls below ``grid.conformal_area_threshold`` has its area clamped to
+``threshold·A_full``. The timestep is deliberately left alone: reducing dt would
+perturb every existing result and ``summary["dt"]``.
 
 This is not a refinement — it is load-bearing. An analytic coax on a 32-cell
 transverse mesh produces open-area fractions down to 0.011, and the run
@@ -62,34 +62,46 @@ def test_default_threshold_is_documented_value():
     assert create_grid(4, 4, 4, 1e-3).conformal_area_threshold == 0.4
 
 
-def test_sliver_face_is_suppressed_and_counted():
+def test_sliver_face_area_is_clamped_not_killed():
+    """The face keeps integrating its contour; only the coefficient is bounded.
+
+    Killing it instead (inv_A = 0) leaves the four edges of its contour carrying
+    E while H is frozen — an E/H mismatch that costs ε_eff dearly. See
+    test_conformal_coax_eps_eff_matches_the_fill.
+    """
     grid = _cut_grid(0.05, threshold=0.4)
     g = conformal_geometry(grid)
-    assert g.inv_Az[8, 8, 8] == 0.0            # treated as fully PEC
-    assert g.Az[8, 8, 8] > 0.0                 # the area itself is untouched
-    assert g.n_suppressed == 1
+    full = grid.dxp[8] * grid.dyp[8]
+    assert g.inv_Az[8, 8, 8] == pytest.approx(1.0 / (0.4 * full), rel=1e-12)
+    assert g.inv_Az[8, 8, 8] > 0.0             # still live
+    assert g.Az[8, 8, 8] > 0.0                 # the true area is untouched
+    assert g.n_clamped == 1
 
 
 def test_face_above_threshold_is_untouched():
     grid = _cut_grid(0.45, threshold=0.4)
     g = conformal_geometry(grid)
     assert g.inv_Az[8, 8, 8] == pytest.approx(1.0 / g.Az[8, 8, 8], rel=1e-12)
-    assert g.n_suppressed == 0
+    assert g.n_clamped == 0
 
 
-def test_threshold_zero_keeps_every_cut_but_still_guards_zero_area():
-    grid = _cut_grid(0.0, threshold=0.0)
-    g = conformal_geometry(grid)
-    assert g.inv_Az[8, 8, 8] == 0.0            # fully covered, not 1/0
-    assert g.n_suppressed == 0                 # nothing *thresholded* away
-    assert np.all(np.isfinite(g.inv_Az))
+def test_fully_covered_face_stays_frozen_whatever_the_threshold():
+    """Clamping applies to *cut* faces. A face with no open area at all has no
+    contour either — all four of its edges are zeroed — so it stays at inv_A = 0
+    and there is no mismatch to create."""
+    for thr in (0.0, 0.4):
+        grid = _cut_grid(0.0, threshold=thr)
+        g = conformal_geometry(grid)
+        assert g.inv_Az[8, 8, 8] == 0.0
+        assert g.n_clamped == 0
+        assert np.all(np.isfinite(g.inv_Az))
 
 
 def test_threshold_change_invalidates_the_cache():
     grid = _cut_grid(0.2, threshold=0.4)
-    assert conformal_geometry(grid).n_suppressed == 1
+    assert conformal_geometry(grid).n_clamped == 1
     grid.conformal_area_threshold = 0.1
-    assert conformal_geometry(grid).n_suppressed == 0
+    assert conformal_geometry(grid).n_clamped == 0
 
 
 @pytest.mark.parametrize("bad", [1.0, 1.5, -0.1])
@@ -137,21 +149,26 @@ def test_analytic_coax_produces_slivers_far_below_the_threshold():
     grid, _, _ = _coax(2.3, 32, 3, 0.4)
     open_z = grid.pec_face_open_z
     assert open_z[open_z > 0].min() < 0.05
-    assert conformal_geometry(grid).n_suppressed > 0
+    assert conformal_geometry(grid).n_clamped > 0
 
 
 @pytest.mark.slow
-def test_conformal_coax_runs_stably_and_records_eps_eff():
-    """Homogeneous fill ⇒ LC = με ⇒ v = c/√ε_r whatever the conductor geometry.
+def test_conformal_coax_eps_eff_matches_the_fill():
+    """V1 — homogeneous fill ⇒ LC = με ⇒ v = c/√ε_r whatever the conductor
+    geometry. Staircasing, cut cells and clamped slivers can move Z₀; none of
+    them may move ε_eff.
 
-    Stability is the S4 gate and is asserted tightly. ε_eff is only *recorded*
-    here, because it cannot be exact yet: H integrates the conformal contour
-    while ``apply_pec_mask`` still zeroes E by the staircase dilation, so E and H
-    see different geometry — the very inconsistency S3 exists to remove. Measured
-    today: staircase +0.29%, conformal +1.83% (threshold 0.4), +2.91% (0.5).
+    This is the S3 gate, and it is a genuine assertion now that E and H are both
+    derived from the cut geometry. Measured by time-domain velocity, whose own
+    resolution is ~0.3%:
 
-    The bound below is a regression floor, not a target. **S3 must bring this to
-    the staircase level or better**; if it does not, S3 is wrong.
+        staircase                        +0.29%
+        conformal, threshold 0.4         +0.21%   ← at or better than staircase
+        conformal, threshold 0.5         +1.03%   ← the cost of over-clamping
+
+    Two earlier configurations failed this and are why the bound is tight:
+    conformal H with the staircase dilation still on E read +1.83%, and killing
+    sliver faces instead of clamping them read +5.77%.
     """
     eps_r, n, nz, f_max = 2.3, 32, 256, 40e9
     k_src, k_p1, k_p2 = 24, 70, 200
@@ -186,5 +203,5 @@ def test_conformal_coax_runs_stably_and_records_eps_eff():
 
     v_meas = (k_p2 - k_p1) * ds / (peak_time(probes[1]) - peak_time(probes[0]))
     eps_eff = (C0 / v_meas) ** 2
-    assert eps_eff == pytest.approx(eps_r, rel=0.03), (
+    assert eps_eff == pytest.approx(eps_r, rel=0.005), (
         f"eps_eff {eps_eff:.4f} vs {eps_r} (v = {v_meas:.4e} m/s)")

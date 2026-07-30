@@ -122,7 +122,20 @@ def apply_pec_mask(grid: FDTDGrid) -> FDTDGrid:
     mutating it **in place** after the first step does not, so call
     :func:`build_pec_edge_masks` yourself (or clear ``grid._pec_edge_cache``) if
     you need to do that mid-run.
+
+    Conformal PEC
+    -------------
+    With cut-cell geometry present the dilation is **replaced** by the
+    geometrically exact rule — zero an edge iff its open length is zero. The
+    dilation was a conservative over-zeroing that bought E/H consistency at the
+    price of losing the sub-cell geometry; under conformal PEC that consistency
+    comes from E and H being derived from the *same* cut geometry instead, which
+    is the proper fix rather than the safe one. See
+    :func:`build_conformal_edge_masks`.
     """
+    if grid.is_conformal:
+        return _apply_conformal_edge_mask(grid)
+
     if grid.pec_mask is None:
         return grid
 
@@ -138,6 +151,42 @@ def apply_pec_mask(grid: FDTDGrid) -> FDTDGrid:
     grid.Ey[ey] = 0.0
     grid.Ez[ez] = 0.0
 
+    return grid
+
+
+def build_conformal_edge_masks(grid: FDTDGrid) -> tuple:
+    """Per-component E masks from cut geometry: ``(ex, ey, ez)``.
+
+    An edge is inside the conductor iff **none** of it is open. A partially
+    covered edge stays alive and carries the field on its open part — that is
+    what the unknown means in the conformal formulation, and it is exactly the
+    sub-cell information the staircase dilation threw away.
+
+    Note this is a *weaker* condition than the staircase rule it replaces, which
+    zeroed an edge when any of the four cells touching it was PEC. E therefore
+    survives closer to the metal than before, and that is intended: the H update
+    now integrates the same cut contour, so the two agree. Restoring the
+    dilation on top of this would reintroduce the mismatch in the other
+    direction.
+    """
+    return (grid.pec_edge_open_x == 0.0,
+            grid.pec_edge_open_y == 0.0,
+            grid.pec_edge_open_z == 0.0)
+
+
+def _apply_conformal_edge_mask(grid: FDTDGrid) -> FDTDGrid:
+    """Zero E on fully covered edges; cached like the staircase edge masks."""
+    key = (grid.pec_edge_open_x, grid.pec_edge_open_y, grid.pec_edge_open_z)
+
+    cache = getattr(grid, '_conformal_edge_cache', None)
+    if cache is None or any(a is not b for a, b in zip(cache[0], key)):
+        cache = (key,) + build_conformal_edge_masks(grid)
+        grid._conformal_edge_cache = cache
+    _, ex, ey, ez = cache
+
+    grid.Ex[ex] = 0.0
+    grid.Ey[ey] = 0.0
+    grid.Ez[ez] = 0.0
     return grid
 
 
@@ -162,10 +211,10 @@ class ConformalGeometry:
     contour integral is 0 and the update would otherwise be 0/0.
 
     The guard also carries the small-cut area threshold: a face whose open
-    fraction is below ``grid.conformal_area_threshold`` is treated as fully PEC,
-    which is exactly ``inv_A = 0`` for that face. ``n_suppressed`` counts how
-    many faces that hit — a number worth watching, since every one of them is a
-    cut the run staircased rather than resolved.
+    fraction is below ``grid.conformal_area_threshold`` has its area **clamped**
+    to ``threshold·A_full``, bounding the coefficient without disturbing the
+    contour. ``n_clamped`` counts how many faces that hit — worth watching, since
+    every one is a cut whose geometry the run only partly resolved.
     """
     Lx: np.ndarray
     Ly: np.ndarray
@@ -176,7 +225,7 @@ class ConformalGeometry:
     inv_Ax: np.ndarray
     inv_Ay: np.ndarray
     inv_Az: np.ndarray
-    n_suppressed: int = 0
+    n_clamped: int = 0
 
 
 def build_conformal_geometry(grid: FDTDGrid) -> ConformalGeometry:
@@ -199,9 +248,9 @@ def build_conformal_geometry(grid: FDTDGrid) -> ConformalGeometry:
     Az = grid.pec_face_open_z * (dxp * dyp)
 
     thr = float(grid.conformal_area_threshold)
-    inv_Ax, nx = _guarded_inverse(Ax, grid.pec_face_open_x, thr)
-    inv_Ay, ny = _guarded_inverse(Ay, grid.pec_face_open_y, thr)
-    inv_Az, nz = _guarded_inverse(Az, grid.pec_face_open_z, thr)
+    inv_Ax, nx = _guarded_inverse(Ax, grid.pec_face_open_x, thr, dyp * dzp)
+    inv_Ay, ny = _guarded_inverse(Ay, grid.pec_face_open_y, thr, dzp * dxp)
+    inv_Az, nz = _guarded_inverse(Az, grid.pec_face_open_z, thr, dxp * dyp)
 
     return ConformalGeometry(
         Lx=grid.pec_edge_open_x * dxp,
@@ -209,21 +258,37 @@ def build_conformal_geometry(grid: FDTDGrid) -> ConformalGeometry:
         Lz=grid.pec_edge_open_z * dzp,
         Ax=Ax, Ay=Ay, Az=Az,
         inv_Ax=inv_Ax, inv_Ay=inv_Ay, inv_Az=inv_Az,
-        n_suppressed=nx + ny + nz,
+        n_clamped=nx + ny + nz,
     )
 
 
 def _guarded_inverse(area: np.ndarray, fraction: np.ndarray,
-                     threshold: float) -> tuple:
-    """``(1/area, n_suppressed)``, with sliver and fully covered faces zeroed.
+                     threshold: float, full_area: np.ndarray) -> tuple:
+    """``(1/A_eff, n_clamped)`` — the bounded reciprocal open area.
+
+    Sliver faces are handled by **clamping** the area to the threshold,
+    ``A_eff = max(A_open, threshold·A_full)``, rather than by killing the face
+    outright. Both bound the ``1/A_open`` coefficient and so both cure the
+    small-cut instability, but only clamping keeps E and H looking at the same
+    geometry.
+
+    Killing the face (the plan's original wording, "treated as fully PEC")
+    freezes H there while the four edges of its contour keep carrying E, because
+    those edges are shared with neighbouring faces that are *not* suppressed and
+    cannot simply be zeroed. That mismatch is exactly what the homogeneous-fill
+    invariant detects: with it, ε_eff on the reference coax read +5.8% at
+    threshold 0.4 and +24.0% at 0.5, tracking the suppressed-face count. Clamping
+    brings both back to the staircase level, because the face still integrates
+    its true contour — only the coefficient is limited.
 
     Thresholding the *fraction* rather than the area keeps the rule
     resolution-independent on a graded mesh, where ``A_full`` varies per cell.
     """
-    live = (fraction >= threshold) & (area > 0.0)
-    inv = np.divide(1.0, area, out=np.zeros_like(area), where=live)
-    n_suppressed = int(np.count_nonzero((fraction > 0.0) & ~live))
-    return inv, n_suppressed
+    open_face = fraction > 0.0
+    a_eff = np.maximum(area, threshold * full_area)
+    inv = np.divide(1.0, a_eff, out=np.zeros_like(area), where=open_face)
+    n_clamped = int(np.count_nonzero(open_face & (fraction < threshold)))
+    return inv, n_clamped
 
 
 def conformal_geometry(grid: FDTDGrid):

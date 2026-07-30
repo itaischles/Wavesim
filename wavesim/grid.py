@@ -167,11 +167,19 @@ class FDTDGrid:
     # ------------------------------------------------------------------ #
     # Small-cut area threshold (Dey–Mittra's own stability remedy).
     #
-    # ``dt/(μ·A_open)`` diverges as a cut cell shrinks, so H faces whose open
-    # *fraction* falls below this are treated as fully PEC (H frozen there).
+    # ``dt/(μ·A_open)`` diverges as a cut cell shrinks, so an H face whose open
+    # *fraction* falls below this has its area clamped to ``threshold·A_full``.
     # This keeps dt untouched — the alternative, reducing the timestep, would
-    # perturb every existing result — at the cost of reintroducing a little
-    # staircasing at the very smallest cuts.
+    # perturb every existing result — at the cost of a slightly too-weak update
+    # on the very smallest cuts.
+    #
+    # Clamping, NOT killing the face. Freezing H on a sliver face leaves the four
+    # edges of its contour still carrying E (they are shared with neighbouring
+    # faces that are not slivers, so they cannot simply be zeroed), and that E/H
+    # mismatch is exactly what the homogeneous-fill invariant catches: it read
+    # +5.8% at 0.4 and +24.0% at 0.5 on the reference coax, against +0.2% for
+    # clamping. Both cure the instability; only clamping keeps the geometry
+    # consistent.
     #
     # A fraction rather than an area, so the rule is the same on a graded mesh.
     # Measured on a single isolated cut cell (cubic cells, CFL 0.99): stable at
