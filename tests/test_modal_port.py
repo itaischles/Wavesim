@@ -121,8 +121,9 @@ def test_low_face_requires_one_cell_in():
 
 @pytest.mark.slow
 def test_z1_face_absorbs_without_pml():
-    """High-index face terminates the coax TEM at < −20 dB, PML only on the far
-    (launch) side."""
+    """High-index face terminates the coax TEM at < −28 dB, PML only on the far
+    (launch) side. The bound locks in the read-back time-shift (sampling V̄ at
+    n + h_tau, not the naïve n−½): reverting it lifts reflection back to ~−25 dB."""
     g, c, rp = _coax(nz=50)
     cpml = ws.init_cpml(g, d_pml=8, faces=('z0',))
     sim = ws.Simulation(g, cpml=cpml, pec_faces=('x0', 'x1', 'y0', 'y1'),
@@ -134,7 +135,7 @@ def test_z1_face_absorbs_without_pml():
     for _ in range(int(round(1.2e-9 / g.dt))):
         sim.step()
     db = _reflection_db(np.array(mon.times) * 1e9, np.array(mon.values), 0.33)
-    assert db < -20.0, f"z1 face reflection {db:.1f} dB (want < −20)"
+    assert db < -28.0, f"z1 face reflection {db:.1f} dB (want < −28)"
 
 
 @pytest.mark.slow

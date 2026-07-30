@@ -1135,10 +1135,16 @@ class ModalPort:
 
     where ``ê`` is the 1 V-normalised staggered mode E-profile
     (:meth:`~wavesim.mode_solver.TEMMode._staggered_port_fields`), ``Y₀ = 1/η`` the
-    local wave admittance, ``V̄ = ½(Vⁿ + Vⁿ⁻¹)`` the time-centred modal voltage
-    (ε-weighted overlap projection, :meth:`build_port_kernel`), ``a =
-    amplitude·waveform(t)`` the drive, and ``s`` the numerical-admittance
-    correction ``admittance_scale``. The ``−2a`` term makes the sheet radiate a
+    local wave admittance, ``V̄`` the modal voltage (ε-weighted overlap
+    projection, :meth:`build_port_kernel`) sampled at ``n + h_tau`` — the E↔H
+    space-time offset ``dt/2 − dn/(2·v)`` the launch already applies to its H
+    sheet, interpolated from the read-back history — ``a = amplitude·waveform(t)``
+    the drive, and ``s`` the numerical-admittance correction ``admittance_scale``.
+    Sampling ``V̄`` at the shifted instant rather than the naïve ``½(Vⁿ+Vⁿ⁻¹)``
+    (n−½) removes an O(ω·dt) phase error and is the difference between a ~−25 dB
+    and a ~−33 dB coax termination; it is exact at DC, so DC-exactness stands.
+
+    The ``−2a`` term makes the sheet radiate a
     forward wave of ``a`` volts inward *and* absorb whatever returns, from one
     expression. The sign ``±`` and the ghost-H plane index depend on the face:
     the high-index face (e.g. ``z1``) writes the ghost H at the mode's own index
@@ -1184,13 +1190,13 @@ class ModalPort:
         self.face = face
         self._scale_override = admittance_scale
         self._ready = False
-        self._v_prev = 0.0
         self.times: list = []
         self.voltages: list = []
 
     # -- one-time compile ---------------------------------------------------- #
     def _setup(self, grid: FDTDGrid) -> None:
-        from wavesim.mode_solver import _plane_to_grid, _NORMAL_CFG
+        from wavesim.mode_solver import (_plane_to_grid, _NORMAL_CFG,
+                                         _launch_time_shift, _normal_width)
 
         normal = self.mode.normal
         k = self.mode.slice_index
@@ -1236,6 +1242,22 @@ class ModalPort:
             self._scale = float(self._scale_override)
         else:
             self._scale = self.mode.numerical_admittance_scale(grid)
+
+        # Read-back time-shift. The ghost H written here is consumed by the E
+        # update as H^{n+½}, so the matched modal voltage must be sampled at
+        # n + h_tau, where ``h_tau = dt/2 − dn/(2·v)`` is the *same* E↔H
+        # space-time offset the directional launch already applies to its H
+        # sheet (:meth:`build_port_kernel`). The naive n−½ average left an
+        # O(ω·dt) phase error that was the dominant reflection floor (~−25 dB on
+        # a coax; ~−33 dB once shifted). ``read_tau`` is that offset in steps
+        # (≤ 0). DC-safe: at DC ``V`` is constant, so the shift changes nothing
+        # and the DC-exact termination is preserved. ``frequency=None`` keeps the
+        # broadband continuum velocity, matching the mode's launch counterpart.
+        v_ph = self.mode.v_phase if self.mode.v_phase else C0
+        dn = float(_normal_width(grid, normal)[self._h_k])
+        self._read_tau = _launch_time_shift(grid.dt, dn, v_ph, None) / grid.dt
+        self._hist_len = int(np.ceil(max(-self._read_tau, 0.0))) + 2
+        self._v_hist = []
         self._ready = True
 
     # -- per-step boundary hook (runs between update_H and update_E) ---------- #
@@ -1245,12 +1267,25 @@ class ModalPort:
         V = 0.0
         for comp, (ii, jj, kk, w, coef) in self._edges.items():
             V += float(np.dot(getattr(grid, comp)[ii, jj, kk], w))
+        # Modal voltage sampled at n + read_tau (read_tau ≤ 0), by linear
+        # interpolation over the recent history (newest sample = V^n). Reading a
+        # past instant needs only stored samples — no extrapolation. Startup
+        # (history shorter than the offset) clamps to the oldest sample, where
+        # the fields are ~0 and the choice is immaterial.
+        self._v_hist.append(V)
+        if len(self._v_hist) > self._hist_len:
+            del self._v_hist[0]
+        s = -self._read_tau
+        i0 = int(np.floor(s))
+        frac = s - i0
+        h = self._v_hist
+        n = len(h)
+        v_shift = ((1.0 - frac) * h[-1 - min(i0, n - 1)]
+                   + frac * h[-1 - min(i0 + 1, n - 1)])
         a = self.amplitude * (self.waveform(t) if self.waveform is not None else 0.0)
-        v_centred = 0.5 * (V + self._v_prev)
-        amp = self._sign * self._scale * (v_centred - 2.0 * a)
+        amp = self._sign * self._scale * (v_shift - 2.0 * a)
         for comp, (ii, jj, kk, vals) in self._h.items():
             getattr(grid, comp)[ii, jj, kk] = amp * vals
-        self._v_prev = V
         self.times.append(t)
         self.voltages.append(V)
 
