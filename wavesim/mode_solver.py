@@ -327,9 +327,14 @@ class TEMMode:
         cfg = _NORMAL_CFG[self.normal]
         phi = self.phi
         Na, Nb = phi.shape
-        dual = {'x': grid.dxd, 'y': grid.dyd, 'z': grid.dzd}
-        da = dual[cfg['axes'][0]][:Na - 1][:, None]
-        db = dual[cfg['axes'][1]][:Nb - 1][None, :]
+        # PRIMARY widths: φ sits on nodes, so consecutive φ are one primary
+        # width apart. This is the same separation :func:`_face_coefs` divides
+        # by, which is what keeps ê an exact null vector of the operator that
+        # produced φ. (It read the dual widths before S5b — uniform-mesh
+        # equivalent, wrong on a graded one.)
+        prim = {'x': grid.dxp, 'y': grid.dyp, 'z': grid.dzp}
+        da = prim[cfg['axes'][0]][:Na - 1][:, None]
+        db = prim[cfg['axes'][1]][:Nb - 1][None, :]
         k = self.slice_index
         f_a, f_b = _plane_open_fractions(grid, cfg, self.normal, k)
         Ea = np.zeros_like(phi)
@@ -750,6 +755,25 @@ def _classify_conductors(labels, n_cond, boundary, ground):
 # Sparse weighted-Laplacian assembly and solve
 # ====================================================================== #
 
+def _node_dual(w: np.ndarray) -> np.ndarray:
+    """Dual-cell width owned by each node, from the per-cell primary widths.
+
+    Node ``j`` owns the cell centres either side of it, ``(w[j-1]+w[j])/2`` —
+    which is the grid's own ``dyd[j-1]``, recomputed here because the solver
+    only ever receives the primary widths of its (possibly sub-rectangular)
+    solve region. Node 0 sits on the region's edge and owns only the half cell
+    ``w[0]/2``.
+
+    That half cell is inert for ``boundary='ground'``, where the whole edge ring
+    is pinned and its coefficients are never assembled; it matters only under
+    ``'neumann'``, where a boundary node really does own half a control volume.
+    """
+    out = np.empty_like(w)
+    out[0] = 0.5 * w[0]
+    out[1:] = 0.5 * (w[:-1] + w[1:])
+    return out
+
+
 def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
     """Per-face conductances of the ε-weighted transverse Laplacian.
 
@@ -759,8 +783,20 @@ def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
 
         ``ε_face · face_length / centre_distance``
 
-    with ``face_length`` the cell width on the *other* axis and
-    ``centre_distance`` the dual width ``(w[i]+w[i+1])/2``.
+    φ lives on the Yee **nodes**, so the control volume of the equation at node
+    ``(i,j)`` is the *dual* cell spanning ``xc[i-1]..xc[i]`` — hence
+    ``face_length`` is a **dual** width on the other axis and
+    ``centre_distance`` is the **primary** width along the coupling axis (the
+    node-to-node separation, which is what ``E = Δφ/d`` divides by).
+
+    This pairing was originally the other way round — primary face length
+    against dual centre distance — which is S0's bug living in the mode solver
+    rather than in the kernels. A uniform mesh hides it exactly
+    (``dxp == dxd`` to the last ULP), so nothing caught it until the conformal
+    derivation made the node picture explicit. On a graded mesh it costs an
+    order: the discrete field of a parallel-plate line stops being uniform, so
+    even that exactly-solvable case comes out wrong
+    (``tests/test_mode_solver_spacing.py``).
 
     **Face permittivity** is the arithmetic mean of the two adjoining cells,
     EXCEPT where one of them is PEC. ε inside a conductor is not a material
@@ -773,10 +809,12 @@ def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
     restores A_filled = ε_r·A_air for a homogeneous fill.
 
     **Conformal PEC**: ``f_a``/``f_b`` scale the centre distance down to the
-    *open* edge length, ``L = f·centre_distance``, so the coefficient grows as
+    *open* edge length, ``L = f·primary width``, so the coefficient grows as
     ``1/f`` — a node just outside the metal sits a short distance from the
     surface and is therefore strongly coupled to it, which is the correct
-    Dirichlet behaviour. A fully covered edge (``f = 0``) gets coefficient 0
+    Dirichlet behaviour. With the pairing above this ``L`` is now literally the
+    open edge length the conformal derivation asks for, rather than the
+    uniform-mesh-equivalent ``f·dual`` S5 settled for. A fully covered edge (``f = 0``) gets coefficient 0
     and carries no flux equation at all; both of its endpoints are pinned by
     :func:`_conformal_node_pec`, so the constraint it stands for (equal φ) is
     imposed by the pinning instead.
@@ -788,10 +826,8 @@ def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
     that was actually solved.
     """
     Na, Nb = eps_a.shape
-    dac = 0.5 * (da_w[:-1] + da_w[1:])          # length Na-1, face i↔i+1
-    dbc = 0.5 * (db_w[:-1] + db_w[1:])          # length Nb-1
-    DA = da_w[:, None]                          # (Na, 1) a-widths (b-face length)
-    DB = db_w[None, :]                          # (1, Nb) b-widths (a-face length)
+    DA = _node_dual(da_w)[:, None]              # (Na, 1) dual a-widths (b-face)
+    DB = _node_dual(db_w)[None, :]              # (1, Nb) dual b-widths (a-face)
 
     def _eps_face(eps, src, nbr):
         ef = 0.5 * (eps[src] + eps[nbr])
@@ -804,8 +840,10 @@ def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
     sa, na = np.s_[0:Na - 1, :], np.s_[1:Na, :]
     sb, nb = np.s_[:, 0:Nb - 1], np.s_[:, 1:Nb]
 
-    la = np.broadcast_to(dac[:, None], (max(Na - 1, 0), Nb)).astype(np.float64)
-    lb = np.broadcast_to(dbc[None, :], (Na, max(Nb - 1, 0))).astype(np.float64)
+    # Coupling distance: the node-to-node separation, i.e. the PRIMARY width of
+    # the edge joining them — and under conformal PEC only its open part.
+    la = np.broadcast_to(da_w[:Na - 1, None], (max(Na - 1, 0), Nb)).astype(np.float64)
+    lb = np.broadcast_to(db_w[None, :Nb - 1], (Na, max(Nb - 1, 0))).astype(np.float64)
     if f_a is not None:
         la = la * f_a[:Na - 1, :]
         lb = lb * f_b[:, :Nb - 1]
