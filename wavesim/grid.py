@@ -165,6 +165,23 @@ class FDTDGrid:
     pec_face_open_z: np.ndarray = field(default=None)
 
     # ------------------------------------------------------------------ #
+    # Small-cut area threshold (Dey–Mittra's own stability remedy).
+    #
+    # ``dt/(μ·A_open)`` diverges as a cut cell shrinks, so H faces whose open
+    # *fraction* falls below this are treated as fully PEC (H frozen there).
+    # This keeps dt untouched — the alternative, reducing the timestep, would
+    # perturb every existing result — at the cost of reintroducing a little
+    # staircasing at the very smallest cuts.
+    #
+    # A fraction rather than an area, so the rule is the same on a graded mesh.
+    # Measured on a single isolated cut cell (cubic cells, CFL 0.99): stable at
+    # 0.35, diverges at 0.30, and the failure is abrupt rather than gradual.
+    # 0.4 is therefore the default with roughly 1.15x headroom; a dense band of
+    # cut cells may want more. Set 0.0 to disable (unstable on real geometry).
+    # ------------------------------------------------------------------ #
+    conformal_area_threshold: float = 0.4
+
+    # ------------------------------------------------------------------ #
     # Simulation time
     # ------------------------------------------------------------------ #
     time_step: int = 0

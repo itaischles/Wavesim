@@ -147,15 +147,20 @@ def test_cut_edge_scales_its_contour_contribution():
 
 def test_smaller_open_area_amplifies_the_update():
     """The defining property of a cut cell: the same contour drives a smaller
-    face harder, because A_open is the denominator."""
+    face harder, because A_open is the denominator.
+
+    Uses 0.5, above the default small-cut threshold — below it the face would be
+    suppressed to fully PEC instead, which is what test_conformal_threshold.py
+    covers.
+    """
     ref = _make(conformal={})
-    cut = _make(conformal={'pec_face_open_z': ((3, 2, 1), 0.25)})
+    cut = _make(conformal={'pec_face_open_z': ((3, 2, 1), 0.5)})
     update_H(ref)
     update_H(cut)
     dH_ref = ref.Hz[3, 2, 1]
     dH_cut = cut.Hz[3, 2, 1]
     assert dH_ref != 0.0
-    assert dH_cut == pytest.approx(dH_ref / 0.25, rel=1e-12)
+    assert dH_cut == pytest.approx(dH_ref / 0.5, rel=1e-12)
 
 
 def test_fully_covered_face_freezes_h_without_dividing_by_zero():

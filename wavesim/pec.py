@@ -161,8 +161,11 @@ class ConformalGeometry:
     wholly inside the conductor and all four of its edges are zeroed too, so the
     contour integral is 0 and the update would otherwise be 0/0.
 
-    The guard is also where the small-cut area threshold (S4) belongs: treating a
-    sliver face as fully PEC is exactly ``inv_A = 0`` for that face.
+    The guard also carries the small-cut area threshold: a face whose open
+    fraction is below ``grid.conformal_area_threshold`` is treated as fully PEC,
+    which is exactly ``inv_A = 0`` for that face. ``n_suppressed`` counts how
+    many faces that hit — a number worth watching, since every one of them is a
+    cut the run staircased rather than resolved.
     """
     Lx: np.ndarray
     Ly: np.ndarray
@@ -173,6 +176,7 @@ class ConformalGeometry:
     inv_Ax: np.ndarray
     inv_Ay: np.ndarray
     inv_Az: np.ndarray
+    n_suppressed: int = 0
 
 
 def build_conformal_geometry(grid: FDTDGrid) -> ConformalGeometry:
@@ -194,43 +198,56 @@ def build_conformal_geometry(grid: FDTDGrid) -> ConformalGeometry:
     Ay = grid.pec_face_open_y * (dzp * dxp)
     Az = grid.pec_face_open_z * (dxp * dyp)
 
+    thr = float(grid.conformal_area_threshold)
+    inv_Ax, nx = _guarded_inverse(Ax, grid.pec_face_open_x, thr)
+    inv_Ay, ny = _guarded_inverse(Ay, grid.pec_face_open_y, thr)
+    inv_Az, nz = _guarded_inverse(Az, grid.pec_face_open_z, thr)
+
     return ConformalGeometry(
         Lx=grid.pec_edge_open_x * dxp,
         Ly=grid.pec_edge_open_y * dyp,
         Lz=grid.pec_edge_open_z * dzp,
         Ax=Ax, Ay=Ay, Az=Az,
-        inv_Ax=_guarded_inverse(Ax),
-        inv_Ay=_guarded_inverse(Ay),
-        inv_Az=_guarded_inverse(Az),
+        inv_Ax=inv_Ax, inv_Ay=inv_Ay, inv_Az=inv_Az,
+        n_suppressed=nx + ny + nz,
     )
 
 
-def _guarded_inverse(area: np.ndarray) -> np.ndarray:
-    """``1/area`` where the face is open, ``0`` where it is fully covered."""
-    return np.divide(1.0, area, out=np.zeros_like(area), where=area > 0.0)
+def _guarded_inverse(area: np.ndarray, fraction: np.ndarray,
+                     threshold: float) -> tuple:
+    """``(1/area, n_suppressed)``, with sliver and fully covered faces zeroed.
+
+    Thresholding the *fraction* rather than the area keeps the rule
+    resolution-independent on a graded mesh, where ``A_full`` varies per cell.
+    """
+    live = (fraction >= threshold) & (area > 0.0)
+    inv = np.divide(1.0, area, out=np.zeros_like(area), where=live)
+    n_suppressed = int(np.count_nonzero((fraction > 0.0) & ~live))
+    return inv, n_suppressed
 
 
 def conformal_geometry(grid: FDTDGrid):
     """Cached :class:`ConformalGeometry` for ``grid``, or ``None`` if staircase.
 
-    Cached on the grid and keyed on the *identity* of the six fraction arrays,
-    the same scheme (and the same caveat) as the PEC edge-mask cache in
-    :func:`apply_pec_mask`: replacing an array invalidates the cache
-    automatically, mutating one **in place** does not — clear
-    ``grid._conformal_cache`` yourself if you need to do that mid-run.
+    Cached on the grid and keyed on the *identity* of the six fraction arrays
+    plus the value of ``conformal_area_threshold``, the same scheme (and the same
+    caveat) as the PEC edge-mask cache in :func:`apply_pec_mask`: replacing an
+    array invalidates the cache automatically, mutating one **in place** does not
+    — clear ``grid._conformal_cache`` yourself if you need to do that mid-run.
     """
     if not grid.is_conformal:
         return None
 
-    key = (grid.pec_edge_open_x, grid.pec_edge_open_y, grid.pec_edge_open_z,
-           grid.pec_face_open_x, grid.pec_face_open_y, grid.pec_face_open_z)
+    arrays = (grid.pec_edge_open_x, grid.pec_edge_open_y, grid.pec_edge_open_z,
+              grid.pec_face_open_x, grid.pec_face_open_y, grid.pec_face_open_z)
+    threshold = float(grid.conformal_area_threshold)
 
     cache = getattr(grid, '_conformal_cache', None)
-    if cache is None or len(cache[0]) != len(key) or \
-            any(a is not b for a, b in zip(cache[0], key)):
-        cache = (key, build_conformal_geometry(grid))
+    if cache is None or cache[1] != threshold or len(cache[0]) != len(arrays) \
+            or any(a is not b for a, b in zip(cache[0], arrays)):
+        cache = (arrays, threshold, build_conformal_geometry(grid))
         grid._conformal_cache = cache
-    return cache[1]
+    return cache[2]
 
 
 def count_cut_cells(grid: FDTDGrid) -> int:

@@ -71,7 +71,8 @@ def set_material_arrays(grid: FDTDGrid,
                         pec_edge_open_z: np.ndarray = None,
                         pec_face_open_x: np.ndarray = None,
                         pec_face_open_y: np.ndarray = None,
-                        pec_face_open_z: np.ndarray = None) -> FDTDGrid:
+                        pec_face_open_z: np.ndarray = None,
+                        conformal_area_threshold: float = None) -> FDTDGrid:
     """
     Directly assign pre-computed material arrays to the grid.
 
@@ -88,6 +89,11 @@ def set_material_arrays(grid: FDTDGrid,
     or none at all. Passing them switches the solver onto the conformal
     (Dey–Mittra) path; omitting them (the default) leaves every existing code
     path untouched and bit-identical.
+
+    ``conformal_area_threshold`` overrides the small-cut stability threshold
+    (default 0.4 — see :class:`~wavesim.grid.FDTDGrid`). Real geometry needs it:
+    an analytic coax on a 32-cell transverse mesh produces open-area fractions
+    down to 0.011, and the run diverges without it.
     """
     shape = (grid.Nx, grid.Ny, grid.Nz)
     for name, arr in [('eps_x', eps_x), ('eps_y', eps_y), ('eps_z', eps_z),
@@ -106,6 +112,12 @@ def set_material_arrays(grid: FDTDGrid,
         if pec_mask.shape != shape:
             raise ValueError(f"pec_mask: expected shape {shape}, got {pec_mask.shape}")
         grid.pec_mask = pec_mask.astype(bool)
+
+    if conformal_area_threshold is not None:
+        if not 0.0 <= conformal_area_threshold < 1.0:
+            raise ValueError("conformal_area_threshold must lie in [0, 1), got "
+                             f"{conformal_area_threshold}")
+        grid.conformal_area_threshold = float(conformal_area_threshold)
 
     conformal = dict(zip(_CONFORMAL_KEYS,
                          (pec_edge_open_x, pec_edge_open_y, pec_edge_open_z,
