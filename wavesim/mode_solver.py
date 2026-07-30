@@ -25,6 +25,18 @@ Per mode we also report the (per-unit-length) capacitance, inductance, phase
 velocity, effective permittivity and characteristic impedance, obtained from the
 field-energy integral and a companion air-filled solve.
 
+Conformal (Dey–Mittra) PEC
+-------------------------
+When the grid carries cut-cell open fractions the solver switches to them
+wholesale — conductor mask, stencil, energy integral and launched ê — so the
+port is solved on the *same* geometry the FDTD steps. Without that the Z₀ the
+port presents stops being the Z₀ the run presents, which is the consistency the
+design exists to protect (no separate mode mesh; the mode is solved on the run's
+grid). On the reference coax it takes the modal Z₀ error from +14.4% to −0.8%
+and makes the launched profile exactly mirror-symmetric. The one substitution it
+all rests on is derived at :func:`_plane_open_fractions` below; the gate is
+``tests/test_conformal_mode_solver.py``.
+
 Conventions match the rest of wavesim: all positions in metres; the transverse
 plane is sliced exactly as :mod:`wavesim.monitors` does (``normal='z'`` → XY, etc.).
 SciPy provides the sparse solve (:func:`scipy.sparse.linalg.splu`) and the
@@ -58,6 +70,7 @@ from wavesim.grid import FDTDGrid
 #   node   — attribute names of the two node-coordinate arrays (length N+1),
 #   eps    — material attrs seen by the two transverse E components,
 #   mu     — material attr seen by the H_a component (for the wave impedance),
+#   edge   — conformal open-fraction attrs for the two transverse E components,
 #   E, H   — the field-component names driven on the plane,
 #   h_sign — (sa, sb) so that  H_a = sa·E_b/η,  H_b = sb·E_a/η  (= n̂ × E_t / η).
 #
@@ -70,16 +83,80 @@ _NORMAL_CFG = {
     'z': dict(axes=('x', 'y'), ds=('dx', 'dy'),
               dp=('dxp', 'dyp'), cen=('xc', 'yc'), node=('x', 'y'),
               eps=('eps_x', 'eps_y'), mu='mu_x',
+              edge=('pec_edge_open_x', 'pec_edge_open_y'),
               E=('Ex', 'Ey'), H=('Hx', 'Hy'), h_sign=(-1.0, +1.0)),
     'y': dict(axes=('x', 'z'), ds=('dx', 'dz'),
               dp=('dxp', 'dzp'), cen=('xc', 'zc'), node=('x', 'z'),
               eps=('eps_x', 'eps_z'), mu='mu_x',
+              edge=('pec_edge_open_x', 'pec_edge_open_z'),
               E=('Ex', 'Ez'), H=('Hx', 'Hz'), h_sign=(+1.0, -1.0)),
     'x': dict(axes=('y', 'z'), ds=('dy', 'dz'),
               dp=('dyp', 'dzp'), cen=('yc', 'zc'), node=('y', 'z'),
               eps=('eps_y', 'eps_z'), mu='mu_y',
+              edge=('pec_edge_open_y', 'pec_edge_open_z'),
               E=('Ey', 'Ez'), H=('Hy', 'Hz'), h_sign=(-1.0, +1.0)),
 }
+
+
+# ====================================================================== #
+# Conformal (Dey–Mittra) PEC on the mode plane
+#
+# The FDTD's conformal Faraday update integrates ``E·L`` around the open part
+# of each H face's contour. A TEM mode is exactly the transverse field that
+# makes the longitudinal H face's contour integral vanish:
+#
+#   (E_b·L_b)[i+1,j] − (E_b·L_b)[i,j] − (E_a·L_a)[i,j+1] + (E_a·L_a)[i,j] = 0
+#
+# which is solved identically by ``E_a·L_a = φ[i,j] − φ[i+1,j]`` for a node
+# potential φ. So the conformal transverse field is **the ordinary gradient of
+# φ divided by the OPEN edge length instead of the full one** — the open
+# fraction lands on the stencil's centre distance, not on its face length. The
+# rest follows: a fully covered edge (``L = 0``) forces φ equal at its two
+# endpoints, which is the conductor equipotential condition, and it is exactly
+# the set of edges :func:`wavesim.pec.apply_pec_mask` zeroes. Nothing has to be
+# assumed about which side of a cut edge the metal lies on.
+#
+# Every weight below is the legacy weight times an open fraction, so a grid
+# whose fractions are all 1.0 reproduces the staircase assembly bit-for-bit on
+# any mesh (``tests/test_conformal_mode_solver.py``).
+# ====================================================================== #
+
+
+def _plane_open_fractions(grid: FDTDGrid, cfg: dict, normal: str, k: int):
+    """``(f_a, f_b)`` open fractions of the two transverse E edges on the plane.
+
+    ``(None, None)`` when the grid carries no cut-cell geometry, which is the
+    single switch between the conformal and the legacy assembly.
+    """
+    if not grid.is_conformal:
+        return None, None
+    return (np.asarray(_slice(getattr(grid, cfg['edge'][0]), normal, k), float),
+            np.asarray(_slice(getattr(grid, cfg['edge'][1]), normal, k), float))
+
+
+def _conformal_node_pec(f_a: np.ndarray, f_b: np.ndarray) -> np.ndarray:
+    """Nodes lying inside the conductor, from the cut-edge open fractions.
+
+    A node is in the metal iff at least one edge meeting it is *fully* covered:
+    a covered edge lies wholly inside the conductor, so both of its endpoints
+    do too. Every such node is index-adjacent to the far end of that edge, so
+    :func:`scipy.ndimage.label` on this mask recovers the equipotential groups
+    — the connected components of the fully-covered-edge graph — and the rest
+    of the solver (conductor labelling, ground selection, pinning) is unchanged.
+
+    This replaces the cell-centred ``pec_mask``, which is half a cell away from
+    the nodes φ actually lives on. A *partially* covered edge is deliberately
+    not counted: its open part carries field, and the ``1/L`` weight already
+    places the node the correct sub-cell distance from the metal surface.
+
+    Two conductors closer than one cell would be merged by the index adjacency
+    (the labelling cannot tell a partially-open edge from a gap); that is below
+    the resolution at which a cut cell means anything.
+    """
+    covered = (f_a == 0.0) | (f_b == 0.0)
+    covered[1:, :] |= (f_a[:-1, :] == 0.0)
+    covered[:, 1:] |= (f_b[:, :-1] == 0.0)
+    return covered
 
 
 def _plane_to_grid(normal: str, k: int, a: np.ndarray, b: np.ndarray):
@@ -237,31 +314,49 @@ class TEMMode:
         divergence — the collocated ``np.gradient`` field in ``self.E`` is not, and
         injecting it charges the domain. ``Ĥ = (n̂ × ê)/η`` is rebuilt from the same
         staggered ``ê`` so the directional E/H pairing stays consistent.
+
+        Under conformal PEC the divisor becomes the **open** edge length
+        ``f·d``: ``ê·L = -Δφ`` is precisely the condition that makes the
+        conformal Faraday contour of the longitudinal H face vanish, i.e. that
+        makes ``ê`` a genuine TEM (``H_n = 0``) field of the *cut* grid rather
+        than of the staircased one. Fully covered edges divide by zero open
+        length and are simply zeroed — the same set
+        :func:`wavesim.pec.apply_pec_mask` zeroes, and the reason the PEC mask
+        is not applied on top: a partially covered edge must keep its field.
         """
         cfg = _NORMAL_CFG[self.normal]
         phi = self.phi
         Na, Nb = phi.shape
         dual = {'x': grid.dxd, 'y': grid.dyd, 'z': grid.dzd}
-        da = dual[cfg['axes'][0]]
-        db = dual[cfg['axes'][1]]
+        da = dual[cfg['axes'][0]][:Na - 1][:, None]
+        db = dual[cfg['axes'][1]][:Nb - 1][None, :]
+        k = self.slice_index
+        f_a, f_b = _plane_open_fractions(grid, cfg, self.normal, k)
         Ea = np.zeros_like(phi)
         Eb = np.zeros_like(phi)
-        Ea[:-1, :] = -(phi[1:, :] - phi[:-1, :]) / da[:Na - 1][:, None]
-        Eb[:, :-1] = -(phi[:, 1:] - phi[:, :-1]) / db[:Nb - 1][None, :]
-        pec = self.pec
-        Ea[pec] = 0.0
-        Eb[pec] = 0.0
+        if f_a is None:
+            Ea[:-1, :] = -(phi[1:, :] - phi[:-1, :]) / da
+            Eb[:, :-1] = -(phi[:, 1:] - phi[:, :-1]) / db
+            pec = self.pec
+            Ea[pec] = 0.0
+            Eb[pec] = 0.0
+        else:
+            La, Lb = f_a[:Na - 1, :] * da, f_b[:, :Nb - 1] * db
+            np.divide(-(phi[1:, :] - phi[:-1, :]), La,
+                      out=Ea[:-1, :], where=La > 0.0)
+            np.divide(-(phi[:, 1:] - phi[:, :-1]), Lb,
+                      out=Eb[:, :-1], where=Lb > 0.0)
 
         # η = η₀·√(μ_r/ε_r) on the plane, exactly as :func:`_build_mode`.
-        k = self.slice_index
         eps_a = _slice(getattr(grid, cfg['eps'][0]), self.normal, k)
         mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
         eta = ETA0 * np.sqrt(mu_a / np.where(eps_a > 0, eps_a, 1.0))
         sa, sb = cfg['h_sign']
         Ha = sa * Eb / eta
         Hb = sb * Ea / eta
-        Ha[pec] = 0.0
-        Hb[pec] = 0.0
+        if f_a is None:                    # H inherits ê's zeros conformally
+            Ha[pec] = 0.0
+            Hb[pec] = 0.0
 
         E = {cfg['E'][0]: Ea, cfg['E'][1]: Eb}
         H = {cfg['H'][0]: Ha, cfg['H'][1]: Hb}
@@ -288,6 +383,12 @@ class TEMMode:
         cancel and ``s`` stays close to 1 (≈ 1.1 on a coax at 12 cells across the
         gap, → 1 under transverse refinement).
 
+        Under conformal PEC the cancellation becomes exact for a homogeneous
+        fill: Z₀ and G are then two readings of one open-area energy integral,
+        giving ``G = C·c₀/√ε_r`` against ``Z₀ = √ε_r/(c₀·C)``, so ``s = 1`` to
+        round-off rather than to within a percent. An inhomogeneous
+        cross-section still has a genuine residue.
+
         Requires the mode's ``impedance`` (solve with ``compute_params=True``).
         """
         if self.impedance is None or not self.impedance > 0:
@@ -297,23 +398,30 @@ class TEMMode:
         cfg = _NORMAL_CFG[self.normal]
         E_stag, _H = self._staggered_port_fields(grid)
         k = self.slice_index
-        # Transverse per-cell primary widths → cell area dA on the plane.
+        # Transverse per-cell primary widths → cell area dA on the plane. Under
+        # conformal PEC each component's area is scaled by its own edge's open
+        # fraction, so ``G`` integrates over the open cross-section — the same
+        # open-area weighting the mode's Z₀ comes from, which is what lets the
+        # two discretisation errors keep cancelling in ``s = 1/(Z₀·G)``.
         prim = {'x': grid.dxp, 'y': grid.dyp, 'z': grid.dzp}
         wa = prim[cfg['axes'][0]]
         wb = prim[cfg['axes'][1]]
         dA = wa[:, None] * wb[None, :]
+        f_open = dict(zip(cfg['E'],
+                          _plane_open_fractions(grid, cfg, self.normal, k)))
         mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
         G = 0.0
         eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
         for comp in cfg['E']:
             ehat = E_stag[comp]
+            dA_c = dA if f_open[comp] is None else dA * f_open[comp]
             a, b = np.nonzero(ehat)
             if a.size == 0:
                 continue
             ii, jj, kk = _plane_to_grid(self.normal, k, a, b)
             epsr = eps_of[comp][ii, jj, kk]
             eta = ETA0 * np.sqrt(mu_a[a, b] / np.where(epsr > 0, epsr, 1.0))
-            G += float(np.sum(ehat[a, b] ** 2 / eta * dA[a, b]))
+            G += float(np.sum(ehat[a, b] ** 2 / eta * dA_c[a, b]))
         if G <= 0.0:
             raise ValueError("Mode has no transverse E energy; cannot scale.")
         return 1.0 / (self.impedance * G)
@@ -400,6 +508,8 @@ class TEMMode:
         gathered = {}
         S = 0.0
         Sv = 0.0
+        f_open = dict(zip(cfg['E'],
+                          _plane_open_fractions(grid, cfg, self.normal, k)))
         for comp in cfg['E']:
             Ehat2d = E_stag[comp]
             a, b = np.nonzero(Ehat2d)
@@ -409,6 +519,8 @@ class TEMMode:
             Ehat = Ehat2d[a, b]
             epsr = eps_of[comp][ii, jj, kk]
             dV_c = grid.dxp[ii] * grid.dyp[jj] * grid.dzp[kk]
+            if f_open[comp] is not None:   # cut cells store energy only where open
+                dV_c = dV_c * f_open[comp][a, b]
             gathered[comp] = (ii, jj, kk, Ehat, epsr)
             S += float(np.sum(epsr * Ehat ** 2))
             Sv += float(np.sum(dV_c * epsr * Ehat ** 2))
@@ -496,7 +608,14 @@ def solve_tem_modes(grid: FDTDGrid, *,
     eps_a_full = _slice(getattr(grid, cfg['eps'][0]), normal, k)
     eps_b_full = _slice(getattr(grid, cfg['eps'][1]), normal, k)
     mu_a_full = _slice(getattr(grid, cfg['mu']), normal, k)
-    if grid.pec_mask is None:
+
+    # Conformal cut-cell geometry, if the grid carries it. The conductor mask
+    # then comes from the cut edges rather than from the cell-centred
+    # ``pec_mask``, because φ lives on the nodes those edges connect.
+    fa_full, fb_full = _plane_open_fractions(grid, cfg, normal, k)
+    if fa_full is not None:
+        pec_full = _conformal_node_pec(fa_full, fb_full)
+    elif grid.pec_mask is None:
         pec_full = np.zeros(eps_a_full.shape, dtype=bool)
     else:
         pec_full = _slice(grid.pec_mask, normal, k).astype(bool)
@@ -518,6 +637,8 @@ def solve_tem_modes(grid: FDTDGrid, *,
     eps_b = np.ascontiguousarray(eps_b_full[sub], dtype=np.float64)
     mu_a = np.ascontiguousarray(mu_a_full[sub], dtype=np.float64)
     pec = np.ascontiguousarray(pec_full[sub])
+    f_a = None if fa_full is None else np.ascontiguousarray(fa_full[sub])
+    f_b = None if fb_full is None else np.ascontiguousarray(fb_full[sub])
 
     # --- transverse spacing (per-cell — rectilinear/non-uniform aware) ------ #
     # ``da_w``/``db_w`` are the per-cell primary widths on the solved sub-rect;
@@ -550,13 +671,14 @@ def solve_tem_modes(grid: FDTDGrid, *,
 
     # --- factorise the weighted Laplacian once, reuse for every mode -------- #
     lu, B, free_idx, fixed_cells = _factor_laplacian(eps_a, eps_b, da_w, db_w,
-                                                     fixed, pec)
+                                                     fixed, pec, f_a, f_b)
     # Air-filled companion (ε≡1) for the per-unit-length parameters. The PEC
     # one-sided rule is a no-op here (ε is uniformly 1), which is precisely why
     # applying it to the filled solve restores φ == φ_air on a homogeneous fill.
     if compute_params:
         lu_air, B_air, _, _ = _factor_laplacian(
-            np.ones_like(eps_a), np.ones_like(eps_b), da_w, db_w, fixed, pec)
+            np.ones_like(eps_a), np.ones_like(eps_b), da_w, db_w, fixed, pec,
+            f_a, f_b)
 
     modes: List[TEMMode] = []
     for Ls in signals:
@@ -568,7 +690,7 @@ def solve_tem_modes(grid: FDTDGrid, *,
             phi_air = _solve_one(lu_air, B_air, free_idx, fixed_cells,
                                  labels, fixed, Ls)
             _attach_params(mode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c,
-                           pec)
+                           pec, f_a, f_b)
         modes.append(mode)
 
     return modes
@@ -628,23 +750,87 @@ def _classify_conductors(labels, n_cond, boundary, ground):
 # Sparse weighted-Laplacian assembly and solve
 # ====================================================================== #
 
-def _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed, pec=None):
+def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
+    """Per-face conductances of the ε-weighted transverse Laplacian.
+
+    Returns ``(ca, cb)``: ``ca[i,j]`` (shape ``(Na-1, Nb)``) is the coefficient
+    of the face between cells ``(i,j)`` and ``(i+1,j)``, ``cb[i,j]`` (shape
+    ``(Na, Nb-1)``) that of the face between ``(i,j)`` and ``(i,j+1)``. Each is
+
+        ``ε_face · face_length / centre_distance``
+
+    with ``face_length`` the cell width on the *other* axis and
+    ``centre_distance`` the dual width ``(w[i]+w[i+1])/2``.
+
+    **Face permittivity** is the arithmetic mean of the two adjoining cells,
+    EXCEPT where one of them is PEC. ε inside a conductor is not a material
+    property — it is whatever the voxeliser happened to leave there (1.0) — so
+    averaging it in makes conductor-adjacent faces carry a different ε ratio
+    than interior faces. The filled and air systems then stop being scalar
+    multiples of one another, φ ≠ φ_air, and the exact cancellation in
+    ε_eff = C/C_air breaks. Taking the free cell's ε one-sided is both
+    physically right (the dielectric runs up to the conductor surface) and
+    restores A_filled = ε_r·A_air for a homogeneous fill.
+
+    **Conformal PEC**: ``f_a``/``f_b`` scale the centre distance down to the
+    *open* edge length, ``L = f·centre_distance``, so the coefficient grows as
+    ``1/f`` — a node just outside the metal sits a short distance from the
+    surface and is therefore strongly coupled to it, which is the correct
+    Dirichlet behaviour. A fully covered edge (``f = 0``) gets coefficient 0
+    and carries no flux equation at all; both of its endpoints are pinned by
+    :func:`_conformal_node_pec`, so the constraint it stands for (equal φ) is
+    imposed by the pinning instead.
+
+    Both arrays are returned once per face, not once per direction, and the
+    assembly walks each face twice — the two views share the same coefficient.
+    The energy integral in :func:`_attach_params` reuses them, which is what
+    makes the reported capacitance exactly the quadratic form of the operator
+    that was actually solved.
+    """
+    Na, Nb = eps_a.shape
+    dac = 0.5 * (da_w[:-1] + da_w[1:])          # length Na-1, face i↔i+1
+    dbc = 0.5 * (db_w[:-1] + db_w[1:])          # length Nb-1
+    DA = da_w[:, None]                          # (Na, 1) a-widths (b-face length)
+    DB = db_w[None, :]                          # (1, Nb) b-widths (a-face length)
+
+    def _eps_face(eps, src, nbr):
+        ef = 0.5 * (eps[src] + eps[nbr])
+        if pec is not None:
+            pec_src, pec_nbr = pec[src], pec[nbr]
+            ef = np.where(pec_nbr & ~pec_src, eps[src], ef)
+            ef = np.where(pec_src & ~pec_nbr, eps[nbr], ef)
+        return ef
+
+    sa, na = np.s_[0:Na - 1, :], np.s_[1:Na, :]
+    sb, nb = np.s_[:, 0:Nb - 1], np.s_[:, 1:Nb]
+
+    la = np.broadcast_to(dac[:, None], (max(Na - 1, 0), Nb)).astype(np.float64)
+    lb = np.broadcast_to(dbc[None, :], (Na, max(Nb - 1, 0))).astype(np.float64)
+    if f_a is not None:
+        la = la * f_a[:Na - 1, :]
+        lb = lb * f_b[:, :Nb - 1]
+
+    ca = np.divide(np.broadcast_to(DB, la.shape), la,
+                   out=np.zeros_like(la), where=la > 0.0) * _eps_face(eps_a, sa, na)
+    cb = np.divide(np.broadcast_to(DA, lb.shape), lb,
+                   out=np.zeros_like(lb), where=lb > 0.0) * _eps_face(eps_b, sb, nb)
+    return ca, cb
+
+
+def _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed, pec=None,
+                      f_a=None, f_b=None):
     """Assemble and LU-factorise the ε-weighted 2D Laplacian over free cells.
 
     Discretises ``∂_a(ε_a ∂_a φ) + ∂_b(ε_b ∂_b φ) = 0`` with a 5-point
     variable-coefficient **finite-volume** stencil on a rectilinear (possibly
     non-uniform) transverse mesh. ``da_w``/``db_w`` are the per-cell primary
-    widths along the two transverse axes. The flux across the face between two
-    cells is ``ε_face·(Δφ / centre_distance)·face_length`` with the face
-    permittivity the arithmetic mean of the two adjoining cells; ``centre_distance``
-    is the dual width ``(w[i]+w[i+1])/2`` and ``face_length`` is the cell width
-    on the *other* axis. Faces onto a PEC cell take the free cell's ε one-sided
-    rather than the mean (``pec``, optional — see the inline note at the stencil
-    assembly). Out-of-array neighbours are simply omitted, which is the
-    natural zero-flux (Neumann) edge; a grounded edge is instead handled by the
-    caller marking the ring as ``fixed``. On a uniform mesh every coefficient
-    reduces to a constant multiple of the old ``ε/da²`` stencil (a global row
-    scaling that leaves φ unchanged).
+    widths along the two transverse axes; the per-face conductances come from
+    :func:`_face_coefs`, which also carries the PEC ε rule and the conformal
+    open-length weighting (``f_a``/``f_b``). Out-of-array neighbours are simply
+    omitted, which is the natural zero-flux (Neumann) edge; a grounded edge is
+    instead handled by the caller marking the ring as ``fixed``. On a uniform
+    mesh every coefficient reduces to a constant multiple of the old ``ε/da²``
+    stencil (a global row scaling that leaves φ unchanged).
 
     Returns ``(lu, B, free_idx, fixed_cells)`` where ``lu`` solves ``A x = b`` over
     the free cells, ``B`` (free × fixed) maps pinned potentials into the RHS via
@@ -662,54 +848,29 @@ def _factor_laplacian(eps_a, eps_b, da_w, db_w, fixed, pec=None):
     fixed_idx = -np.ones((Na, Nb), dtype=np.int64)
     fixed_idx[fixed] = np.arange(n_fixed)
 
-    # Centre-to-centre distances (dual widths) between adjacent cells per axis.
-    dac = 0.5 * (da_w[:-1] + da_w[1:])          # length Na-1, face i↔i+1
-    dbc = 0.5 * (db_w[:-1] + db_w[1:])          # length Nb-1
-    DA = da_w[:, None]                          # (Na, 1) a-widths (b-face length)
-    DB = db_w[None, :]                          # (1, Nb) b-widths (a-face length)
-
-    # Per-direction face weights, already shaped like the ``src`` slice: an
-    # a-face carries ``face_length(=db_w) / centre_distance(=dac)``, a b-face
-    # ``da_w / dbc``. ``+a``/``-a`` reference the same physical faces (rows
-    # 0..Na-2), so both use ``dac``; likewise ``±b`` share ``dbc``.
-    wa = DB / dac[:, None]                       # (Na-1, Nb)
-    wb = DA / dbc[None, :]                        # (Na, Nb-1)
+    ca, cb = _face_coefs(eps_a, eps_b, da_w, db_w, pec, f_a, f_b)
 
     # The 5-point stencil is built one *face direction* at a time (4 vectorised
     # passes), not cell-by-cell. For each direction the in-bounds region is a
-    # whole-array slice ``src`` paired with its neighbour slice ``nbr``; the face
-    # permittivity is the arithmetic mean of the two, exactly as before. Omitting
-    # the out-of-bounds border rows/columns reproduces the zero-flux (Neumann)
-    # edge. Off-diagonal couplings split by whether the neighbour is free (→ A) or
-    # pinned (→ B); the diagonal accumulates −Σ(face coef) over the same faces.
+    # whole-array slice ``src`` paired with its neighbour slice ``nbr``; ``+a``
+    # and ``-a`` are the same physical faces seen from opposite sides, so they
+    # share one coefficient array. Omitting the out-of-bounds border rows/columns
+    # reproduces the zero-flux (Neumann) edge. Off-diagonal couplings split by
+    # whether the neighbour is free (→ A) or pinned (→ B); the diagonal
+    # accumulates −Σ(face coef) over the same faces.
     diag = np.zeros((Na, Nb), dtype=np.float64)
     rows_A, cols_A, data_A = [], [], []
     rows_B, cols_B, data_B = [], [], []
 
     directions = (
-        (np.s_[0:Na - 1, :], np.s_[1:Na, :],     eps_a, wa),  # +a face
-        (np.s_[1:Na, :],     np.s_[0:Na - 1, :], eps_a, wa),  # -a face
-        (np.s_[:, 0:Nb - 1], np.s_[:, 1:Nb],     eps_b, wb),  # +b face
-        (np.s_[:, 1:Nb],     np.s_[:, 0:Nb - 1], eps_b, wb),  # -b face
+        (np.s_[0:Na - 1, :], np.s_[1:Na, :],     ca),  # +a face
+        (np.s_[1:Na, :],     np.s_[0:Na - 1, :], ca),  # -a face
+        (np.s_[:, 0:Nb - 1], np.s_[:, 1:Nb],     cb),  # +b face
+        (np.s_[:, 1:Nb],     np.s_[:, 0:Nb - 1], cb),  # -b face
     )
-    for src, nbr, eps, w in directions:
-        if eps[src].size == 0:
+    for src, nbr, coef in directions:
+        if coef.size == 0:
             continue
-        # Face permittivity: arithmetic mean of the two adjoining cells, EXCEPT
-        # where one of them is PEC. ε inside a conductor is not a material
-        # property — it is whatever the voxeliser happened to leave there (1.0)
-        # — so averaging it in makes conductor-adjacent faces carry a different
-        # ε ratio than interior faces. The filled and air systems then stop being
-        # scalar multiples of one another, φ ≠ φ_air, and the exact cancellation
-        # in ε_eff = C/C_air breaks. Taking the free cell's ε one-sided is both
-        # physically right (the dielectric runs up to the conductor surface) and
-        # restores A_filled = ε_r·A_air for a homogeneous fill.
-        eps_face = 0.5 * (eps[src] + eps[nbr])
-        if pec is not None:
-            pec_src, pec_nbr = pec[src], pec[nbr]
-            eps_face = np.where(pec_nbr & ~pec_src, eps[src], eps_face)
-            eps_face = np.where(pec_src & ~pec_nbr, eps[nbr], eps_face)
-        coef = eps_face * w
         i_src = free_idx[src]
         free_src = i_src >= 0
         # diagonal: only free source cells own a row (fixed-cell diag is unused).
@@ -813,8 +974,14 @@ def _build_mode(phi, eps_a, eps_b, mu_a, pec, da_w, db_w, a_c, b_c, cfg,
 
 
 def _attach_params(mode: TEMMode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c,
-                   pec=None):
+                   pec=None, f_a=None, f_b=None):
     """Fill C, L, Z₀, v, ε_eff from the field energy of the filled & air solves."""
+    if f_a is not None:
+        C = _fv_energy(phi, eps_a, eps_b, da_w, db_w, pec, f_a, f_b)
+        C_air = _fv_energy(phi_air, np.ones_like(eps_a), np.ones_like(eps_b),
+                           da_w, db_w, pec, f_a, f_b)
+        return _set_params(mode, C, C_air)
+
     # Energy integral uses the gradient over the whole cross-section (V = 1 V):
     #   C = ε₀ ∫ (ε_a E_a² + ε_b E_b²) dA,  with a per-cell area dA_ij = da_i·db_j
     #   and the gradient taken against the true (non-uniform) centre coordinates.
@@ -840,6 +1007,42 @@ def _attach_params(mode: TEMMode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b
     Ea_air, Eb_air = _grad(phi_air)
     C_air = EPS0 * np.sum((Ea_air**2 + Eb_air**2) * dA)
 
+    _set_params(mode, C, C_air)
+
+
+def _fv_energy(phi, eps_a, eps_b, da_w, db_w, pec, f_a, f_b) -> float:
+    """Capacitance as the quadratic form of the conformal operator: ``-φᵀAφ``.
+
+    Writing the face conductance as ``ε·face_length/L`` with ``L`` the *open*
+    edge length, each face contributes
+
+        ``ε·(Δφ)²·face_length/L  =  ε·E²·(L · face_length)``
+
+    — the field energy on the face's **open area**, since ``E = Δφ/L`` is
+    exactly the field the conformal FDTD carries on that edge. So this is the
+    open-area energy integral the plan asks for, and it comes out of the
+    operator rather than being re-derived beside it: reusing
+    :func:`_face_coefs` guarantees ``C`` is the energy of the system that was
+    actually solved, which is what keeps ``C = ε_r·C_air`` exact for a
+    homogeneous fill (the filled and air operators are then scalar multiples,
+    so φ = φ_air and every face coefficient scales by ε_r).
+
+    The legacy staircase path keeps its collocated ``np.gradient`` integral
+    instead — it is bit-identical to every recorded result and to
+    ``tests/test_homogeneous_fill.py``, and the conformal path is where the
+    cut-cell areas have to appear.
+    """
+    ca, cb = _face_coefs(eps_a, eps_b, da_w, db_w, pec, f_a, f_b)
+    e = 0.0
+    if ca.size:
+        e += float(np.sum(ca * (phi[1:, :] - phi[:-1, :]) ** 2))
+    if cb.size:
+        e += float(np.sum(cb * (phi[:, 1:] - phi[:, :-1]) ** 2))
+    return EPS0 * e
+
+
+def _set_params(mode: TEMMode, C: float, C_air: float) -> None:
+    """Fill the per-unit-length parameters from the two capacitances."""
     if C > 0 and C_air > 0:
         mode.capacitance = float(C)
         mode.inductance = float(1.0 / (C0**2 * C_air))
