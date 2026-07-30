@@ -17,14 +17,27 @@ geometric source of truth is the node-coordinate array per axis (``x``/``y``/``z
 strictly increasing, length ``N+1`` for ``N`` cells) — this is where the future
 snapping / mesh generator will write.
 
-From the coordinates we precompute two 1-D spacing arrays per axis, following the
-Yee-layout result in the plan:
+From the coordinates we precompute two 1-D spacing arrays per axis:
 
 - **primary widths** ``dxp[i] = x[i+1] - x[i]``  (length ``N``) — the denominator
-  for every ``update_E`` derivative (differences an integer-node H field).
+  for every ``update_H`` derivative, because every E field the H curl differences
+  sits on an integer *node* along the differenced axis (``Ez[i,j,k]`` is at
+  ``y[j]``). Equivalently: the Faraday contour of an H face is bounded by nodes,
+  so its sides are primary widths and its area is ``dxp[i]·dyp[j]``.
 - **dual widths** ``dxd[i] = (dxp[i] + dxp[i+1]) / 2``  (length ``N``, the last
-  entry replicates ``dxp[-1]`` as boundary padding) — the denominator for every
-  ``update_H`` derivative (differences a half-node E field).
+  entry replicates ``dxp[-1]`` as boundary padding, and is never read) — the
+  denominator for every ``update_E`` derivative, because every H field the E curl
+  differences sits at a cell *centre* (``Hz[i,j,k]`` is at ``yc[j]``, so
+  ``Hz[j] - Hz[j-1]`` spans ``yc[j] - yc[j-1] = dyd[j-1]``).
+
+These two were originally assigned the other way round. Uniform grids hide the
+difference exactly (``dxp == dxd`` to the last ULP), but on a graded mesh the
+inverted pairing costs an order of accuracy: measured on a smoothly graded 1D
+cavity, interior truncation error converged at order 0.96 and the lowest
+eigenfrequency at 1.03, against 2.00 for both with the pairing above. A stability
+check does not catch it — the leapfrog amplification matrix has ``max|λ| = 1`` for
+either pairing, since both conserve energy under *some* diagonal inner product.
+See ``tests/test_grid_spacing_order.py``.
 
 Center (half-node) coordinates ``xc[i] = (x[i] + x[i+1]) / 2`` are stored for
 index lookups and the PML.
