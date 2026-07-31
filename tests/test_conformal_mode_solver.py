@@ -183,22 +183,25 @@ def test_conformal_impedance_beats_the_staircase_target():
 
     Measured against the analytic 65.871 Ω (error, |Z₀/Z_analytic − 1|):
 
-        cell (mm)   staircase   binary   conformal
-        0.5000       +14.37%    +6.86%     -0.79%
-        0.3750        +8.73%    +3.15%     -0.50%
-        0.2500        +7.46%    +3.59%     -0.27%
-        0.1875        +4.97%    +2.04%     -0.17%
+        cell (mm)   staircase = binary   conformal
+        0.5000            +6.86%           -0.79%
+        0.3750            +3.15%           -0.50%
+        0.2500            +3.59%           -0.27%
+        0.1875            +2.04%           -0.17%
 
-    The ``binary`` column is the staircase conductor run through the conformal
-    code path, and it is why it is worth reading this table rather than just the
-    endpoints: the new energy integral alone takes +14.4% to +6.9%, and the cut
-    cells take it the rest of the way. Only the cut cells make the sequence
-    monotone — staircase and binary both wobble (7.46 after 8.73, 3.59 after
-    3.15) because refining a staircase re-rasterises the conductor rather than
-    resolving it.
+    ``binary`` — the staircase conductor pushed through the conformal code path
+    — is now *identical* to ``staircase``, because S5d gave both the same
+    finite-volume energy integral. Before it, staircase read +14.37% here and
+    the two columns differed; that gap was the old collocated ``np.gradient``
+    capacitance, not the geometry.
+
+    What is left is the geometry alone, and it is worth reading the whole column
+    rather than the endpoints: only the cut cells make the sequence monotone.
+    Staircase wobbles (3.59 after 3.15) because refining a staircase
+    re-rasterises the conductor rather than resolving it.
     """
     assert _z0_err(0.5e-3, 'conformal') < 0.02
-    assert _z0_err(0.5e-3, 'staircase') > 0.10
+    assert _z0_err(0.5e-3, 'staircase') > 0.05
 
 
 def test_conformal_impedance_converges_faster_than_first_order():
@@ -280,20 +283,23 @@ def _circulation(H, grid, ic, jc, m):
 def test_launched_h_sheet_carries_the_exact_modal_current():
     """``∮Ĥ·dl`` = V/Z₀ on every contour enclosing the inner conductor.
 
-    Ampère says the enclosed current is the same on any such loop, so this is
-    two properties in one: the launch impresses the *right* current, and its Ĥ
-    is curl-free in the gap. Measured on the reference coax at 0.5 mm:
+    Ampère says the enclosed current is the same on any such loop, so the
+    **loop-independence is the real assertion** — it is what says Ĥ is curl-free
+    in the gap, i.e. a valid magnetostatic field. Measured on the reference coax
+    at 0.5 mm, loops of ±8/10/12 cells:
 
-        staircase   1.0758 → 1.0720 of V/Z₀ as the loop grows (7% high, drifting)
-        conformal   1.0004 → 1.0004                           (loop-independent)
+        staircase   1.0052 → 1.0034 → 1.0016   (spread 3.6e-3)
+        conformal   1.0004 → 1.0005 → 1.0004   (spread 1.0e-4)
 
-    The drift is the interesting half. A staircase Ĥ carries spurious
-    distributed curl in what should be empty gap, so the enclosed current
-    depends on where you measure it — the field is not a valid magnetostatic
-    one. That is also why only the conformal launch traps a DC current (R8 in
-    the plan): its deposited static field is genuinely curl-free, hence a null
-    mode of the leapfrog that nothing removes, while the staircase one has curl,
-    couples to E, and decays.
+    A staircase Ĥ carries spurious distributed curl in what should be empty gap,
+    so the enclosed current depends on where you measure it. That is why only
+    the conformal launch traps a DC current (R8 in the plan): its deposited
+    static field is genuinely curl-free, hence a null mode of the leapfrog that
+    nothing removes, while the staircase one has curl, couples to E, and decays.
+
+    Before S5d both ratios sat ~7% high (1.0758 → 1.0720 for staircase). That
+    offset was the *capacitance integral*, not the launch: it inflated Z₀ by the
+    same 7%. Only the spread was ever the physical signal.
     """
     cell = 0.5e-3
     ic = jc = int(round(0.5 * int(round(2 * B_OUT / cell))))
@@ -307,11 +313,12 @@ def test_launched_h_sheet_carries_the_exact_modal_current():
 
     conf = np.array(ratios['conformal'])
     assert np.abs(conf - 1.0).max() < 5e-3, f"modal current off by {conf}"
-    assert np.ptp(conf) < 1e-3, f"conformal Ĥ not curl-free in the gap: {conf}"
+    assert np.ptp(conf) < 5e-4, f"conformal Ĥ not curl-free in the gap: {conf}"
 
+    # The staircase launch drifts with the contour: its Ĥ is not curl-free.
     stair = np.array(ratios['staircase'])
-    assert np.abs(stair - 1.0).min() > 0.05        # ~7% high
-    assert np.ptp(stair) > 10 * np.ptp(conf)       # and drifting with the loop
+    assert np.ptp(stair) > 10 * np.ptp(conf), (
+        f"staircase Ĥ no longer drifts with the loop: {stair}")
 
 
 def test_admittance_scale_is_unity_for_a_homogeneous_fill():

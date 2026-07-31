@@ -51,7 +51,7 @@ FMAX = 10e9
 Z0_ANALYTIC = 59.9585 * np.log(B_OUT / A_IN)      # 65.871 Ω
 
 
-def build(cell, eps_r=1.0, conformal=False):
+def build(cell, eps_r=1.0, conformal=False, threshold=None):
     """Grid + analytic coax PEC mask. ``cell`` is the transverse cell size (m).
 
     With ``conformal`` the six cut-cell open-fraction arrays are attached too,
@@ -75,6 +75,7 @@ def build(cell, eps_r=1.0, conformal=False):
         ws.set_material_arrays(
             grid, grid.eps_x, grid.eps_y, grid.eps_z,
             grid.mu_x, grid.mu_y, grid.mu_z,
+            conformal_area_threshold=threshold,
             **coax_fractions(grid, cx, cy, A_IN, B_OUT))
     return grid, cx, cy
 
@@ -90,9 +91,9 @@ def _floor_db(values, tail=0.35):
 
 
 def run(cell, fmax=FMAX, steps_factor=6.0, verbose=True, conformal=False,
-        backend=None, waveform=None):
+        backend=None, waveform=None, threshold=None):
     """One resolution: returns the §7 row plus the §8 V/I purity split."""
-    grid, cx, cy = build(cell, conformal=conformal)
+    grid, cx, cy = build(cell, conformal=conformal, threshold=threshold)
     backend = backend or 'numba'
 
     # Modes on the two end planes. The launch plane sits one cell in from the
@@ -134,6 +135,7 @@ def run(cell, fmax=FMAX, steps_factor=6.0, verbose=True, conformal=False,
         n_transverse=grid.Nx,
         conformal=conformal,
         backend=backend,
+        threshold=float(grid.conformal_area_threshold),
         Z0_mode=float(mode_lo.impedance),
         Z0_err_pct=100.0 * (mode_lo.impedance / Z0_ANALYTIC - 1.0),
         Z0_ratio=v_peak / i_peak if i_peak else np.nan,
@@ -161,13 +163,16 @@ if __name__ == '__main__':
     args = sys.argv[1:]
     conformal = '--conformal' in args
     backend = 'numpy' if '--numpy' in args else None
+    thr = next((float(a.split('=')[1]) for a in args
+                if a.startswith('--threshold=')), None)
     cells = [float(a) * 1e-3 for a in args if not a.startswith('--')] or \
         [0.5e-3, 0.375e-3, 0.25e-3, 0.1875e-3]
     print(f"Reference coax: a = {A_IN*1e3} mm, b = {B_OUT*1e3} mm, "
           f"L = {LENGTH*1e3} mm, dz = {DZ*1e3} mm, fmax = {FMAX/1e9} GHz")
     print(f"Analytic Z0 = {Z0_ANALYTIC:.3f} ohm   "
           f"({'CONFORMAL' if conformal else 'staircase'})\n")
-    rows = [run(c, conformal=conformal, backend=backend) for c in cells]
+    rows = [run(c, conformal=conformal, backend=backend, threshold=thr)
+            for c in cells]
 
     print("\n| cell (mm) | Z0 (ohm) | err | V peak | V floor | I floor | split |")
     print("|---|---|---|---|---|---|---|")

@@ -694,7 +694,7 @@ def solve_tem_modes(grid: FDTDGrid, *,
         if compute_params:
             phi_air = _solve_one(lu_air, B_air, free_idx, fixed_cells,
                                  labels, fixed, Ls)
-            _attach_params(mode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c,
+            _attach_params(mode, phi, phi_air, eps_a, eps_b, da_w, db_w,
                            pec, f_a, f_b)
         modes.append(mode)
 
@@ -1026,40 +1026,21 @@ def _build_mode(phi, eps_a, eps_b, mu_a, pec, da_w, db_w, a_c, b_c, cfg,
         a_nodes=a_nodes, b_nodes=b_nodes)
 
 
-def _attach_params(mode: TEMMode, phi, phi_air, eps_a, eps_b, da_w, db_w, a_c, b_c,
+def _attach_params(mode: TEMMode, phi, phi_air, eps_a, eps_b, da_w, db_w,
                    pec=None, f_a=None, f_b=None):
-    """Fill C, L, Z₀, v, ε_eff from the field energy of the filled & air solves."""
-    if f_a is not None:
-        C = _fv_energy(phi, eps_a, eps_b, da_w, db_w, pec, f_a, f_b)
-        C_air = _fv_energy(phi_air, np.ones_like(eps_a), np.ones_like(eps_b),
-                           da_w, db_w, pec, f_a, f_b)
-        return _set_params(mode, C, C_air)
+    """Fill C, L, Z₀, v, ε_eff from the field energy of the filled & air solves.
 
-    # Energy integral uses the gradient over the whole cross-section (V = 1 V):
-    #   C = ε₀ ∫ (ε_a E_a² + ε_b E_b²) dA,  with a per-cell area dA_ij = da_i·db_j
-    #   and the gradient taken against the true (non-uniform) centre coordinates.
-    #
-    # E must be zeroed inside PEC first — exactly as _transverse_E does. φ is
-    # pinned there, but np.gradient is a centred difference, so a conductor cell
-    # bordering a free cell still reports a nonzero E. That phantom energy is
-    # weighted by the conductor's meaningless ε (1.0) in the filled solve and by
-    # 1.0 in the air solve, so it does not cancel in C/C_air and biases ε_eff low.
-    dA = da_w[:, None] * db_w[None, :]
-
-    def _grad(p):
-        Ea = -np.gradient(p, a_c, axis=0)
-        Eb = -np.gradient(p, b_c, axis=1)
-        if pec is not None:
-            Ea[pec] = 0.0
-            Eb[pec] = 0.0
-        return Ea, Eb
-
-    Ea, Eb = _grad(phi)
-    C = EPS0 * np.sum((eps_a * Ea**2 + eps_b * Eb**2) * dA)
-
-    Ea_air, Eb_air = _grad(phi_air)
-    C_air = EPS0 * np.sum((Ea_air**2 + Eb_air**2) * dA)
-
+    Both capacitances are the quadratic form of the operator that was actually
+    solved (:func:`_fv_energy`). Until S5d the staircase path instead integrated
+    a collocated ``np.gradient`` field over per-cell areas, which is a different
+    and worse discretisation: it reads 3.9% low on an exactly-solvable parallel
+    plate, and on the reference coax it was most of the gap between the +14.4%
+    staircase Z₀ error and the +6.9% the same staircased conductor gives through
+    this integral.
+    """
+    C = _fv_energy(phi, eps_a, eps_b, da_w, db_w, pec, f_a, f_b)
+    C_air = _fv_energy(phi_air, np.ones_like(eps_a), np.ones_like(eps_b),
+                       da_w, db_w, pec, f_a, f_b)
     _set_params(mode, C, C_air)
 
 

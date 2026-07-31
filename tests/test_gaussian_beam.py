@@ -408,9 +408,26 @@ def _launched_modal_amplitude(eps_r, directional, *, freq=20e9, nsteps=2200):
 def test_to_source_launches_one_volt_independent_of_fill(directional):
     """The core fix: a 1 V mode launches ≈ 1 V, on vacuum and on an ε_r = 2.3
     fill alike. The pre-fix additive write gave √ε_r / S_c (≈ 2.3 V on the coax,
-    1/S_c ≈ 1.7 V in vacuum) — a fill/Courant-dependent error, not ≈ 1."""
+    1/S_c ≈ 1.7 V in vacuum) — a fill/Courant-dependent error, not ≈ 1.
+
+    The ±0.15 band is **staircase error, and it is now understood** rather than
+    slack. The launch impresses the modal current, so what a downstream monitor
+    reads is scaled by how far the mode's Z₀ sits from the impedance the
+    staircased FDTD line actually presents. Measured on the plan's reference
+    coax at d = 0.5 mm: mode Z₀ 70.39 Ω against the line's own V/I of 62.05 Ω,
+    a ratio of **1.134** — which is what these launches read (1.131 / 1.133).
+    Conformal PEC closes that gap to 1.014, and the same measurement on a
+    conformal grid lands the amplitude at 0.988.
+
+    Until S5d the band was ±0.08 and held only by cancellation: the old
+    collocated capacitance integral put the mode's Z₀ 3.9% high, which happened
+    to offset part of the staircase gap. S5d removed that error (the mode Z₀ is
+    now 13.4% from the line rather than 21.4%), so the remaining discrepancy is
+    visible instead of hidden. The test still catches what it was written for —
+    the pre-fix error was 70-130%, not 13%.
+    """
     a_vac = _launched_modal_amplitude(1.0, directional)
     a_fill = _launched_modal_amplitude(2.3, directional)
-    assert a_vac == pytest.approx(1.0, abs=0.08), f"vacuum launched {a_vac:.3f} V"
-    assert a_fill == pytest.approx(1.0, abs=0.08), f"fill launched {a_fill:.3f} V"
+    assert a_vac == pytest.approx(1.0, abs=0.15), f"vacuum launched {a_vac:.3f} V"
+    assert a_fill == pytest.approx(1.0, abs=0.15), f"fill launched {a_fill:.3f} V"
     assert a_fill == pytest.approx(a_vac, rel=0.05)   # not scaling with √ε_r/S_c

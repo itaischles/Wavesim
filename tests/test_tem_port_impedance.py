@@ -144,12 +144,26 @@ def test_bare_port_lands_forward_volts_on_any_geometry():
 
     Two coaxes with very different κ/Z₀ (RG58 ε=2.3 → ~19%; a fatter air line →
     ~29%). Both land the forward voltage to within a few percent and agree — the
-    residual is discretisation noise, not a κ/Z₀ term.
+    residual is discretisation, not a κ/Z₀ term.
+
+    That "discretisation" is now measured rather than asserted. Refining the
+    air line transversely walks the ratio toward 1 in step with its staircase
+    Z₀ error:
+
+        n      30       45       60       80
+        Z₀   +14.6%   +15.5%   +4.7%    +4.8%
+        ratio 0.948    0.961    0.976    0.981
+
+    The ±0.06 band is the coarsest point of that sequence. It was ±0.05 until
+    S5d, held by cancellation: the old collocated capacitance integral put the
+    mode's Z₀ ~4% high, offsetting part of the staircase gap. Removing it made
+    the mode's Z₀ much more accurate (air line +35.4% → +14.6%) and left the
+    staircase gap on show.
     """
     r_rg58 = _forward_ratio(RG58)
     r_fat = _forward_ratio((30, 0.30e-3, 2.10e-3, 1.0))
-    assert r_rg58 == pytest.approx(1.0, abs=0.05), f"RG58 forward ratio {r_rg58:.3f}"
-    assert r_fat == pytest.approx(1.0, abs=0.05), f"air-line forward ratio {r_fat:.3f}"
+    assert r_rg58 == pytest.approx(1.0, abs=0.06), f"RG58 forward ratio {r_rg58:.3f}"
+    assert r_fat == pytest.approx(1.0, abs=0.06), f"air-line forward ratio {r_fat:.3f}"
     assert abs(r_rg58 - r_fat) < 0.05, (
         f"forward ratio drifts with geometry ({r_rg58:.3f} vs {r_fat:.3f})")
 
