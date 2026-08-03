@@ -41,6 +41,10 @@ from wavesim.pml import (
 )
 from wavesim.pec import (apply_pec_faces, apply_pec_mask,
                          ConformalGeometry, conformal_geometry, count_cut_cells)
+from wavesim.stability import (
+    StabilityProbe, probe_growth, max_stable_dt, stability_margin,
+    safe_area_threshold, ensure_stable_threshold,
+)
 from wavesim.sources import (
     Waveform, GaussianPulse, Sinusoid,
     Source, PointSource, ArraySource, PlaneSource, GaussianBeam,
@@ -101,6 +105,9 @@ __all__ = [
     # pec
     "apply_pec_faces", "apply_pec_mask",
     "ConformalGeometry", "conformal_geometry", "count_cut_cells",
+    # stability (conformal small-cut, plan S7)
+    "StabilityProbe", "probe_growth", "max_stable_dt", "stability_margin",
+    "safe_area_threshold", "ensure_stable_threshold",
     # sources
     "Waveform", "GaussianPulse", "Sinusoid",
     "Source", "PointSource", "ArraySource", "PlaneSource", "GaussianBeam",

@@ -28,6 +28,7 @@ Example
 
 import sys
 import time
+import warnings
 from typing import Callable, Iterable
 
 from wavesim.grid import FDTDGrid
@@ -119,6 +120,26 @@ class Simulation:
            Per-step host hooks (sources / monitors) currently sync the E/H fields
            around them; footprint-only sync is a future optimisation.
 
+    conformal_stability : {'auto', 'warn', 'off'}, optional
+        What to do about the conformal-PEC small-cut instability (plan S7).
+        A cut-cell grid can diverge at the default clamp threshold while a
+        *finer* mesh of the same model is fine, so the setting cannot be
+        reasoned about and is measured instead:
+        :func:`wavesim.stability.probe_growth` seeds noise, steps this exact
+        scheme with no sources, and reports the growth rate.
+
+        ``'auto'`` (default) raises ``grid.conformal_area_threshold`` in place
+        until the probe is quiet, and warns when it had to.
+        ``'warn'`` measures and warns but changes nothing.
+        ``'off'`` skips the measurement.
+
+        **Only a conformal grid is ever probed**, so nothing that ran before
+        this existed pays for it, and a conformal grid whose threshold already
+        works is left untouched — the check costs a few seconds and changes
+        nothing. Read ``grid.conformal_area_threshold`` *after* construction
+        when recording what a run did; under ``'auto'`` it is no longer
+        necessarily the value that was asked for.
+
     Notes
     -----
     The simulation time passed to sources is ``grid.time_step * grid.dt``,
@@ -132,7 +153,8 @@ class Simulation:
                  monitors: Iterable = (),
                  pec_faces: tuple = (),
                  boundaries: Iterable = (),
-                 backend: str = 'numpy') -> None:
+                 backend: str = 'numpy',
+                 conformal_stability: str = 'auto') -> None:
         self.grid = grid
         self.cpml = cpml
         self.sources = list(sources)
@@ -142,8 +164,59 @@ class Simulation:
         self.backend = backend
         self._update_H, self._update_E, self._update_H_pml, self._update_E_pml = \
             _load_backend(backend)
+        self.conformal_stability = conformal_stability
+        self._check_conformal_stability()
         for mon in self.monitors:
             self._autofill_energy_region(mon)
+
+    def _check_conformal_stability(self) -> None:
+        """Measure — and by default fix — the S7 small-cut instability.
+
+        Runs here rather than in ``run()`` so the threshold is settled before
+        anything reads it back, and because a caller that has built a Simulation
+        has by then supplied the two things the probe needs that the grid does
+        not carry: the PEC walls and the CPML.
+
+        The clamp threshold reaches nothing but ``inv_A`` in the H update — the
+        mode solver reads the open *edge* fractions and never the clamped face
+        areas — so raising it here cannot invalidate a port solved earlier.
+        """
+        mode = self.conformal_stability
+        if mode == 'off' or not self.grid.is_conformal:
+            return
+        if mode not in ('auto', 'warn'):
+            raise ValueError(
+                f"conformal_stability must be 'auto', 'warn' or 'off', got "
+                f"{mode!r}")
+
+        if self.backend == 'cuda':
+            # The GPU has no conformal H kernel, and ``run()`` reaches it
+            # through CudaResident, which does not check (plan R7). Probing
+            # there would step the *staircase* scheme and report a reassuring
+            # 1.000 for a grid whose conformal update was never executed — a
+            # false pass is worse than no check. Defer to the backend's own
+            # guard so there is one message, not two.
+            from wavesim.backend_cuda import _refuse_conformal
+            _refuse_conformal(self.grid)
+
+        from wavesim.stability import ensure_stable_threshold, probe_growth
+
+        probe_kw = dict(pec_faces=self.pec_faces, cpml=self.cpml,
+                        backend=self.backend)
+        if mode == 'auto':
+            ensure_stable_threshold(self.grid, **probe_kw)
+            return
+
+        probe = probe_growth(self.grid, **probe_kw)
+        if not probe.stable:
+            warnings.warn(
+                f"conformal PEC: this grid diverges at clamp threshold "
+                f"{self.grid.conformal_area_threshold:.2f} — the seeded free "
+                f"run grows {probe.growth:.4g} per step, implying "
+                f"dt_max/dt = {probe.margin:.5f}. Raise "
+                f"conformal_area_threshold, or pass "
+                f"conformal_stability='auto' to have it raised for you.",
+                RuntimeWarning, stacklevel=3)
 
     # ------------------------------------------------------------------ #
     # Building up the simulation
