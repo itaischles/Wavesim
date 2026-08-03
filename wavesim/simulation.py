@@ -7,8 +7,9 @@ them or hide the physics. Anything you can do by hand you can still do by hand;
 ``Simulation`` just bundles the grid, the optional CPML, the sources, the
 monitors, and the PEC-face list, and steps them in the fixed order:
 
-    update_H → update_H_pml → update_E → update_E_pml
-    → apply_pec_faces → apply_pec_mask
+    update_H → update_H_pml → boundaries.apply
+    → update_E → update_E_pml
+    → apply_pec_faces → apply_pec_mask → boundaries.apply_post_E
     → sources.inject → monitors.record → time_step += 1
 
 Example
@@ -293,6 +294,16 @@ class Simulation:
         if self.pec_faces:
             grid = apply_pec_faces(grid, faces=self.pec_faces)
         grid = apply_pec_mask(grid)              # no-op if no pec_mask
+
+        # 5b. Boundaries, second hook — a port that has to *constrain* E (rather
+        # than write H) needs the slot after the E update and after the PEC
+        # masking, which is where every other E constraint is applied. Optional:
+        # a boundary without one is unaffected. See
+        # :meth:`~wavesim.sources.ModalPort.apply_post_E`.
+        for bnd in self.boundaries:
+            post = getattr(bnd, 'apply_post_E', None)
+            if post is not None:
+                post(grid, t)
 
         # 6. Sources (soft, additive)
         for src in self.sources:

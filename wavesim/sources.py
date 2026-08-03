@@ -1196,7 +1196,9 @@ class ModalPort:
     # -- one-time compile ---------------------------------------------------- #
     def _setup(self, grid: FDTDGrid) -> None:
         from wavesim.mode_solver import (_plane_to_grid, _NORMAL_CFG,
-                                         _launch_time_shift, _normal_width)
+                                         _launch_time_shift, _normal_width,
+                                         _plane_open_fractions,
+                                         port_plane_pinned_nodes)
 
         normal = self.mode.normal
         k = self.mode.slice_index
@@ -1234,6 +1236,19 @@ class ModalPort:
                 continue
             ii, jj, kk = _plane_to_grid(normal, self._h_k, a, b)
             self._h[comp] = (ii, jj, kk, arr2d[a, b])
+
+        # Ghost-plane normal-E edges to hold at zero (conformal grids only).
+        # See :meth:`apply_post_E` for what goes wrong without this.
+        self._pin = None
+        if grid.is_conformal:
+            cfg = _NORMAL_CFG[normal]
+            f_a, f_b = _plane_open_fractions(grid, cfg, normal, k)
+            pinned = port_plane_pinned_nodes(f_a, f_b)
+            a, b = np.nonzero(pinned)
+            if a.size:
+                ii, jj, kk = _plane_to_grid(normal, self._h_k, a, b)
+                self._pin = ({'x': 'Ex', 'y': 'Ey', 'z': 'Ez'}[normal],
+                             ii, jj, kk)
 
         # Amplitude calibration of the launch. ``V̄ − 2a`` radiates a forward wave
         # whose modal voltage equals ``a`` for a matched sheet, so ``amplitude`` is
@@ -1288,6 +1303,59 @@ class ModalPort:
             getattr(grid, comp)[ii, jj, kk] = amp * vals
         self.times.append(t)
         self.voltages.append(V)
+
+    # -- per-step post-E hook (runs after update_E and the PEC masking) ------- #
+    def apply_post_E(self, grid: FDTDGrid, t: float) -> None:
+        """Hold the port-normal E at zero on the ghost-H plane's conductor nodes.
+
+        The ghost plane is the one place in the domain where the leapfrog is
+        **open loop**: :meth:`apply` overwrites its tangential H every step, so
+        whatever E the next Ampère update writes there can never act back on that
+        H. Anything the E update deposits on that plane therefore *integrates*,
+        step after step, with no restoring force.
+
+        What it deposits is the sheet's discrete transverse divergence. Writing
+        ``ĥ = (n̂ × ê)/η`` on the plane, the normal-E update reads its transverse
+        curl, which is ``∇_t·ê/η``. The mode solver's Laplacian drives that to
+        round-off at every node where it *solved* for ``φ`` — but not at the nodes
+        where it **pinned** ``φ``, i.e. the nodes on the conductor. There the
+        residual is the mode's induced surface charge, which is physically real
+        and of order the field itself.
+
+        That residual is not new and is not conformal: it is the same size in both
+        formulations (2.4e3 in ``V⁻¹m⁻¹`` on the reference coax either way). The
+        staircase run never saw it only because
+        :func:`wavesim.pec.build_pec_edge_masks` **dilates**, so every one of those
+        conductor-node edges was already zeroed for an unrelated reason. The
+        conformal rule of :func:`wavesim.pec.build_conformal_edge_masks` — zero an
+        edge iff its own open length is zero — is right in the bulk (plan S3) and
+        leaves these alive, because an edge running *along* a grid-aligned
+        conductor surface is fully open even though both of its endpoints are on
+        the metal. Removing the dilation removed an accidental guard.
+
+        Measured on the plan's reference coax at ``d`` = 0.5 mm with a 1 GHz
+        modulated Gaussian: ``max|Ez|`` on the ghost plane reached 6.87e3 V/m
+        against 0.35 V/m one cell in — five orders — and was reproduced to
+        3.6e-12 V/m by ``(dt/(ε₀ε))·∇_t·ê/η·Σₙ ampₙ``, i.e. it is exactly this
+        integral and nothing else. It survives ``amplitude = 0`` on both ports, so
+        it is a property of the sheet, not of the drive.
+
+        The condition is **geometric alignment**, not cut-cell size: it fires only
+        where a conductor surface lands on the node ruler. Shifting the same coax
+        a quarter cell off-lattice takes the count of affected edges to zero; a
+        grid-aligned *rectangular* conductor, where every surface node qualifies,
+        takes it from 6 to 117.
+
+        Zeroing here rather than in :meth:`apply` is deliberate: ``apply`` runs
+        *before* the E update, so it would leave one step's worth of the residual
+        (~60 V/m on that case) alive for the monitors and for the next H update.
+        This hook runs after the E update and after the PEC masking, so the plane
+        is clean when anything reads it.
+        """
+        if self._pin is None:
+            return
+        comp, ii, jj, kk = self._pin
+        getattr(grid, comp)[ii, jj, kk] = 0.0
 
 
 class SpicePort(LineSource):

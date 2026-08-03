@@ -159,6 +159,44 @@ def _conformal_node_pec(f_a: np.ndarray, f_b: np.ndarray) -> np.ndarray:
     return covered
 
 
+# An open fraction at or below this is a *covered* edge. The exact ``== 0.0``
+# test used elsewhere in this module is not enough for the port-plane rule below,
+# because an analytic or voxelised fraction generator lands a grid-aligned
+# conductor face on the node ruler to within round-off, not exactly: a face
+# tangent to the mesh produces fractions like 1.7e-15 rather than 0.0. Such an
+# edge is covered in every sense that matters — its ``ê = −Δφ/(f·d)`` divides a
+# round-off numerator by a round-off denominator — but it fails ``== 0.0`` and so
+# escapes both :func:`_conformal_node_pec` and
+# :func:`wavesim.pec.build_conformal_edge_masks`. The threshold is far below any
+# fraction a real cut produces (the smallest on the reference coax is 0.125) and
+# far above the ~1e-16 round-off floor, so it separates the two cleanly.
+COVERED_FRACTION_TOL = 1e-9
+
+
+def port_plane_pinned_nodes(f_a: np.ndarray, f_b: np.ndarray,
+                            tol: float = COVERED_FRACTION_TOL) -> np.ndarray:
+    """Nodes on the mode plane that lie *on or inside* the conductor.
+
+    The same rule as :func:`_conformal_node_pec` — a node is metal iff one of the
+    (up to four) transverse edges meeting it is fully covered — but tested to
+    ``tol`` rather than exactly, and returned for the port machinery rather than
+    for the conductor labelling. See :attr:`COVERED_FRACTION_TOL` for why the
+    tolerance is needed and :meth:`ModalPort._setup` for what it is used for.
+
+    These are precisely the nodes at which ``φ`` is *pinned* rather than solved,
+    so the discrete divergence ``∇·(ε ê)`` — which the Laplacian drives to zero at
+    every free node — is unconstrained there. What it holds instead is the mode's
+    induced **surface charge**, which is physically real and nonzero. That is
+    harmless in the bulk, where the leapfrog carries it, and is the whole problem
+    on a :class:`~wavesim.sources.ModalPort`'s ghost-H plane, where there is no
+    leapfrog to carry it.
+    """
+    m = (f_a <= tol) | (f_b <= tol)
+    m[1:, :] |= (f_a[:-1, :] <= tol)
+    m[:, 1:] |= (f_b[:, :-1] <= tol)
+    return m
+
+
 def _plane_to_grid(normal: str, k: int, a: np.ndarray, b: np.ndarray):
     """Map transverse-plane indices ``(a, b)`` on the slice to full 3D grid
     indices, inverting :func:`_slice` (same (a, b) axis order)."""
