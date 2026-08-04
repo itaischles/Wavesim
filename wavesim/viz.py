@@ -132,7 +132,7 @@ def plot_grid_xy(grid: FDTDGrid, cpml=None, ax=None):
 def plot_materials_xy(grid: FDTDGrid, component: str = 'eps_z',
                       cpml=None, ax=None):
     """
-    2D colour map of a material array (eps or mu) in the XY plane.
+    2D colour map of a material array (eps, mu or sigma) in the XY plane.
 
     Shows cell boundaries as thin grid lines. Annotates with colour bar
     and physical dimensions.
@@ -144,8 +144,16 @@ def plot_materials_xy(grid: FDTDGrid, component: str = 'eps_z',
     Parameters
     ----------
     component : str
-        One of: 'eps_x', 'eps_y', 'eps_z', 'mu_x', 'mu_y', 'mu_z'
+        One of: 'eps_x', 'eps_y', 'eps_z', 'mu_x', 'mu_y', 'mu_z',
+        'sigma_x', 'sigma_y', 'sigma_z'. The sigma arrays exist only on a lossy
+        grid (see :mod:`wavesim.loss`).
     """
+    if component.startswith('sigma') and getattr(grid, component, None) is None:
+        raise ValueError(
+            f"{component!r}: this grid carries no conductivity, so there is "
+            f"nothing to plot. Place a lossy material (sigma=... on set_box / "
+            f"set_dielectric) or plot an 'eps_*' / 'mu_*' component instead.")
+
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 7))
     else:

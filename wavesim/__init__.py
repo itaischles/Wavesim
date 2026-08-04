@@ -56,9 +56,9 @@ from wavesim.sources import (
 )
 from wavesim.monitors import (
     FieldProbe, SnapshotMonitor, PoyntingMonitor, EnergyMonitor,
-    VoltageMonitor, CurrentMonitor, circular_path,
+    DissipationMonitor, VoltageMonitor, CurrentMonitor, circular_path,
     record_field, record_snapshot, record_poynting, record_energy,
-    record_voltage, record_current,
+    record_dissipation, record_voltage, record_current,
 )
 from wavesim.update import update_H, update_E
 from wavesim.simulation import Simulation
@@ -121,9 +121,9 @@ __all__ = [
     "LineSource", "TEMPort", "ModalPort", "SpicePort", "VolumeSource",
     # monitors
     "FieldProbe", "SnapshotMonitor", "PoyntingMonitor", "EnergyMonitor",
-    "VoltageMonitor", "CurrentMonitor", "circular_path",
+    "DissipationMonitor", "VoltageMonitor", "CurrentMonitor", "circular_path",
     "record_field", "record_snapshot", "record_poynting", "record_energy",
-    "record_voltage", "record_current",
+    "record_dissipation", "record_voltage", "record_current",
     # update
     "update_H", "update_E",
     # simulation

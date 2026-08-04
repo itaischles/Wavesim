@@ -83,16 +83,19 @@ _NORMAL_CFG = {
     'z': dict(axes=('x', 'y'), ds=('dx', 'dy'),
               dp=('dxp', 'dyp'), cen=('xc', 'yc'), node=('x', 'y'),
               eps=('eps_x', 'eps_y'), mu='mu_x',
+              sigma=('sigma_x', 'sigma_y'),
               edge=('pec_edge_open_x', 'pec_edge_open_y'),
               E=('Ex', 'Ey'), H=('Hx', 'Hy'), h_sign=(-1.0, +1.0)),
     'y': dict(axes=('x', 'z'), ds=('dx', 'dz'),
               dp=('dxp', 'dzp'), cen=('xc', 'zc'), node=('x', 'z'),
               eps=('eps_x', 'eps_z'), mu='mu_x',
+              sigma=('sigma_x', 'sigma_z'),
               edge=('pec_edge_open_x', 'pec_edge_open_z'),
               E=('Ex', 'Ez'), H=('Hx', 'Hz'), h_sign=(+1.0, -1.0)),
     'x': dict(axes=('y', 'z'), ds=('dy', 'dz'),
               dp=('dyp', 'dzp'), cen=('yc', 'zc'), node=('y', 'z'),
               eps=('eps_y', 'eps_z'), mu='mu_y',
+              sigma=('sigma_y', 'sigma_z'),
               edge=('pec_edge_open_y', 'pec_edge_open_z'),
               E=('Ey', 'Ez'), H=('Hy', 'Hz'), h_sign=(-1.0, +1.0)),
 }
@@ -605,6 +608,36 @@ class TEMMode:
 # Public entry point
 # ====================================================================== #
 
+def _warn_if_lossy_plane(grid: FDTDGrid, cfg: dict, normal: str, k: int) -> None:
+    """Warn when the port plane carries conductivity, and solve lossless anyway.
+
+    The static solve is ``∇·(ε∇φ) = 0`` over a **real** ε. Conductivity makes it
+    ``∇·(ε̃∇φ) = 0`` with ``ε̃ = ε − jσ/(ωε₀)``, so φ, Z₀ and γ all go complex and
+    become frequency-dependent — a different solver, not a coefficient change.
+
+    Solving on Re(ε) is the right default rather than a refusal: a port plane
+    normally sits in low-loss dielectric, where the correction to Z₀ is second
+    order in tan δ (0.5% at tan δ = 0.1), and the alternative is refusing to
+    launch into any model that has a lossy substrate somewhere. But the number
+    returned is the *lossless* Z₀ of that cross-section, so it is said out loud.
+    """
+    if not grid.is_lossy:
+        return
+    worst = max(float(np.max(_slice(getattr(grid, name), normal, k)))
+                for name in cfg['sigma'])
+    if worst <= 0.0:
+        return
+    warnings.warn(
+        f"solve_tem_modes: the port plane carries conductivity (max sigma = "
+        f"{worst:.4g} S/m). The transverse-static solve uses the real part of "
+        f"eps only, so the reported Z0, C, L and eps_eff are those of the "
+        f"lossless cross-section; the true ones are complex and "
+        f"frequency-dependent. Fine when the port sits in low-loss dielectric "
+        f"(the usual case) -- place the port plane clear of the lossy region if "
+        f"you need the loss reflected in Z0.",
+        RuntimeWarning, stacklevel=2)
+
+
 def solve_tem_modes(grid: FDTDGrid, *,
                     normal: str = 'z', position: float = 0.0,
                     bounds: Tuple[float, float, float, float] = None,
@@ -651,6 +684,7 @@ def solve_tem_modes(grid: FDTDGrid, *,
     eps_a_full = _slice(getattr(grid, cfg['eps'][0]), normal, k)
     eps_b_full = _slice(getattr(grid, cfg['eps'][1]), normal, k)
     mu_a_full = _slice(getattr(grid, cfg['mu']), normal, k)
+    _warn_if_lossy_plane(grid, cfg, normal, k)
 
     # Conformal cut-cell geometry, if the grid carries it. The conductor mask
     # then comes from the cut edges rather than from the cell-centred

@@ -38,9 +38,9 @@ from wavesim.pec import apply_pec_faces, apply_pec_mask
 from wavesim.sources import Source
 from wavesim.monitors import (
     FieldProbe, SnapshotMonitor, PoyntingMonitor, EnergyMonitor,
-    VoltageMonitor, CurrentMonitor,
+    DissipationMonitor, VoltageMonitor, CurrentMonitor,
     record_field, record_snapshot, record_poynting, record_energy,
-    record_voltage, record_current,
+    record_dissipation, record_voltage, record_current,
 )
 
 
@@ -51,9 +51,14 @@ _RECORDERS = {
     SnapshotMonitor:  record_snapshot,
     PoyntingMonitor:  record_poynting,
     EnergyMonitor:    record_energy,
+    DissipationMonitor: record_dissipation,
     VoltageMonitor:   record_voltage,
     CurrentMonitor:   record_current,
 }
+
+# Monitors that carry the region/d_pml/faces trio and want it filled from the
+# run's CPML (see Simulation._autofill_region).
+_REGION_MONITORS = (EnergyMonitor, DissipationMonitor)
 
 
 def _load_backend(backend: str):
@@ -93,7 +98,8 @@ class Simulation:
         Excitations injected each step (see :mod:`wavesim.sources`).
     monitors : iterable, optional
         Any mix of FieldProbe / SnapshotMonitor / PoyntingMonitor /
-        EnergyMonitor / VoltageMonitor / CurrentMonitor; recorded each step.
+        EnergyMonitor / DissipationMonitor / VoltageMonitor / CurrentMonitor;
+        recorded each step.
     pec_faces : tuple of str, optional
         Domain faces to hold as PEC walls each step, e.g. ('y0', 'y1').
         ``apply_pec_mask`` always runs as well (it is a no-op when the grid has
@@ -168,7 +174,7 @@ class Simulation:
         self.conformal_stability = conformal_stability
         self._check_conformal_stability()
         for mon in self.monitors:
-            self._autofill_energy_region(mon)
+            self._autofill_region(mon)
 
     def _check_conformal_stability(self) -> None:
         """Measure — and by default fix — the S7 small-cut instability.
@@ -244,19 +250,19 @@ class Simulation:
             raise TypeError(
                 f"Unknown monitor type {type(monitor).__name__}. "
                 f"Expected one of {[t.__name__ for t in _RECORDERS]}.")
-        self._autofill_energy_region(monitor)
+        self._autofill_region(monitor)
         self.monitors.append(monitor)
         return monitor
 
-    def _autofill_energy_region(self, monitor) -> None:
-        """Fill an ``'interior'`` EnergyMonitor's PML geometry from this run's CPML.
+    def _autofill_region(self, monitor) -> None:
+        """Fill an ``'interior'`` monitor's PML geometry from this run's CPML.
 
         The monitor needs the PML thickness and absorbing faces to know which
         outer cells to drop, but they live on the ``CPMLArrays``, not the grid.
         Copy them from ``self.cpml`` unless the user set them explicitly. With no
         CPML, ``'interior'`` trims nothing (``d_pml=0``) and equals ``'full'``.
         """
-        if not isinstance(monitor, EnergyMonitor) or monitor.region != 'interior':
+        if not isinstance(monitor, _REGION_MONITORS) or monitor.region != 'interior':
             return
         if self.cpml is not None:
             if monitor.d_pml is None:
