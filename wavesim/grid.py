@@ -132,6 +132,24 @@ class FDTDGrid:
     zc: np.ndarray
 
     # ------------------------------------------------------------------ #
+    # Electric conductivity (S/m) — shape (Nx, Ny, Nz), same staggering as eps.
+    # ``sigma_x`` is the conductivity seen by Ex, etc.
+    #
+    # ``None`` (the default) means lossless, and is not the same thing as an
+    # all-zero array: it selects the one-coefficient E update, which cannot
+    # differ from the pre-loss solver because it is the same code. (All-zero
+    # arrays take the lossy path and give bit-identical results anyway — see
+    # :mod:`wavesim.loss` — but they cost three array reads per E component.)
+    #
+    # All three are set together or not at all. Lossy DIELECTRICS only: a good
+    # conductor belongs in ``pec_mask``, and where the two overlap PEC wins,
+    # since ``apply_pec_mask`` zeroes E after the update either way.
+    # ------------------------------------------------------------------ #
+    sigma_x: np.ndarray = field(default=None)
+    sigma_y: np.ndarray = field(default=None)
+    sigma_z: np.ndarray = field(default=None)
+
+    # ------------------------------------------------------------------ #
     # PEC body mask — shape (Nx, Ny, Nz), dtype bool
     # True = cell is a perfect electric conductor.
     # E components inside PEC cells are zeroed after every E update.
@@ -205,6 +223,18 @@ class FDTDGrid:
         never have to remember which of the six arrays to test.
         """
         return self.pec_face_open_x is not None
+
+    # ------------------------------------------------------------------ #
+    # Lossy-dielectric predicate
+    # ------------------------------------------------------------------ #
+    @property
+    def is_lossy(self) -> bool:
+        """True when electric-conductivity arrays are present.
+
+        The single place the lossy/lossless branch is decided, mirroring
+        :attr:`is_conformal`. See :mod:`wavesim.loss`.
+        """
+        return self.sigma_x is not None
 
     # ------------------------------------------------------------------ #
     # Coordinate conversion — metres -> cell index

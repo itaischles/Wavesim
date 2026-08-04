@@ -31,10 +31,14 @@ from importlib import import_module
 from wavesim.constants import C0, EPS0, MU0, ETA0
 from wavesim.grid import FDTDGrid, create_grid, create_grid_rectilinear
 from wavesim.materials import (
-    set_vacuum, set_material_arrays, set_box, set_cylinder, set_coax,
+    set_vacuum, set_dielectric, set_material_arrays,
+    set_box, set_cylinder, set_coax,
 )
 from wavesim.subpixel import (
     reduce_fine_eps, smooth_from_function, smooth_shape_region,
+)
+from wavesim.loss import (
+    LossCoefficients, build_loss_coefficients, loss_coefficients,
 )
 from wavesim.pml import (
     CPMLArrays, init_cpml, update_H_pml, update_E_pml, ALL_FACES,
@@ -97,9 +101,12 @@ __all__ = [
     # grid
     "FDTDGrid", "create_grid", "create_grid_rectilinear",
     # materials
-    "set_vacuum", "set_material_arrays", "set_box", "set_cylinder", "set_coax",
+    "set_vacuum", "set_dielectric", "set_material_arrays",
+    "set_box", "set_cylinder", "set_coax",
     # subpixel smoothing
     "reduce_fine_eps", "smooth_from_function", "smooth_shape_region",
+    # lossy dielectrics
+    "LossCoefficients", "build_loss_coefficients", "loss_coefficients",
     # pml
     "CPMLArrays", "init_cpml", "update_H_pml", "update_E_pml", "ALL_FACES",
     # pec

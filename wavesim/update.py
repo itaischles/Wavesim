@@ -28,6 +28,11 @@ Update equations (Ampere — E step):
     Ey[i,j,k] += (dt/eps_y) * ( (Hx[i,j,k]-Hx[i,j,k-1])/dz - (Hz[i,j,k]-Hz[i-1,j,k])/dx )
     Ez[i,j,k] += (dt/eps_z) * ( (Hy[i,j,k]-Hy[i-1,j,k])/dx - (Hx[i,j,k]-Hx[i,j-1,k])/dy )
 
+A grid carrying electric conductivity takes the two-coefficient form of the same
+E step, ``E = Ca·E + Cb·curl H`` (`_update_E_lossy`, coefficients in
+:mod:`wavesim.loss`). H is unaffected — wavesim models lossy dielectrics, not
+magnetic loss.
+
 The `if grid.Nz > 1` branches below are the full-3D path; the `else` branches are
 a deliberate `Nz=1` fast path that drops the z-derivative entirely (used by the
 2D-slice Tests 00–04 and quick iteration). Both paths are validated — full 3D by
@@ -40,6 +45,7 @@ guarded by a plain `if Nz > 1`, and is bit-identical to this reference.
 import numpy as np
 from wavesim.grid import FDTDGrid
 from wavesim.constants import MU0, EPS0
+from wavesim.loss import loss_coefficients
 from wavesim.pec import conformal_geometry
 
 
@@ -182,6 +188,16 @@ def _update_H_conformal(grid: FDTDGrid) -> FDTDGrid:
 
 
 def update_E(grid: FDTDGrid) -> FDTDGrid:
+    """Advance E by one timestep using the full 3D curl of H.
+
+    Dispatches to the two-coefficient form when the grid carries electric
+    conductivity. As with the conformal branch in :func:`update_H`, the lossless
+    branch below is left exactly as it was — a model with no lossy material must
+    not pay for the two extra full-volume array reads per component.
+    """
+    if grid.is_lossy:
+        return _update_E_lossy(grid)
+
     dt = grid.dt
     # Every E derivative differences an H field that sits at a cell CENTRE along
     # the differenced axis (Hz[i,j,k] is at yc[j]), so the denominator is the DUAL
@@ -219,5 +235,51 @@ def update_E(grid: FDTDGrid) -> FDTDGrid:
     grid.Ez[1:, 1:, :] += (dt / (EPS0 * grid.eps_z[1:, 1:, :])) * (
         dHy_dx[:, 1:, :] - dHx_dy[1:, :, :]
     )
+
+    return grid
+
+
+def _update_E_lossy(grid: FDTDGrid) -> FDTDGrid:
+    """Ampere with a conduction current: ``E = Ca·E + Cb·curl H``.
+
+    Same stencil, same divisors, same updated sub-ranges as the lossless branch
+    — only the two coefficients differ, and they are precomputed and cached (see
+    :mod:`wavesim.loss`). At σ = 0 the coefficients are exactly ``1`` and
+    ``dt/(ε₀ε)``, so this reproduces the lossless branch bit-for-bit; the sole
+    reason for the separate branch is the cost of reading Ca/Cb.
+    """
+    c = loss_coefficients(grid)
+    dxd = grid.dxd[:-1][:, None, None]
+    dyd = grid.dyd[:-1][None, :, None]
+    dzd = grid.dzd[:-1][None, None, :]
+
+    # Ex: dHz/dy - dHy/dz
+    dHz_dy = (grid.Hz[:, 1:, :] - grid.Hz[:, :-1, :]) / dyd
+    if grid.Nz > 1:
+        dHy_dz = (grid.Hy[:, :, 1:] - grid.Hy[:, :, :-1]) / dzd
+        sl = np.s_[:, 1:, 1:]
+        grid.Ex[sl] = (c.Ca_x[sl] * grid.Ex[sl]
+                       + c.Cb_x[sl] * (dHz_dy[:, :, 1:] - dHy_dz[:, 1:, :]))
+    else:
+        sl = np.s_[:, 1:, :]
+        grid.Ex[sl] = c.Ca_x[sl] * grid.Ex[sl] + c.Cb_x[sl] * dHz_dy
+
+    # Ey: dHx/dz - dHz/dx
+    dHz_dx = (grid.Hz[1:, :, :] - grid.Hz[:-1, :, :]) / dxd
+    if grid.Nz > 1:
+        dHx_dz = (grid.Hx[:, :, 1:] - grid.Hx[:, :, :-1]) / dzd
+        sl = np.s_[1:, :, 1:]
+        grid.Ey[sl] = (c.Ca_y[sl] * grid.Ey[sl]
+                       + c.Cb_y[sl] * (dHx_dz[1:, :, :] - dHz_dx[:, :, 1:]))
+    else:
+        sl = np.s_[1:, :, :]
+        grid.Ey[sl] = c.Ca_y[sl] * grid.Ey[sl] + c.Cb_y[sl] * (-dHz_dx)
+
+    # Ez: dHy/dx - dHx/dy
+    dHy_dx = (grid.Hy[1:, :, :] - grid.Hy[:-1, :, :]) / dxd
+    dHx_dy = (grid.Hx[:, 1:, :] - grid.Hx[:, :-1, :]) / dyd
+    sl = np.s_[1:, 1:, :]
+    grid.Ez[sl] = (c.Ca_z[sl] * grid.Ez[sl]
+                   + c.Cb_z[sl] * (dHy_dx[:, 1:, :] - dHx_dy[1:, :, :]))
 
     return grid

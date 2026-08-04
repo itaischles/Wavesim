@@ -12,9 +12,14 @@ TEST SCAFFOLDING (used only in tests and examples):
     set_cylinder()           — cylindrical rod aligned with Z
     set_coax()               — coaxial cross-section in XY plane
 
-All geometry functions ultimately write to eps/mu arrays or grid.pec_mask.
+All geometry functions ultimately write to eps/mu/sigma arrays or grid.pec_mask.
 The future CAD importer bypasses scaffolding and calls set_material_arrays()
 directly.
+
+Conductivity is opt-in: every placement function takes ``sigma`` (S/m,
+default 0), and the σ arrays are allocated only once a nonzero one is placed, so
+a lossless model never carries them. Lossy dielectrics only — see
+:mod:`wavesim.loss` for why a metal-scale σ is not a model of a metal.
 """
 
 import numpy as np
@@ -28,7 +33,7 @@ from wavesim.subpixel import smooth_shape_region
 
 def set_vacuum(grid: FDTDGrid) -> FDTDGrid:
     """
-    Set entire domain to eps_r=1, mu_r=1 (vacuum).
+    Set entire domain to eps_r=1, mu_r=1, sigma=0 (vacuum).
     Always call this first before placing any material regions.
     """
     grid.eps_x[:] = 1.0
@@ -37,13 +42,18 @@ def set_vacuum(grid: FDTDGrid) -> FDTDGrid:
     grid.mu_x[:]  = 1.0
     grid.mu_y[:]  = 1.0
     grid.mu_z[:]  = 1.0
+    _clear_sigma(grid)
     return grid
 
 def set_dielectric(grid: FDTDGrid,
-                   EPS_X: float, EPS_Y: float = None, EPS_Z: float = None) -> FDTDGrid:
+                   EPS_X: float, EPS_Y: float = None, EPS_Z: float = None,
+                   sigma: float = 0.0) -> FDTDGrid:
     """
     Set entire domain to uniform dielectric with specified epsilon values.
     If EPS_Y or EPS_Z are not provided, they default to EPS_X.
+
+    ``sigma`` is the (isotropic) electric conductivity in S/m — lossy
+    dielectrics only; see :mod:`wavesim.loss`.
     """
     if EPS_Y is None:
         EPS_Y = EPS_X
@@ -56,7 +66,73 @@ def set_dielectric(grid: FDTDGrid,
     grid.mu_x[:]  = 1.0
     grid.mu_y[:]  = 1.0
     grid.mu_z[:]  = 1.0
+    if sigma:
+        for arr in _sigma_arrays(grid):
+            arr[:] = sigma
+    else:
+        _clear_sigma(grid)
     return grid
+
+
+# ----------------------------------------------------------------------- #
+# Conductivity plumbing
+#
+# The σ arrays are allocated on first use rather than with the grid, so a
+# lossless model neither carries them nor takes the lossy update path (see
+# wavesim.loss). ``sigma=0.0`` therefore does not allocate: passing it means
+# "no loss here", not "make this grid lossy with zero loss".
+# ----------------------------------------------------------------------- #
+
+def _sigma_arrays(grid: FDTDGrid) -> tuple:
+    """The three σ arrays, allocating zeros (and so making the grid lossy) once."""
+    if grid.sigma_x is None:
+        shape = (grid.Nx, grid.Ny, grid.Nz)
+        dtype = grid.eps_x.dtype
+        grid.sigma_x = np.zeros(shape, dtype=dtype)
+        grid.sigma_y = np.zeros(shape, dtype=dtype)
+        grid.sigma_z = np.zeros(shape, dtype=dtype)
+    return grid.sigma_x, grid.sigma_y, grid.sigma_z
+
+
+def _clear_sigma(grid: FDTDGrid) -> None:
+    """Drop the σ arrays entirely, returning the grid to the lossless path."""
+    grid.sigma_x = grid.sigma_y = grid.sigma_z = None
+    grid._loss_cache = None
+
+
+def _reject_conductive_pec(sigma: float, what: str) -> None:
+    """A region cannot be both PEC and a lossy dielectric.
+
+    Silently ignoring the σ would be defensible — ``apply_pec_mask`` zeroes E in
+    the cell afterwards either way, so PEC wins on overlap — but a caller who
+    typed both wants one of them and we cannot tell which.
+    """
+    if sigma:
+        raise ValueError(
+            f"{what}: pec=True and sigma={sigma} are mutually exclusive. A PEC "
+            f"cell has its E zeroed after every update, so the conductivity "
+            f"would have no effect. Drop one: PEC for a good conductor, sigma "
+            f"for a lossy dielectric.")
+
+
+def _reject_subpixel_sigma(sigma: float, what: str) -> None:
+    """Refuse subpixel smoothing of a lossy shape.
+
+    Kottke's normal/tangential reduction is derived for a real ε. Conductivity
+    is the imaginary part of ``eps~ = eps - j*sigma/(w*eps0)``, so the correct
+    smoothing of a lossy interface is frequency-dependent and a real (ε, σ) pair
+    cannot carry it. Applying the ε rule to σ regardless is a common
+    approximation and may be added later; until it is measured, a staircased
+    boundary whose error is understood beats a smoothed one whose error is not.
+    """
+    if sigma:
+        raise NotImplementedError(
+            f"{what}: subpixel smoothing of a lossy material is not supported. "
+            f"Kottke's tensor reduction is derived for a real permittivity, and "
+            f"the correct smoothing of a conductive interface is "
+            f"frequency-dependent (sigma is the imaginary part of eps). Place "
+            f"the lossy region with subpixel=False, or place it lossless and "
+            f"write grid.sigma_* yourself.")
 
 _CONFORMAL_KEYS = ('pec_edge_open_x', 'pec_edge_open_y', 'pec_edge_open_z',
                    'pec_face_open_x', 'pec_face_open_y', 'pec_face_open_z')
@@ -65,6 +141,9 @@ _CONFORMAL_KEYS = ('pec_edge_open_x', 'pec_edge_open_y', 'pec_edge_open_z',
 def set_material_arrays(grid: FDTDGrid,
                         eps_x: np.ndarray, eps_y: np.ndarray, eps_z: np.ndarray,
                         mu_x:  np.ndarray, mu_y:  np.ndarray, mu_z:  np.ndarray,
+                        sigma_x: np.ndarray = None,
+                        sigma_y: np.ndarray = None,
+                        sigma_z: np.ndarray = None,
                         pec_mask: np.ndarray = None,
                         pec_edge_open_x: np.ndarray = None,
                         pec_edge_open_y: np.ndarray = None,
@@ -81,6 +160,18 @@ def set_material_arrays(grid: FDTDGrid,
 
     All arrays must have shape (Nx, Ny, Nz).
     If pec_mask is provided it is written into grid.pec_mask.
+
+    Conductivity
+    ------------
+    The three ``sigma_*`` arrays are the electric conductivity in S/m seen by
+    Ex/Ey/Ez, all three together or none at all. Passing them switches the
+    solver onto the two-coefficient E update (:mod:`wavesim.loss`); omitting
+    them (the default) **clears** any conductivity the grid was carrying and
+    leaves every existing code path untouched and bit-identical.
+
+    Lossy dielectrics only. Good conductors belong in ``pec_mask``; where a σ
+    region and ``pec_mask`` overlap, PEC wins, because ``apply_pec_mask`` zeroes
+    E after the update regardless.
 
     Conformal PEC
     -------------
@@ -107,6 +198,27 @@ def set_material_arrays(grid: FDTDGrid,
     grid.mu_x  = mu_x.copy()
     grid.mu_y  = mu_y.copy()
     grid.mu_z  = mu_z.copy()
+
+    sigmas = (sigma_x, sigma_y, sigma_z)
+    if any(s is not None for s in sigmas):
+        # All three or none, for the same reason the conformal set is all six:
+        # a partial set would leave one field component lossless and the other
+        # two damped, which is not a material anyone asked for.
+        names = ('sigma_x', 'sigma_y', 'sigma_z')
+        missing = [n for n, s in zip(names, sigmas) if s is None]
+        if missing:
+            raise ValueError(
+                "conductivity must be supplied for all three components; "
+                f"missing {missing}")
+        for name, arr in zip(names, sigmas):
+            if arr.shape != shape:
+                raise ValueError(f"{name}: expected shape {shape}, got {arr.shape}")
+            if np.any(arr < 0.0):
+                raise ValueError(f"{name}: conductivity must be non-negative")
+            setattr(grid, name, arr.copy())
+        grid._loss_cache = None
+    else:
+        _clear_sigma(grid)
 
     if pec_mask is not None:
         if pec_mask.shape != shape:
@@ -157,7 +269,7 @@ def set_box(grid: FDTDGrid,
             y0: float, y1: float,
             z0: float, z1: float,
             eps_r: float, mu_r: float = 1.0,
-            pec: bool = False,
+            pec: bool = False, sigma: float = 0.0,
             subpixel: bool = False, oversample: int = 4) -> FDTDGrid:
     """
     Fill an axis-aligned box with a uniform material, or mark as PEC.
@@ -171,6 +283,11 @@ def set_box(grid: FDTDGrid,
     pec : bool
         If True, mark the region as PEC in grid.pec_mask instead of
         writing eps/mu values.
+    sigma : float
+        Electric conductivity of the fill in S/m (default 0 — lossless).
+        **Lossy dielectrics only**: a metal-scale sigma is not a model of a
+        metal, see :mod:`wavesim.loss`. Mutually exclusive with ``pec``, and not
+        supported together with ``subpixel``.
     subpixel : bool
         If True (dielectric only), place the box with **subpixel smoothing**:
         the true physical box edges are honoured and boundary cells receive the
@@ -180,12 +297,15 @@ def set_box(grid: FDTDGrid,
     oversample : int
         Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
     """
+    _reject_conductive_pec(sigma if pec else 0.0, "set_box")
+
     if subpixel:
         if pec:
             raise NotImplementedError(
                 "subpixel smoothing is for dielectrics only; PEC is a hard "
                 "field constraint, not a material average (see wavesim.pec). "
                 "Use pec=True without subpixel.")
+        _reject_subpixel_sigma(sigma, "set_box")
         return smooth_shape_region(
             grid,
             lambda X, Y, Z: ((X >= x0) & (X <= x1) &
@@ -219,6 +339,11 @@ def set_box(grid: FDTDGrid,
         grid.mu_x[sl]  = mu_r
         grid.mu_y[sl]  = mu_r
         grid.mu_z[sl]  = mu_r
+        if sigma or grid.is_lossy:
+            # Write zeros too once the grid is lossy, so re-placing a lossless
+            # material over a lossy region actually clears it.
+            for arr in _sigma_arrays(grid):
+                arr[sl] = sigma
 
     return grid
 
@@ -228,7 +353,7 @@ def set_cylinder(grid: FDTDGrid,
                  radius: float,
                  z0: float, z1: float,
                  eps_r: float, mu_r: float = 1.0,
-                 pec: bool = False,
+                 pec: bool = False, sigma: float = 0.0,
                  subpixel: bool = False, oversample: int = 4) -> FDTDGrid:
     """
     Fill a cylindrical rod aligned with Z, or mark as PEC.
@@ -245,6 +370,9 @@ def set_cylinder(grid: FDTDGrid,
         Material properties (ignored when pec=True).
     pec : bool
         If True, mark the cylinder as PEC.
+    sigma : float
+        Electric conductivity of the fill in S/m (default 0 — lossless). Lossy
+        dielectrics only; see :func:`set_box` and :mod:`wavesim.loss`.
     subpixel : bool
         If True (dielectric only), place the rod with **subpixel smoothing** so
         the curved boundary is anti-staircased with an anisotropic effective
@@ -252,12 +380,15 @@ def set_cylinder(grid: FDTDGrid,
     oversample : int
         Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
     """
+    _reject_conductive_pec(sigma if pec else 0.0, "set_cylinder")
+
     if subpixel:
         if pec:
             raise NotImplementedError(
                 "subpixel smoothing is for dielectrics only; PEC is a hard "
                 "field constraint, not a material average (see wavesim.pec). "
                 "Use pec=True without subpixel.")
+        _reject_subpixel_sigma(sigma, "set_cylinder")
         return smooth_shape_region(
             grid,
             lambda X, Y, Z: (((X - cx) ** 2 + (Y - cy) ** 2 <= radius ** 2) &
@@ -286,6 +417,7 @@ def set_cylinder(grid: FDTDGrid,
         grid.pec_mask[:, :, k0:k1] |= mask_2d[:, :, np.newaxis]
     else:
         # Apply material to all z slices in range
+        sigmas = _sigma_arrays(grid) if (sigma or grid.is_lossy) else ()
         for k in range(k0, k1):
             grid.eps_x[:, :, k] = np.where(mask_2d, eps_r, grid.eps_x[:, :, k])
             grid.eps_y[:, :, k] = np.where(mask_2d, eps_r, grid.eps_y[:, :, k])
@@ -293,6 +425,8 @@ def set_cylinder(grid: FDTDGrid,
             grid.mu_x[:, :, k]  = np.where(mask_2d, mu_r,  grid.mu_x[:, :, k])
             grid.mu_y[:, :, k]  = np.where(mask_2d, mu_r,  grid.mu_y[:, :, k])
             grid.mu_z[:, :, k]  = np.where(mask_2d, mu_r,  grid.mu_z[:, :, k])
+            for arr in sigmas:
+                arr[:, :, k] = np.where(mask_2d, sigma, arr[:, :, k])
 
     return grid
 

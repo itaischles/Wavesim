@@ -63,6 +63,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from wavesim.grid import FDTDGrid
+from wavesim.loss import loss_coefficients
 from wavesim.pec import conformal_geometry
 from wavesim.constants import EPS0, MU0, ETA0
 
@@ -507,7 +508,8 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     """
     Advance the H-derivative psi arrays and add their correction onto the E
     fields that update_E has already advanced. Coefficient is dt/(EPS0*eps) to
-    match update.py exactly.
+    match update.py exactly — or ``Cb`` when the grid is lossy, which is the
+    same thing generalised; see ``cb`` below.
 
     psi arrays are boundary slabs (see module docstring): the derivative axis
     carries only the active PML indices sel_*E. Each slab index j holds the
@@ -517,6 +519,29 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     dt = grid.dt
     Nz = grid.Nz
     sx, sy, sz = cpml.sel_xE, cpml.sel_yE, cpml.sel_zE
+
+    # CPML stretches the *whole* curl, so every curl contribution carries the
+    # same coefficient — the interior difference in update_E and the psi memory
+    # term here alike. Lossless that coefficient is dt/(EPS0·eps); lossy it is
+    # Cb, and using dt/(EPS0·eps) anyway leaves psi undamped relative to the term
+    # it corrects.
+    #
+    # Worth keeping in proportion: the two differ by 1/(1+k) with
+    # k = sigma·dt/(2·eps) = dt/(2·tau), which is ~2e-3 for a well-resolved lossy
+    # dielectric and only approaches 1 in the regime wavesim.loss warns about. It
+    # is not a dramatic failure — a PML reflection test cannot resolve it, which
+    # is why the gate (tests/test_lossy_dielectric.py) pins the coefficient
+    # exactly instead. It is simply the consistent discretisation, and it costs
+    # nothing to be right.
+    #
+    # Sliced on demand rather than materialised, so the lossless path allocates
+    # exactly what it did before and evaluates the identical expression.
+    loss = loss_coefficients(grid)
+
+    def cb(comp: str, sl) -> np.ndarray:
+        if loss is None:
+            return dt / (EPS0 * getattr(grid, 'eps_' + comp)[sl])
+        return getattr(loss, 'Cb_' + comp)[sl]
     # Non-uniform divisors: every H-derivative in the E-side curl is divided by
     # the DUAL width, sampled at sel_* - 1 (Session 4). On a uniform grid these
     # are the constant PML spacing → bit-identical to the old scalar /ds.
@@ -528,15 +553,15 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     cpml.psi_Hz_y = cpml.byE_s * cpml.psi_Hz_y + cpml.cyE_s * dHz_dy
 
     if Nz > 1:
-        grid.Ex[:, sy, 1:] += (dt / (EPS0 * grid.eps_x[:, sy, 1:])) \
+        grid.Ex[:, sy, 1:] += cb('x', np.s_[:, sy, 1:]) \
             * cpml.psi_Hz_y[:, :, 1:]
 
         dHy_dz = (grid.Hy[:, :, sz] - grid.Hy[:, :, sz - 1]) / dzd    # (Nx, Ny, n_zE)
         cpml.psi_Hy_z = cpml.bzE_s * cpml.psi_Hy_z + cpml.czE_s * dHy_dz
-        grid.Ex[:, 1:, sz] -= (dt / (EPS0 * grid.eps_x[:, 1:, sz])) \
+        grid.Ex[:, 1:, sz] -= cb('x', np.s_[:, 1:, sz]) \
             * cpml.psi_Hy_z[:, 1:, :]
     else:
-        grid.Ex[:, sy, :] += (dt / (EPS0 * grid.eps_x[:, sy, :])) * cpml.psi_Hz_y
+        grid.Ex[:, sy, :] += cb('x', np.s_[:, sy, :]) * cpml.psi_Hz_y
 
     # ---------- Ey  (curl term: dHx/dz - dHz/dx) ----------
     # dHz/dx lives at the Ey location -> staggered (E) profile along x.
@@ -544,27 +569,27 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     cpml.psi_Hz_x = cpml.bxE_s * cpml.psi_Hz_x + cpml.cxE_s * dHz_dx
 
     if Nz > 1:
-        grid.Ey[sx, :, 1:] -= (dt / (EPS0 * grid.eps_y[sx, :, 1:])) \
+        grid.Ey[sx, :, 1:] -= cb('y', np.s_[sx, :, 1:]) \
             * cpml.psi_Hz_x[:, :, 1:]
 
         dHx_dz = (grid.Hx[:, :, sz] - grid.Hx[:, :, sz - 1]) / dzd    # (Nx, Ny, n_zE)
         cpml.psi_Hx_z = cpml.bzE_s * cpml.psi_Hx_z + cpml.czE_s * dHx_dz
-        grid.Ey[1:, :, sz] += (dt / (EPS0 * grid.eps_y[1:, :, sz])) \
+        grid.Ey[1:, :, sz] += cb('y', np.s_[1:, :, sz]) \
             * cpml.psi_Hx_z[1:, :, :]
     else:
-        grid.Ey[sx, :, :] -= (dt / (EPS0 * grid.eps_y[sx, :, :])) * cpml.psi_Hz_x
+        grid.Ey[sx, :, :] -= cb('y', np.s_[sx, :, :]) * cpml.psi_Hz_x
 
     # ---------- Ez  (curl term: dHy/dx - dHx/dy) ----------
     # dHy/dx lives at the Ez location -> staggered (E) profile along x.
     dHy_dx = (grid.Hy[sx, :, :] - grid.Hy[sx - 1, :, :]) / dxd        # (n_xE, Ny, Nz)
     cpml.psi_Hy_x = cpml.bxE_s * cpml.psi_Hy_x + cpml.cxE_s * dHy_dx
-    grid.Ez[sx, 1:, :] += (dt / (EPS0 * grid.eps_z[sx, 1:, :])) \
+    grid.Ez[sx, 1:, :] += cb('z', np.s_[sx, 1:, :]) \
         * cpml.psi_Hy_x[:, 1:, :]
 
     # dHx/dy lives at the Ez location -> staggered (E) profile along y.
     dHx_dy = (grid.Hx[:, sy, :] - grid.Hx[:, sy - 1, :]) / dyd        # (Nx, n_yE, Nz)
     cpml.psi_Hx_y = cpml.byE_s * cpml.psi_Hx_y + cpml.cyE_s * dHx_dy
-    grid.Ez[1:, sy, :] -= (dt / (EPS0 * grid.eps_z[1:, sy, :])) \
+    grid.Ez[1:, sy, :] -= cb('z', np.s_[1:, sy, :]) \
         * cpml.psi_Hx_y[1:, :, :]
 
     return grid, cpml

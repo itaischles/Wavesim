@@ -288,6 +288,13 @@ def _curl_curl_operator(grid: FDTDGrid, pec_faces: tuple):
     for name in ('Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'):
         setattr(work, name, np.zeros(getattr(grid, name).shape, dtype=float))
     work.dt = 1.0
+    # Lanczos needs a symmetric operator, and the lossy E update is not one: it
+    # scales the incoming E by Ca as well as the curl by Cb, so eigsh would
+    # quietly converge on the wrong spectrum. Conductivity does not enter the
+    # CFL limit anyway (|Ca| < 1 unconditionally — see wavesim.loss), so the
+    # honest operator to measure is the lossless one this grid's curl defines.
+    work.sigma_x = work.sigma_y = work.sigma_z = None
+    work._loss_cache = None
     shape = work.Ex.shape
     size = 3 * int(np.prod(shape))
 

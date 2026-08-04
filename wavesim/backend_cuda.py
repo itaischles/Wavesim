@@ -365,6 +365,22 @@ def _refuse_conformal(grid: FDTDGrid) -> None:
             "pec_edge_open_* / pec_face_open_* arrays to run staircased.")
 
 
+def _refuse_lossy(grid: FDTDGrid) -> None:
+    """Reject a lossy grid — the CUDA kernels only know the lossless E update.
+
+    Refused for the same reason as conformal PEC above: the kernels would apply
+    ``E += Cb·curl`` with ``Cb = dt/(eps0*eps)`` and no ``Ca``, i.e. run the
+    material as though it were lossless. A model whose conductivity silently
+    does nothing is a wrong answer wearing a working run's clothes.
+    """
+    if grid.is_lossy:
+        raise NotImplementedError(
+            "The CUDA backend does not implement lossy dielectrics: its E "
+            "update has no Ca/Cb pair, so a grid carrying sigma would step as "
+            "though it were lossless. Use backend='numba' (or 'numpy'), or drop "
+            "the sigma_* arrays to run the model lossless deliberately.")
+
+
 def update_H(grid: FDTDGrid) -> FDTDGrid:
     """CUDA drop-in for :func:`wavesim.update.update_H`."""
     _refuse_conformal(grid)
@@ -385,6 +401,7 @@ def update_H(grid: FDTDGrid) -> FDTDGrid:
 
 def update_E(grid: FDTDGrid) -> FDTDGrid:
     """CUDA drop-in for :func:`wavesim.update.update_E`."""
+    _refuse_lossy(grid)
     g = grid
     _cH, cE, dx, dy, dz = _scalars(g)
     dEx, dEy, dEz = (cuda.to_device(g.Ex), cuda.to_device(g.Ey),
@@ -461,6 +478,7 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
 
 def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays]:
     """CUDA drop-in for :func:`wavesim.pml.update_E_pml`."""
+    _refuse_lossy(grid)
     g = grid
     dtype = g.Ex.dtype
     _cH, cE, dx, dy, dz = _scalars(g)
@@ -587,6 +605,7 @@ class CudaResident:
 
     def __init__(self, grid: FDTDGrid, cpml: CPMLArrays = None,
                  pec_faces: tuple = ()):
+        _refuse_lossy(grid)
         g = grid
         self.g = g
         self.dtype = g.Hx.dtype
