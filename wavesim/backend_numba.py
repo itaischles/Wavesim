@@ -30,6 +30,16 @@ per-cell expression. A single 3D kernel subsumes the `Nz=1` fast path via an
 drops on a 2D slice — so results are bit-identical (no parallel reductions, just
 independent per-cell writes).
 
+Lossy dielectrics
+-----------------
+A grid carrying conductivity dispatches to `_update_E_lossy`, which is the same
+stencil with `E = Ca·E + Cb·curl H` in place of `E += (dt/eps0·eps)·curl H` (see
+`wavesim.loss`). It gets its own kernel for the same reason `_update_H_conformal`
+does — it is the hot loop and the extra reads must not be charged to a lossless
+model. The E-side CPML kernel takes a `lossy` flag instead, mirroring how the
+conformal case is handled there: only six coefficients change, and duplicating
+the slab bookkeeping around them would be the worse trade.
+
 CPML psi state
 --------------
 The psi arrays use the SAME boundary-slab layout as pml.py (compressed along their
@@ -49,6 +59,7 @@ import numpy as np
 from numba import njit, prange
 
 from wavesim.grid import FDTDGrid
+from wavesim.loss import loss_coefficients
 from wavesim.pec import conformal_geometry
 from wavesim.pml import CPMLArrays
 from wavesim.constants import MU0, EPS0
@@ -210,6 +221,63 @@ def _update_E(Ex, Ey, Ez, Hx, Hy, Hz,
                 Ez[i, j, k] += (dt / (_EPS0 * eps_z[i, j, k])) * (dHy_dx - dHx_dy)
 
 
+@njit(**_NJIT)
+def _update_E_lossy(Ex, Ey, Ez, Hx, Hy, Hz,
+                    Ca_x, Cb_x, Ca_y, Cb_y, Ca_z, Cb_z,
+                    dxd, dyd, dzd, Nx, Ny, Nz):
+    """Ampere with a conduction current: ``E = Ca·E + Cb·curl H``.
+
+    A **separate kernel** rather than a flag inside :func:`_update_E`, for the
+    same reason :func:`_update_H_conformal` is separate: this is the hot loop,
+    the lossy form costs two extra full-volume array reads per component, and a
+    model with no lossy material must not pay it. The dispatch happens once, in
+    the :func:`update_E` wrapper.
+
+    Every stencil, divisor and loop bound is character-for-character
+    :func:`_update_E`'s; only the two coefficients differ, and they arrive
+    precomputed from :mod:`wavesim.loss` (so ``dt``, ``EPS0`` and ``eps`` do not
+    appear here at all).
+    """
+    if Nz > 1:
+        # Ex[:, 1:, 1:] = Ca*Ex + Cb * (dHz/dy - dHy/dz)
+        for i in prange(Nx):
+            for j in range(1, Ny):
+                for k in range(1, Nz):
+                    dHz_dy = (Hz[i, j, k] - Hz[i, j - 1, k]) / dyd[j - 1]
+                    dHy_dz = (Hy[i, j, k] - Hy[i, j, k - 1]) / dzd[k - 1]
+                    Ex[i, j, k] = (Ca_x[i, j, k] * Ex[i, j, k]
+                                   + Cb_x[i, j, k] * (dHz_dy - dHy_dz))
+
+        # Ey[1:, :, 1:] = Ca*Ey + Cb * (dHx/dz - dHz/dx)
+        for i in prange(1, Nx):
+            for j in range(Ny):
+                for k in range(1, Nz):
+                    dHx_dz = (Hx[i, j, k] - Hx[i, j, k - 1]) / dzd[k - 1]
+                    dHz_dx = (Hz[i, j, k] - Hz[i - 1, j, k]) / dxd[i - 1]
+                    Ey[i, j, k] = (Ca_y[i, j, k] * Ey[i, j, k]
+                                   + Cb_y[i, j, k] * (dHx_dz - dHz_dx))
+    else:
+        # Nz=1 slice fast path
+        for i in prange(Nx):
+            for j in range(1, Ny):
+                dHz_dy = (Hz[i, j, 0] - Hz[i, j - 1, 0]) / dyd[j - 1]
+                Ex[i, j, 0] = Ca_x[i, j, 0] * Ex[i, j, 0] + Cb_x[i, j, 0] * dHz_dy
+        for i in prange(1, Nx):
+            for j in range(Ny):
+                dHz_dx = (Hz[i, j, 0] - Hz[i - 1, j, 0]) / dxd[i - 1]
+                Ey[i, j, 0] = (Ca_y[i, j, 0] * Ey[i, j, 0]
+                               + Cb_y[i, j, 0] * (-dHz_dx))
+
+    # Ez[1:, 1:, :] = Ca*Ez + Cb * (dHy/dx - dHx/dy)   (identical for all Nz)
+    for i in prange(1, Nx):
+        for j in range(1, Ny):
+            for k in range(Nz):
+                dHy_dx = (Hy[i, j, k] - Hy[i - 1, j, k]) / dxd[i - 1]
+                dHx_dy = (Hx[i, j, k] - Hx[i, j - 1, k]) / dyd[j - 1]
+                Ez[i, j, k] = (Ca_z[i, j, k] * Ez[i, j, k]
+                               + Cb_z[i, j, k] * (dHy_dx - dHx_dy))
+
+
 # ====================================================================== #
 # CPML corrections
 # ====================================================================== #
@@ -368,10 +436,20 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
 def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
                   dt, dxd, dyd, dzd, Nx, Ny, Nz,
                   sx, sy, sz, bxE, cxE, byE, cyE, bzE, czE,
-                  psi_Hz_y, psi_Hy_z, psi_Hx_z, psi_Hz_x, psi_Hy_x, psi_Hx_y):
+                  psi_Hz_y, psi_Hy_z, psi_Hx_z, psi_Hz_x, psi_Hy_x, psi_Hx_y,
+                  lossy, Cb_x, Cb_y, Cb_z):
     # dxd/dyd/dzd are the DUAL widths sampled at sel_* - 1 (per-slab, in sel_*E
     # order), so they index by the slab counter p — matching update_E's per-cell
     # dual divisor. On a uniform grid they are the constant PML spacing.
+    #
+    # Lossy dielectrics (see wavesim.pml.update_E_pml): the psi recursion, the
+    # signs and the slab bookkeeping are all untouched; only the SIX correction
+    # coefficients change, from dt/(EPS0·eps) to Cb. Like the conformal flag in
+    # _update_H_pml this branches instead of getting its own copy — the branch is
+    # loop-invariant and hoists out, so a lossless run pays nothing, and
+    # duplicating the slab bookkeeping to vary six coefficients would be the
+    # worse trade. When ``lossy`` is False the Cb arrays are empty and never
+    # indexed.
     n_xE = sx.shape[0]
     n_yE = sy.shape[0]
     n_zE = sz.shape[0]
@@ -388,6 +466,10 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
         for i in prange(Nx):
             for p in range(n_yE):
                 j = sy[p]
+                if lossy:
+                    for k in range(1, Nz):
+                        Ex[i, j, k] += Cb_x[i, j, k] * psi_Hz_y[i, p, k]
+                    continue
                 for k in range(1, Nz):
                     Ex[i, j, k] += (dt / (_EPS0 * eps_x[i, j, k])) * psi_Hz_y[i, p, k]
         # psi_Hy_z[i, j, p], k = sz[p]; correct Ex[:, 1:, sz]
@@ -399,6 +481,11 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
                     psi_Hy_z[i, j, p] = bzE[p] * psi_Hy_z[i, j, p] + czE[p] * dHy_dz
         for i in prange(Nx):
             for j in range(1, Ny):
+                if lossy:
+                    for p in range(n_zE):
+                        k = sz[p]
+                        Ex[i, j, k] -= Cb_x[i, j, k] * psi_Hy_z[i, j, p]
+                    continue
                 for p in range(n_zE):
                     k = sz[p]
                     Ex[i, j, k] -= (dt / (_EPS0 * eps_x[i, j, k])) * psi_Hy_z[i, j, p]
@@ -406,7 +493,10 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
         for i in prange(Nx):
             for p in range(n_yE):
                 j = sy[p]
-                Ex[i, j, 0] += (dt / (_EPS0 * eps_x[i, j, 0])) * psi_Hz_y[i, p, 0]
+                if lossy:
+                    Ex[i, j, 0] += Cb_x[i, j, 0] * psi_Hz_y[i, p, 0]
+                else:
+                    Ex[i, j, 0] += (dt / (_EPS0 * eps_x[i, j, 0])) * psi_Hz_y[i, p, 0]
 
     # ---------- Ey: -psi_Hz_x (x axis), +psi_Hx_z (z axis) ----------
     # psi_Hz_x[p, j, k], i = sx[p]; correct Ey[sx, :, 1:]
@@ -420,6 +510,10 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
         for j in prange(Ny):
             for p in range(n_xE):
                 i = sx[p]
+                if lossy:
+                    for k in range(1, Nz):
+                        Ey[i, j, k] -= Cb_y[i, j, k] * psi_Hz_x[p, j, k]
+                    continue
                 for k in range(1, Nz):
                     Ey[i, j, k] -= (dt / (_EPS0 * eps_y[i, j, k])) * psi_Hz_x[p, j, k]
         # psi_Hx_z[i, j, p], k = sz[p]; correct Ey[1:, :, sz]
@@ -431,6 +525,11 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
                     psi_Hx_z[i, j, p] = bzE[p] * psi_Hx_z[i, j, p] + czE[p] * dHx_dz
         for i in prange(1, Nx):
             for j in range(Ny):
+                if lossy:
+                    for p in range(n_zE):
+                        k = sz[p]
+                        Ey[i, j, k] += Cb_y[i, j, k] * psi_Hx_z[i, j, p]
+                    continue
                 for p in range(n_zE):
                     k = sz[p]
                     Ey[i, j, k] += (dt / (_EPS0 * eps_y[i, j, k])) * psi_Hx_z[i, j, p]
@@ -438,7 +537,10 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
         for j in prange(Ny):
             for p in range(n_xE):
                 i = sx[p]
-                Ey[i, j, 0] -= (dt / (_EPS0 * eps_y[i, j, 0])) * psi_Hz_x[p, j, 0]
+                if lossy:
+                    Ey[i, j, 0] -= Cb_y[i, j, 0] * psi_Hz_x[p, j, 0]
+                else:
+                    Ey[i, j, 0] -= (dt / (_EPS0 * eps_y[i, j, 0])) * psi_Hz_x[p, j, 0]
 
     # ---------- Ez: +psi_Hy_x (x axis), -psi_Hx_y (y axis) ----------
     # psi_Hy_x[p, j, k], i = sx[p]; correct Ez[sx, 1:, :]
@@ -451,6 +553,10 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
     for j in prange(1, Ny):
         for p in range(n_xE):
             i = sx[p]
+            if lossy:
+                for k in range(Nz):
+                    Ez[i, j, k] += Cb_z[i, j, k] * psi_Hy_x[p, j, k]
+                continue
             for k in range(Nz):
                 Ez[i, j, k] += (dt / (_EPS0 * eps_z[i, j, k])) * psi_Hy_x[p, j, k]
     # psi_Hx_y[i, p, k], j = sy[p]; correct Ez[1:, sy, :]
@@ -463,6 +569,10 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
     for i in prange(1, Nx):
         for p in range(n_yE):
             j = sy[p]
+            if lossy:
+                for k in range(Nz):
+                    Ez[i, j, k] -= Cb_z[i, j, k] * psi_Hx_y[i, p, k]
+                continue
             for k in range(Nz):
                 Ez[i, j, k] -= (dt / (_EPS0 * eps_z[i, j, k])) * psi_Hx_y[i, p, k]
 
@@ -494,7 +604,19 @@ def update_H(grid: FDTDGrid) -> FDTDGrid:
 
 
 def update_E(grid: FDTDGrid) -> FDTDGrid:
-    """Numba-accelerated drop-in for :func:`wavesim.update.update_E`."""
+    """Numba-accelerated drop-in for :func:`wavesim.update.update_E`.
+
+    Dispatches to the two-coefficient kernel when the grid carries conductivity,
+    exactly as the NumPy reference does — the two must not diverge, or the same
+    model damps differently depending on which backend ran it.
+    """
+    if grid.is_lossy:
+        c = loss_coefficients(grid)
+        _update_E_lossy(grid.Ex, grid.Ey, grid.Ez, grid.Hx, grid.Hy, grid.Hz,
+                        c.Ca_x, c.Cb_x, c.Ca_y, c.Cb_y, c.Ca_z, c.Cb_z,
+                        grid.dxd, grid.dyd, grid.dzd,
+                        grid.Nx, grid.Ny, grid.Nz)
+        return grid
     _update_E(grid.Ex, grid.Ey, grid.Ez, grid.Hx, grid.Hy, grid.Hz,
               grid.eps_x, grid.eps_y, grid.eps_z,
               grid.dt, grid.dxd, grid.dyd, grid.dzd, grid.Nx, grid.Ny, grid.Nz)
@@ -551,5 +673,21 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
         _ravel(cpml.byE_s), _ravel(cpml.cyE_s),
         _ravel(cpml.bzE_s), _ravel(cpml.czE_s),
         cpml.psi_Hz_y, cpml.psi_Hy_z, cpml.psi_Hx_z,
-        cpml.psi_Hz_x, cpml.psi_Hy_x, cpml.psi_Hx_y)
+        cpml.psi_Hz_x, cpml.psi_Hy_x, cpml.psi_Hx_y,
+        *_lossy_pml_args(grid))
     return grid, cpml
+
+
+def _lossy_pml_args(grid: FDTDGrid):
+    """``(lossy, Cb_x, Cb_y, Cb_z)`` for the E-side PML kernel.
+
+    A lossy dielectric may run straight into the absorbing shell — a lossy
+    substrate terminated by the PML is the ordinary case, not an exotic one — so
+    the correction there needs the same Cb the interior uses. The placeholders
+    keep the kernel's Numba signature (and so its cached compilation) identical
+    in both cases.
+    """
+    if not grid.is_lossy:
+        return (False,) + (_NO_ARRAY,) * 3
+    c = loss_coefficients(grid)
+    return True, c.Cb_x, c.Cb_y, c.Cb_z
