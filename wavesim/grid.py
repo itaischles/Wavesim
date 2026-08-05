@@ -158,6 +158,34 @@ class FDTDGrid:
     pec_mask: np.ndarray = field(default=None)
 
     # ------------------------------------------------------------------ #
+    # Named PEC parts — shape (Nx, Ny, Nz), dtype int32
+    #
+    # ``pec_id[i,j,k]`` is the part number owning that conductor cell, or 0 for
+    # "unnamed metal". ``pec_names`` maps part name → part number (numbering
+    # starts at 1; 0 is reserved and never appears as a value).
+    #
+    # This is a *labelling of* ``pec_mask``, not a second geometry: every cell
+    # with ``pec_id > 0`` is also True in ``pec_mask``, and the FDTD solver never
+    # reads either of these — to the field update a named part and anonymous
+    # metal are the same perfect conductor. They exist so a *different* solver
+    # can address one conductor at a time, which is what the electrostatic
+    # solver needs in order to hold "the signal trace" at 5 V.
+    #
+    # Naming rather than connected-component numbering, because the FreeCAD
+    # workbench is the primary caller and a CAD solid already has a stable name;
+    # component labels renumber themselves whenever the mesh or the geometry
+    # shifts. It also makes one class of user error detectable: two *distinct*
+    # named parts that turn out to be electrically touching cannot both be held
+    # at their own potential, and only names can tell that apart from one part
+    # that was always a single connected body.
+    #
+    # Both are ``None`` (the default) until the first part is named, so a model
+    # that never uses parts carries no extra state. See :mod:`wavesim.parts`.
+    # ------------------------------------------------------------------ #
+    pec_id: np.ndarray = field(default=None)
+    pec_names: dict = field(default=None)
+
+    # ------------------------------------------------------------------ #
     # Conformal (Dey–Mittra) PEC — shape (Nx, Ny, Nz), dimensionless ∈ [0,1]
     #
     # ``pec_edge_open_x[i,j,k]`` is the fraction of the Yee E-edge ``Ex[i,j,k]``

@@ -20,10 +20,17 @@ Conductivity is opt-in: every placement function takes ``sigma`` (S/m,
 default 0), and the σ arrays are allocated only once a nonzero one is placed, so
 a lossless model never carries them. Lossy dielectrics only — see
 :mod:`wavesim.loss` for why a metal-scale σ is not a model of a metal.
+
+Part naming is opt-in the same way: a PEC placement takes ``name`` (and
+``set_material_arrays`` takes the pre-built ``pec_id``/``pec_names`` pair the CAD
+importer produces), which records *which conductor* a cell belongs to without
+changing the ``pec_mask`` the FDTD update reads. A model that names nothing
+carries no part arrays. See :mod:`wavesim.parts`.
 """
 
 import numpy as np
 from wavesim.grid import FDTDGrid
+from wavesim.parts import name_pec_region
 from wavesim.subpixel import smooth_shape_region
 
 
@@ -134,6 +141,99 @@ def _reject_subpixel_sigma(sigma: float, what: str) -> None:
             f"the lossy region with subpixel=False, or place it lossless and "
             f"write grid.sigma_* yourself.")
 
+def _reject_named_dielectric(name, pec: bool, what: str) -> None:
+    """``name=`` is meaningless without ``pec=True``.
+
+    Part names exist so a solver can hold *that conductor* at a potential
+    (:mod:`wavesim.parts`); a dielectric has no such handle. Accepting the
+    argument and dropping it would leave the caller believing they had named
+    something, and the error would only surface much later as "no PEC part
+    named 'trace'" from a different module.
+    """
+    if name is not None and not pec:
+        raise ValueError(
+            f"{what}: name={name!r} requires pec=True. Part names identify "
+            f"conductors so a solver can assign them a potential; a dielectric "
+            f"region has no potential to assign.")
+
+
+def _set_pec_parts(grid: FDTDGrid, pec_id, pec_names, shape,
+                   mask_replaced: bool) -> None:
+    """Install a pre-computed part labelling, validating it against the mask.
+
+    Split out of :func:`set_material_arrays` because the checks are the
+    interesting part: this is the one entry point where the labelling arrives
+    already built rather than accumulated a placement at a time, so it is the
+    only place the ``pec_id ⊆ pec_mask`` invariant can be violated by a caller.
+    A voxeliser that drops a part below the mesh resolution, or numbers from 0,
+    fails here rather than silently energising nothing later.
+
+    ``mask_replaced`` says whether this call also overwrote ``pec_mask``. If it
+    did and no labelling came with it, the old labelling is **discarded** rather
+    than kept: it describes conductors that no longer exist at those indices,
+    and stale names are worse than absent ones — an absent name raises, a stale
+    one energises whatever geometry happens to sit there now.
+    """
+    if pec_id is None and pec_names is None:
+        if mask_replaced:
+            grid.pec_id = None
+            grid.pec_names = None
+        return
+    if pec_id is None or pec_names is None:
+        # Either alone is unusable: labels with no names cannot be addressed,
+        # and names with no labels point at no cells.
+        missing = 'pec_id' if pec_id is None else 'pec_names'
+        raise ValueError(f"pec_id and pec_names must be supplied together; "
+                         f"missing {missing}")
+    if pec_id.shape != shape:
+        raise ValueError(f"pec_id: expected shape {shape}, got {pec_id.shape}")
+
+    pec_id = pec_id.astype(np.int32)
+    if np.any(pec_id < 0):
+        raise ValueError("pec_id: part numbers must be positive (0 = unnamed)")
+
+    for name, pid in pec_names.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"pec_names: part name must be a non-empty "
+                             f"string, got {name!r}")
+        if int(pid) < 1:
+            raise ValueError(f"pec_names[{name!r}] = {pid}: part numbers start "
+                             f"at 1, since 0 marks unnamed metal in pec_id")
+
+    labelled = pec_id != 0
+    if labelled.any() and (grid.pec_mask is None or
+                           np.any(labelled & ~grid.pec_mask)):
+        raise ValueError(
+            "pec_id labels cells that are not PEC. A named part must also be "
+            "marked in pec_mask — the name identifies a conductor, it does not "
+            "create one.")
+
+    unknown = set(np.unique(pec_id[labelled]).tolist()) - {
+        int(p) for p in pec_names.values()}
+    if unknown:
+        raise ValueError(f"pec_id contains part numbers with no name in "
+                         f"pec_names: {sorted(unknown)}")
+
+    grid.pec_id = pec_id
+    grid.pec_names = {str(n): int(p) for n, p in pec_names.items()}
+
+
+def _place_pec(grid: FDTDGrid, mask: np.ndarray, name) -> None:
+    """Write a PEC region, named or anonymous.
+
+    The single place the placement helpers turn a mask into metal, so the
+    ``pec_mask``/``pec_id`` invariant (every named cell is also masked) has one
+    owner. An unnamed region touches only ``pec_mask``, leaving a model that
+    never names anything carrying no part arrays at all.
+    """
+    if name is not None:
+        name_pec_region(grid, mask, name)
+        return
+    if grid.pec_mask is None:
+        grid.pec_mask = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=bool)
+    grid.pec_mask |= mask
+
+
 _CONFORMAL_KEYS = ('pec_edge_open_x', 'pec_edge_open_y', 'pec_edge_open_z',
                    'pec_face_open_x', 'pec_face_open_y', 'pec_face_open_z')
 
@@ -145,6 +245,8 @@ def set_material_arrays(grid: FDTDGrid,
                         sigma_y: np.ndarray = None,
                         sigma_z: np.ndarray = None,
                         pec_mask: np.ndarray = None,
+                        pec_id: np.ndarray = None,
+                        pec_names: dict = None,
                         pec_edge_open_x: np.ndarray = None,
                         pec_edge_open_y: np.ndarray = None,
                         pec_edge_open_z: np.ndarray = None,
@@ -172,6 +274,19 @@ def set_material_arrays(grid: FDTDGrid,
     Lossy dielectrics only. Good conductors belong in ``pec_mask``; where a σ
     region and ``pec_mask`` overlap, PEC wins, because ``apply_pec_mask`` zeroes
     E after the update regardless.
+
+    Named PEC parts
+    ---------------
+    ``pec_id`` (int, shape ``(Nx, Ny, Nz)``) labels each conductor cell with the
+    part that owns it, 0 meaning unnamed metal, and ``pec_names`` maps part name
+    → label. Both together or neither. This is how the CAD importer preserves
+    the identity of the solids it voxelised, so the electrostatic solver can
+    hold one of them at a potential; the FDTD path ignores both. See
+    :mod:`wavesim.parts`.
+
+    Every labelled cell must also be True in ``pec_mask`` — a part is a
+    conductor first and a name second, and a label outside the mask would
+    describe metal the field solver cannot see.
 
     Conformal PEC
     -------------
@@ -225,6 +340,9 @@ def set_material_arrays(grid: FDTDGrid,
             raise ValueError(f"pec_mask: expected shape {shape}, got {pec_mask.shape}")
         grid.pec_mask = pec_mask.astype(bool)
 
+    _set_pec_parts(grid, pec_id, pec_names, shape,
+                   mask_replaced=pec_mask is not None)
+
     if conformal_area_threshold is not None:
         if not 0.0 <= conformal_area_threshold < 1.0:
             raise ValueError("conformal_area_threshold must lie in [0, 1), got "
@@ -270,7 +388,8 @@ def set_box(grid: FDTDGrid,
             z0: float, z1: float,
             eps_r: float, mu_r: float = 1.0,
             pec: bool = False, sigma: float = 0.0,
-            subpixel: bool = False, oversample: int = 4) -> FDTDGrid:
+            subpixel: bool = False, oversample: int = 4,
+            name: str = None) -> FDTDGrid:
     """
     Fill an axis-aligned box with a uniform material, or mark as PEC.
 
@@ -283,6 +402,12 @@ def set_box(grid: FDTDGrid,
     pec : bool
         If True, mark the region as PEC in grid.pec_mask instead of
         writing eps/mu values.
+    name : str
+        Name this PEC region as an addressable part (requires ``pec=True``), so
+        a solver that needs to talk about one conductor at a time — the
+        electrostatic solver, which holds it at a potential — can find it. The
+        FDTD update is unaffected. Repeating a name extends that part; see
+        :mod:`wavesim.parts`.
     sigma : float
         Electric conductivity of the fill in S/m (default 0 — lossless).
         **Lossy dielectrics only**: a metal-scale sigma is not a model of a
@@ -298,6 +423,7 @@ def set_box(grid: FDTDGrid,
         Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
     """
     _reject_conductive_pec(sigma if pec else 0.0, "set_box")
+    _reject_named_dielectric(name, pec, "set_box")
 
     if subpixel:
         if pec:
@@ -329,9 +455,9 @@ def set_box(grid: FDTDGrid,
     sl = np.s_[i0:i1, j0:j1, k0:k1]
 
     if pec:
-        if grid.pec_mask is None:
-            grid.pec_mask = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=bool)
-        grid.pec_mask[sl] = True
+        mask = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=bool)
+        mask[sl] = True
+        _place_pec(grid, mask, name)
     else:
         grid.eps_x[sl] = eps_r
         grid.eps_y[sl] = eps_r
@@ -354,7 +480,8 @@ def set_cylinder(grid: FDTDGrid,
                  z0: float, z1: float,
                  eps_r: float, mu_r: float = 1.0,
                  pec: bool = False, sigma: float = 0.0,
-                 subpixel: bool = False, oversample: int = 4) -> FDTDGrid:
+                 subpixel: bool = False, oversample: int = 4,
+                 name: str = None) -> FDTDGrid:
     """
     Fill a cylindrical rod aligned with Z, or mark as PEC.
 
@@ -379,8 +506,12 @@ def set_cylinder(grid: FDTDGrid,
         permittivity (see :mod:`wavesim.subpixel`). Not supported with ``pec=True``.
     oversample : int
         Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
+    name : str
+        Name this PEC rod as an addressable part (requires ``pec=True``). See
+        :func:`set_box` and :mod:`wavesim.parts`.
     """
     _reject_conductive_pec(sigma if pec else 0.0, "set_cylinder")
+    _reject_named_dielectric(name, pec, "set_cylinder")
 
     if subpixel:
         if pec:
@@ -412,9 +543,9 @@ def set_cylinder(grid: FDTDGrid,
     mask_2d = dist <= radius  # shape (Nx, Ny)
 
     if pec:
-        if grid.pec_mask is None:
-            grid.pec_mask = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=bool)
-        grid.pec_mask[:, :, k0:k1] |= mask_2d[:, :, np.newaxis]
+        mask = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=bool)
+        mask[:, :, k0:k1] = mask_2d[:, :, np.newaxis]
+        _place_pec(grid, mask, name)
     else:
         # Apply material to all z slices in range
         sigmas = _sigma_arrays(grid) if (sigma or grid.is_lossy) else ()
@@ -434,7 +565,8 @@ def set_cylinder(grid: FDTDGrid,
 def set_coax(grid: FDTDGrid,
              cx: float, cy: float,
              r_inner: float, r_outer: float,
-             eps_r_fill: float = 1.0) -> FDTDGrid:
+             eps_r_fill: float = 1.0,
+             name_inner: str = None, name_outer: str = None) -> FDTDGrid:
     """
     Build a coaxial cross-section in the XY plane.
 
@@ -450,6 +582,10 @@ def set_coax(grid: FDTDGrid,
         Inner and outer conductor radii (metres).
     eps_r_fill : float
         Relative permittivity of the dielectric between conductors.
+    name_inner, name_outer : str
+        Optional part names for the two conductors — two names because a coax
+        is two conductors, and the whole point of naming is to tell them apart.
+        See :mod:`wavesim.parts`.
 
     Notes
     -----
@@ -467,7 +603,8 @@ def set_coax(grid: FDTDGrid,
     set_cylinder(grid, cx, cy, r_outer, z0, z1, eps_r_fill, pec=False)
 
     # 2. Mark inner conductor as PEC
-    set_cylinder(grid, cx, cy, r_inner, z0, z1, eps_r=1.0, pec=True)
+    set_cylinder(grid, cx, cy, r_inner, z0, z1, eps_r=1.0, pec=True,
+                 name=name_inner)
 
     # 3. Mark outer conductor as PEC (everything at or beyond r_outer)
     #    Build the outer ring mask directly
@@ -480,8 +617,7 @@ def set_coax(grid: FDTDGrid,
                    ((IY - cy_cell) * grid.dy)**2)
     outer_mask = dist >= r_outer  # shape (Nx, Ny)
 
-    if grid.pec_mask is None:
-        grid.pec_mask = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=bool)
-    grid.pec_mask[:, :, :] |= outer_mask[:, :, np.newaxis]
+    _place_pec(grid, np.broadcast_to(outer_mask[:, :, np.newaxis],
+                                     (grid.Nx, grid.Ny, grid.Nz)), name_outer)
 
     return grid
