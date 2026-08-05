@@ -48,7 +48,9 @@ from wavesim.pec import (apply_pec_faces, apply_pec_mask,
 from wavesim.parts import (
     Conductor, list_conductors, describe_conductors, name_pec_region,
     part_id, part_mask, unnamed_pec_mask, check_shorts,
+    pec_node_mask, conductor_bodies, body_parts,
 )
+from wavesim.electrostatics import Electrostatics, ElectrostaticSolution
 from wavesim.stability import (
     StabilityProbe, probe_growth, max_stable_dt, stability_margin,
     safe_area_threshold, ensure_stable_threshold,
@@ -119,6 +121,9 @@ __all__ = [
     # named PEC parts
     "Conductor", "list_conductors", "describe_conductors", "name_pec_region",
     "part_id", "part_mask", "unnamed_pec_mask", "check_shorts",
+    "pec_node_mask", "conductor_bodies", "body_parts",
+    # electrostatics
+    "Electrostatics", "ElectrostaticSolution",
     # stability (conformal small-cut, plan S7)
     "StabilityProbe", "probe_growth", "max_stable_dt", "stability_margin",
     "safe_area_threshold", "ensure_stable_threshold",

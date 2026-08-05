@@ -192,16 +192,47 @@ def test_separated_parts_are_not_shorted():
     assert ws.check_shorts(g) == []
 
 
-def test_diagonal_contact_is_not_a_short():
-    """6-connectivity: cells meeting at an edge share no E-edge, so no current.
+def test_diagonal_contact_is_a_short_under_the_staircase_rule():
+    """Corner-touching cells share a node, and the dilation zeroes both sides.
 
-    Counting a corner touch as a connection would contradict the FDTD update
-    this labelling exists to describe.
+    They share no cell *face*, so a naive 6-connectivity test calls them
+    separate. The FDTD disagrees: ``build_pec_edge_masks`` zeroes an edge when
+    any adjoining cell is PEC, which zeroes edges either side of the shared
+    node, and E = 0 on both means one potential across the join. Connectivity is
+    read off those masks precisely so this case cannot be got wrong by
+    reasoning about it.
     """
     g = _grid()
     ws.set_box(g, 2e-3, 5e-3, 2e-3, 5e-3, 2e-3, 5e-3, 1.0, pec=True, name="a")
     ws.set_box(g, 5e-3, 8e-3, 5e-3, 8e-3, 2e-3, 5e-3, 1.0, pec=True, name="b")
+    assert ws.check_shorts(g) == [("a", "b")]
+
+
+def test_a_one_cell_gap_is_not_a_short():
+    """The case that breaks labelling the node mask instead of the edge graph.
+
+    The two node masks are adjacent — the facing surface nodes sit one index
+    apart — but the edge between them lies in the gap and is never zeroed.
+    """
+    g = _grid()
+    ws.set_box(g, 2e-3, 5e-3, 2e-3, 6e-3, 2e-3, 5e-3, 1.0, pec=True, name="a")
+    ws.set_box(g, 6e-3, 9e-3, 2e-3, 6e-3, 2e-3, 5e-3, 1.0, pec=True, name="b")
     assert ws.check_shorts(g) == []
+
+
+def test_node_mask_is_the_closed_node_box_of_a_block():
+    """Surface nodes on both sides, not just the low side.
+
+    Slicing pec_mask and calling it a node mask keeps node 2 and drops node 6,
+    which is the off-by-half-a-cell asymmetry apply_pec_mask documents.
+    """
+    from wavesim.parts import pec_node_mask
+    g = _grid()
+    ws.set_box(g, 2e-3, 6e-3, 2e-3, 6e-3, 2e-3, 6e-3, 1.0, pec=True, name="b")
+    nodes = np.nonzero(pec_node_mask(g))
+    for axis in range(3):
+        assert nodes[axis].min() == 2
+        assert nodes[axis].max() == 6      # cells 2..5 span nodes 2..6
 
 
 def test_unnamed_metal_can_bridge_two_named_parts():

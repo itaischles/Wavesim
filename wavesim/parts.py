@@ -47,12 +47,15 @@ both kinds, because a user cannot select a part they cannot see.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 from scipy import ndimage
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 from wavesim.grid import FDTDGrid
+from wavesim.pec import build_pec_edge_masks, build_conformal_edge_masks
 
 
 # ====================================================================== #
@@ -227,20 +230,159 @@ def unnamed_pec_mask(grid: FDTDGrid) -> np.ndarray:
 # Consistency
 # ====================================================================== #
 
+# ====================================================================== #
+# Electrical connectivity
+#
+# "Which cells are the same conductor?" has to be answered the way the *field
+# solver* answers it, not the way the geometry looks, or a solver built on this
+# will disagree with the FDTD run it is supposed to describe.
+#
+# The field solver's answer is in the E-edge masks: ``apply_pec_mask`` zeroes a
+# set of Yee edges, and E = 0 along an edge means its two end nodes are at the
+# same potential. So the conductor is the *graph* of zeroed edges, one connected
+# component per electrical body, and the nodes are where potential lives.
+#
+# This is not the same as 6-connectivity of ``pec_mask``, and the difference is
+# not academic. The staircase rule (:func:`~wavesim.pec.build_pec_edge_masks`)
+# zeroes an edge when *any* of the four cells around it is PEC — deliberate
+# over-zeroing that buys E/H consistency. Two cells meeting only at a corner
+# share no cell face, but that dilation zeroes edges on both sides of the shared
+# *node*, so the FDTD does hold them at one potential: they are shorted. Reading
+# it off the edge masks gets this right without anyone having to reason it out,
+# and switches to the conformal rule by itself when the grid carries cut cells —
+# where the same corner contact is genuinely *not* a short, because the exact
+# rule zeroes an edge only when its open length is zero.
+# ====================================================================== #
+
+def _edge_masks(grid: FDTDGrid, cell_mask: np.ndarray = None) -> tuple:
+    """The three per-component zeroed-E masks the FDTD would apply.
+
+    Delegates to whichever rule the grid is actually running — conformal cut
+    cells if it carries them, the staircase dilation otherwise — so everything
+    built on top inherits that choice instead of re-deciding it.
+
+    ``cell_mask`` restricts the question to one part: "which edges would be
+    zeroed if *this* were the only metal in the model". The conformal path has
+    no such restriction available (its open fractions are a property of the
+    whole assembled geometry, not of one solid), so a part-wise query there
+    falls back to the staircase rule on that part's cells — used only to decide
+    which body a named part lands in, never to build the operator.
+    """
+    if cell_mask is None:
+        if grid.is_conformal:
+            return build_conformal_edge_masks(grid)
+        if grid.pec_mask is None:
+            shape = (grid.Nx, grid.Ny, grid.Nz)
+            return tuple(np.zeros(shape, dtype=bool) for _ in range(3))
+        return build_pec_edge_masks(grid.pec_mask)
+    return build_pec_edge_masks(np.asarray(cell_mask, dtype=bool))
+
+
+def pec_node_mask(grid: FDTDGrid, cell_mask: np.ndarray = None) -> np.ndarray:
+    """Nodes lying on a conductor — the end points of every zeroed E-edge.
+
+    Shape ``(Nx, Ny, Nz)``, indexed by node, following the same convention as
+    every other array: node ``(i,j,k)`` is the low corner of cell ``(i,j,k)``,
+    and the ``N``-th node of each axis is not carried (there are ``N+1`` nodes
+    but ``N`` array slots, exactly as in :mod:`wavesim.mode_solver`).
+
+    For a staircased block this comes out as the *closed* node box of the block,
+    surface nodes included — which is the point. Slicing ``pec_mask`` and
+    calling it a node mask instead keeps the low-side surface nodes and drops
+    the high-side ones, an asymmetry that is the same off-by-half-a-cell trap
+    :func:`~wavesim.pec.apply_pec_mask` documents.
+    """
+    ex, ey, ez = _edge_masks(grid, cell_mask)
+    out = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=bool)
+    for arr, ax in ((ex, 0), (ey, 1), (ez, 2)):
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[ax] = slice(0, -1)
+        hi[ax] = slice(1, None)
+        # An edge contributes both of its end nodes. Edges on the last index of
+        # their own axis reach a node the arrays do not carry; their low end
+        # still counts.
+        out |= arr
+        out[tuple(hi)] |= arr[tuple(lo)]
+    return out
+
+
+def conductor_bodies(grid: FDTDGrid) -> Tuple[np.ndarray, int]:
+    """Label every node by which electrical body it belongs to.
+
+    Returns ``(labels, n_bodies)`` with ``labels`` of shape ``(Nx, Ny, Nz)``
+    over nodes, 0 for nodes that are not on a conductor and 1..``n_bodies``
+    otherwise. A *body* is a connected component of the zeroed-edge graph: the
+    set of nodes the field solver forces to one potential.
+
+    Connectivity runs over the edge graph rather than over the node mask,
+    because the two are not the same. Two conductors separated by a single cell
+    have node masks that are adjacent — the near-side surface nodes sit one
+    index apart — while the edge between them lies in the gap and is not
+    zeroed. Labelling the node mask directly would fuse them; walking the edges
+    keeps them apart.
+    """
+    shape = (grid.Nx, grid.Ny, grid.Nz)
+    n_nodes = int(np.prod(shape))
+    idx = np.arange(n_nodes, dtype=np.int64).reshape(shape)
+
+    rows, cols = [], []
+    for arr, ax in zip(_edge_masks(grid), range(3)):
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[ax] = slice(0, -1)
+        hi[ax] = slice(1, None)
+        live = arr[tuple(lo)]
+        rows.append(idx[tuple(lo)][live])
+        cols.append(idx[tuple(hi)][live])
+
+    rows = np.concatenate(rows) if rows else np.empty(0, dtype=np.int64)
+    cols = np.concatenate(cols) if cols else np.empty(0, dtype=np.int64)
+    labels = np.zeros(shape, dtype=np.int32)
+    if rows.size == 0:
+        return labels, 0
+
+    graph = coo_matrix((np.ones(rows.size, dtype=np.int8), (rows, cols)),
+                       shape=(n_nodes, n_nodes))
+    _, comp = connected_components(graph, directed=False)
+
+    # connected_components gives every isolated node its own component; keep
+    # only those an edge actually touched, then renumber them from 1.
+    on_metal = pec_node_mask(grid)
+    keep = np.unique(comp.reshape(shape)[on_metal])
+    renumber = np.zeros(comp.max() + 1, dtype=np.int32)
+    renumber[keep] = np.arange(1, keep.size + 1, dtype=np.int32)
+    labels[on_metal] = renumber[comp.reshape(shape)[on_metal]]
+    return labels, int(keep.size)
+
+
+def body_parts(grid: FDTDGrid) -> List[List[str]]:
+    """Named parts occupying each electrical body, in body order.
+
+    ``body_parts(grid)[b - 1]`` is the sorted list of part names sharing body
+    ``b``; an empty list means that body carries no named part at all (a shield
+    or an enclosure nobody bothered to name). This is the lookup the
+    electrostatic solver needs — it assigns potentials per *body*, not per part,
+    because a body is what physically holds one potential.
+    """
+    labels, n = conductor_bodies(grid)
+    out = [[] for _ in range(n)]
+    for name in sorted(grid.pec_names or {}):
+        touched = np.unique(labels[pec_node_mask(grid, part_mask(grid, name))])
+        for b in touched:
+            if b:
+                out[int(b) - 1].append(name)
+    return out
+
+
 def check_shorts(grid: FDTDGrid) -> List[Tuple[str, ...]]:
     """Find sets of named parts that are electrically one body.
 
-    Returns one sorted tuple of names per connected run of metal containing two
-    or more distinct named parts; an empty list means every named part is its
-    own island.
-
-    Touching is decided by 6-connectivity (face-sharing) over ``pec_mask``,
-    which is what "the same conductor" means on a Yee grid — two cells meeting
-    only along an edge or at a corner share no E-edge and conduct nothing
-    between them in the FDTD update, so counting them as connected here would
-    contradict the solver they are meant to describe. Unnamed metal is included
-    in the connectivity search, because a floating unnamed bracket bridging two
-    named parts shorts them exactly as directly as contact would.
+    Returns one sorted tuple of names per body containing two or more distinct
+    named parts; an empty list means every named part is its own island.
+    Unnamed metal participates in the connectivity, because a floating unnamed
+    bracket bridging two named parts shorts them exactly as directly as contact
+    would — it just does not get a name in the report.
 
     Callers decide what to do about it: parts fused deliberately (a name per
     sub-piece of one electrode) are legitimate, so this reports rather than
@@ -249,14 +391,4 @@ def check_shorts(grid: FDTDGrid) -> List[Tuple[str, ...]]:
     """
     if grid.pec_mask is None or grid.pec_id is None or not grid.pec_names:
         return []
-
-    labels, n = ndimage.label(grid.pec_mask)
-    by_id = {pid: name for name, pid in grid.pec_names.items()}
-
-    out = []
-    for lab in range(1, n + 1):
-        ids = np.unique(grid.pec_id[labels == lab])
-        names = sorted(by_id[int(i)] for i in ids if int(i) in by_id)
-        if len(names) > 1:
-            out.append(tuple(names))
-    return out
+    return [tuple(names) for names in body_parts(grid) if len(names) > 1]
