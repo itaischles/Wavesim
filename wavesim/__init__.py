@@ -50,7 +50,10 @@ from wavesim.parts import (
     part_id, part_mask, unnamed_pec_mask, check_shorts,
     pec_node_mask, conductor_bodies, body_parts,
 )
-from wavesim.electrostatics import Electrostatics, ElectrostaticSolution
+from wavesim.electrostatics import (
+    Electrostatics, ElectrostaticSolution,
+    CapacitanceMatrix, capacitance_matrix,
+)
 from wavesim.stability import (
     StabilityProbe, probe_growth, max_stable_dt, stability_margin,
     safe_area_threshold, ensure_stable_threshold,
@@ -124,6 +127,7 @@ __all__ = [
     "pec_node_mask", "conductor_bodies", "body_parts",
     # electrostatics
     "Electrostatics", "ElectrostaticSolution",
+    "CapacitanceMatrix", "capacitance_matrix",
     # stability (conformal small-cut, plan S7)
     "StabilityProbe", "probe_growth", "max_stable_dt", "stability_margin",
     "safe_area_threshold", "ensure_stable_threshold",

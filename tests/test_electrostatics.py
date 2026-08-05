@@ -20,7 +20,9 @@ import numpy as np
 import pytest
 
 import wavesim as ws
-from wavesim.electrostatics import Electrostatics, _resolve_boundary
+from wavesim.constants import EPS0
+from wavesim.electrostatics import (Electrostatics, capacitance_matrix,
+                                    _resolve_boundary)
 
 
 DS = 1e-3
@@ -388,3 +390,279 @@ def test_potential_at_reads_the_nearest_node():
     g = _plates(_grid())
     sol = _solve(g, {"bot": 0.0, "top": 1.0})
     assert sol.potential_at(6e-3, 6e-3, 9e-3) == pytest.approx(0.5, abs=1e-12)
+
+
+# ====================================================================== #
+# Derived fields
+# ====================================================================== #
+
+def test_E_and_D_match_the_analytic_parallel_plate():
+    """E = V/d and D = ε₀E, on the edges where the FDTD keeps them."""
+    g = _plates(_grid())
+    sol = _solve(g, {"bot": 0.0, "top": 1.0})
+    d = 12 * DS                                      # nodes 3..15
+
+    Ez = sol.E[2]
+    assert Ez[6, 6, 8] == pytest.approx(-1.0 / d, rel=1e-12)
+    assert sol.D[2][6, 6, 8] == pytest.approx(-EPS0 / d, rel=1e-12)
+    # Nothing transverse, and nothing outside the gap. The tolerance is looser
+    # than φ's because differencing by a 1 mm cell amplifies round-off by 1e3.
+    assert np.abs(sol.E[0]).max() < 1e-9
+    assert Ez[6, 6, 17] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_E_vanishes_inside_a_conductor_without_being_masked():
+    """Every edge in there joins two nodes the solve holds at one potential."""
+    g = _grid()
+    ws.set_box(g, 3e-3, 9e-3, 3e-3, 9e-3, 8e-3, 12e-3, 1.0, pec=True, name="c")
+    sol = _solve(g, {"c": 5.0}, boundary='ground')
+
+    inside = np.zeros_like(g.pec_mask)
+    inside[4:8, 4:8, 9:11] = True                    # strictly interior edges
+    for E in sol.E:
+        assert np.all(E[inside] == 0.0)
+
+
+def test_D_uses_the_face_permittivity_not_the_raw_array():
+    """A face on the conductor surface must not report the metal's stored ε.
+
+    ε inside a conductor is whatever the voxeliser left there. If D read the raw
+    array, stamping the metal cells back to 1 would change the surface flux —
+    and so the conductor's charge — without changing the physics.
+    """
+    def charge_with(stamp):
+        g = _grid()
+        ws.set_dielectric(g, 5.0)
+        ws.set_box(g, 3e-3, 9e-3, 3e-3, 9e-3, 8e-3, 12e-3, 1.0,
+                   pec=True, name="c")
+        if stamp:
+            for arr in (g.eps_x, g.eps_y, g.eps_z):
+                arr[g.pec_mask] = 1.0
+        return _solve(g, {"c": 1.0}, boundary='ground').charge("c")
+
+    assert charge_with(True) == pytest.approx(charge_with(False), rel=1e-12)
+
+
+def test_E_magnitude_is_node_centred_and_non_negative():
+    g = _plates(_grid())
+    mag = _solve(g, {"bot": 0.0, "top": 1.0}).E_magnitude()
+    assert mag.shape == (12, 12, 20)
+    assert np.all(mag >= 0.0)
+    assert mag[6, 6, 8] == pytest.approx(1.0 / (12 * DS), rel=1e-12)
+
+
+# ====================================================================== #
+# Charge and energy
+# ====================================================================== #
+
+def test_charge_on_a_parallel_plate_is_the_analytic_value():
+    g = _plates(_grid())
+    sol = _solve(g, {"bot": 0.0, "top": 1.0})
+    # Node box is 11 cells across; the gap spans 12.
+    C = EPS0 * (11 * DS) ** 2 / (12 * DS)
+    assert sol.charge("top") == pytest.approx(C, rel=1e-12)
+    assert sol.charge("bot") == pytest.approx(-C, rel=1e-12)
+
+
+def test_an_enclosed_system_is_charge_neutral():
+    """Every field line that leaves one conductor lands on another."""
+    g = _plates(_grid())
+    sol = _solve(g, {"bot": 0.0, "top": 1.0})
+    assert sol.node_charge.sum() == pytest.approx(0.0, abs=1e-25)
+
+
+def test_free_space_carries_no_charge():
+    """Charge lands only where φ was pinned — that is the equation solved."""
+    g = _grid()
+    ws.set_box(g, 3e-3, 9e-3, 3e-3, 9e-3, 8e-3, 12e-3, 1.0, pec=True, name="c")
+    sol = _solve(g, {"c": 1.0}, boundary='ground')
+
+    free = np.ones_like(sol.node_charge, dtype=bool)
+    free[sol.body_labels > 0] = False
+    free[[0, -1], :, :] = free[:, [0, -1], :] = free[:, :, [0, -1]] = False
+    assert np.abs(sol.node_charge[free]).max() < 1e-25
+
+
+def test_energy_equals_half_sum_qv():
+    """W = ½ΣQV, the identity that ties the energy to the charges."""
+    g = _plates(_grid())
+    sol = _solve(g, {"bot": 0.0, "top": 1.0})
+    assert sol.energy == pytest.approx(
+        0.5 * float((sol.node_charge * sol.phi).sum()), rel=1e-12)
+
+
+def test_capacitance_from_energy_matches_capacitance_from_charge():
+    """2W/V² and Q/V are different routes to the same number."""
+    g = _plates(_grid())
+    sol = _solve(g, {"bot": 0.0, "top": 1.0})
+    assert 2 * sol.energy == pytest.approx(sol.charge("top"), rel=1e-12)
+
+
+def test_energy_scales_with_the_square_of_the_drive():
+    g = _plates(_grid())
+    one = _solve(g, {"bot": 0.0, "top": 1.0}).energy
+    three = _solve(g, {"bot": 0.0, "top": 3.0}).energy
+    assert three == pytest.approx(9.0 * one, rel=1e-12)
+
+
+def test_charge_on_an_unknown_conductor_is_refused():
+    g = _plates(_grid())
+    sol = _solve(g, {"bot": 0.0, "top": 1.0})
+    with pytest.raises(KeyError, match="no conductor named"):
+        sol.charge("side")
+
+
+# ====================================================================== #
+# Capacitance matrix
+# ====================================================================== #
+
+def _three_conductor_grid():
+    g = _grid(20, 12, 12)
+    ws.set_box(g, 2e-3, 6e-3, 4e-3, 8e-3, 4e-3, 8e-3, 1.0, pec=True, name="a")
+    ws.set_box(g, 13e-3, 17e-3, 4e-3, 8e-3, 4e-3, 8e-3, 1.0, pec=True, name="b")
+    return g
+
+
+def test_maxwell_matrix_is_symmetric_with_the_expected_signs():
+    """Reciprocity is a property of the operator, not of the geometry."""
+    cm = capacitance_matrix(_three_conductor_grid(), boundary='ground',
+                            method='direct')
+    C = cm.maxwell
+    assert C == pytest.approx(C.T, rel=1e-9)
+    assert np.all(np.diag(C) > 0)
+    assert C[0, 1] < 0 and C[1, 0] < 0
+
+
+def test_mutual_capacitance_is_positive_and_row_sums_give_ground():
+    cm = capacitance_matrix(_three_conductor_grid(), boundary='ground',
+                            method='direct')
+    mutual = cm.mutual()
+    assert cm.between("a", "b") > 0
+    assert mutual[0, 0] == pytest.approx(cm.to_ground("a"), rel=1e-12)
+    assert cm.to_ground("a") > 0
+
+
+def test_capacitance_matrix_reproduces_the_parallel_plate():
+    g = _plates(_grid())
+    cm = capacitance_matrix(g, boundary='neumann', method='direct')
+    C = EPS0 * (11 * DS) ** 2 / (12 * DS)
+    assert cm.between("top", "bot") == pytest.approx(C, rel=1e-12)
+
+
+def test_capacitance_scales_exactly_with_a_uniform_permittivity():
+    """C(ε_r) = ε_r·C(1) to round-off — no geometry knowledge required."""
+    def cap(eps_r):
+        g = _grid()
+        if eps_r != 1.0:
+            ws.set_dielectric(g, eps_r)
+        _plates(g)
+        return capacitance_matrix(g, boundary='neumann',
+                                  method='direct').between("top", "bot")
+
+    assert cap(7.0) == pytest.approx(7.0 * cap(1.0), rel=1e-12)
+
+
+def test_a_conductor_shorted_to_a_driven_boundary_is_refused():
+    """Driving the shield of an earthed box is a short, and says so."""
+    g = _grid()
+    ws.set_box(g, 0, 4e-3, 2e-3, 6e-3, 2e-3, 6e-3, 1.0, pec=True, name="wall")
+    with pytest.raises(ValueError, match="short"):
+        capacitance_matrix(g, ["wall"], boundary='ground', method='direct')
+
+
+def test_capacitance_needs_somewhere_for_the_field_to_terminate():
+    """One isolated conductor in a Neumann box has no capacitance at all."""
+    g = _grid(8, 8, 8)
+    ws.set_box(g, 3e-3, 5e-3, 3e-3, 5e-3, 3e-3, 5e-3, 1.0, pec=True, name="c")
+    with pytest.raises(ValueError, match="every extracted capacitance is zero"):
+        capacitance_matrix(g, ["c"], boundary='neumann', method='direct')
+
+
+def test_a_rank_deficient_matrix_is_returned_not_refused():
+    """No path to ground makes the rows sum to zero — which is correct, not broken.
+
+    A shielded pair is the ordinary case: there is genuinely no capacitance to
+    ground to report, and the mutual capacitance between them is still exact.
+    """
+    g = _plates(_grid())
+    cm = capacitance_matrix(g, boundary='neumann', method='direct')
+    assert cm.maxwell.sum(axis=1) == pytest.approx(np.zeros(2), abs=1e-25)
+    assert cm.between("top", "bot") > 0
+
+
+def test_parts_that_are_one_conductor_cannot_be_driven_apart():
+    g = _grid()
+    ws.set_box(g, 2e-3, 6e-3, 2e-3, 6e-3, 2e-3, 6e-3, 1.0, pec=True, name="a")
+    ws.set_box(g, 6e-3, 10e-3, 2e-3, 6e-3, 2e-3, 6e-3, 1.0, pec=True, name="b")
+    with pytest.raises(ValueError, match="same conductor"):
+        capacitance_matrix(g, boundary='ground', method='direct')
+
+
+# ====================================================================== #
+# Against the analytic coax, and against the 2D mode solver
+# ====================================================================== #
+
+def _coax_capacitance(N, a=3e-3, b=10e-3, eps_r=2.3, Nz=4):
+    ds = 24e-3 / N
+    g = ws.set_vacuum(ws.create_grid(N, N, Nz, ds, ds, ds))
+    c = N * ds / 2
+    ws.set_coax(g, c, c, a, b, eps_r_fill=eps_r,
+                name_inner="core", name_outer="shield")
+    sol = _solve(g, {"core": 1.0, "shield": 0.0}, boundary='neumann',
+                 method='cg')
+    return g, sol.charge("core") / ((Nz - 1) * ds)
+
+
+def _coax_analytic(a=3e-3, b=10e-3, eps_r=2.3):
+    return 2 * np.pi * EPS0 * eps_r / np.log(b / a)
+
+
+def test_coax_capacitance_approaches_the_analytic_value():
+    _, C = _coax_capacitance(96)              # 12 cells per inner radius
+    assert C == pytest.approx(_coax_analytic(), rel=0.05)
+
+
+def test_coax_capacitance_converges_under_refinement():
+    """The staircased circle is the error source, so it must shrink with h."""
+    exact = _coax_analytic()
+    errs = [abs(_coax_capacitance(N)[1] / exact - 1) for N in (24, 48, 96)]
+    assert errs[0] > errs[1] > errs[2]
+    assert errs[-1] < 0.03
+
+
+@pytest.mark.slow
+def test_both_solvers_bracket_the_analytic_coax():
+    """A known, systematic difference between the two — recorded, not hidden.
+
+    The mode solver's staircase path takes its conductor nodes by slicing
+    ``pec_mask`` directly, which places a block's high-side surface one cell
+    short of where the metal actually ends. This module instead derives them
+    from the FDTD's own zeroed-edge masks, which puts the surface at the true
+    extent. So on the same grid the mode solver models a slightly smaller inner
+    conductor and reads low, while this reads high, and the two straddle the
+    analytic value until the mesh is fine enough for it not to matter. Both
+    converge; neither is wrong; they are not interchangeable at coarse mesh.
+    """
+    N = 48
+    g, C_3d = _coax_capacitance(N)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        C_2d = ws.solve_tem_modes(g, normal='z',
+                                  position=24e-3 / N)[0].capacitance
+    exact = _coax_analytic()
+    assert C_2d < exact < C_3d
+    assert abs(C_3d / exact - 1) < 0.10
+    assert abs(C_2d / exact - 1) < 0.10
+
+
+# ====================================================================== #
+# Derived quantities under the iterative solver
+# ====================================================================== #
+
+def test_cg_reproduces_the_direct_charge_and_energy():
+    g = _plates(_grid())
+    direct = _solve(g, {"bot": 0.0, "top": 1.0}, method='direct')
+    iterative = _solve(g, {"bot": 0.0, "top": 1.0}, method='cg', rtol=1e-12)
+    assert iterative.charge("top") == pytest.approx(direct.charge("top"),
+                                                    rel=1e-8)
+    assert iterative.energy == pytest.approx(direct.energy, rel=1e-8)

@@ -67,6 +67,7 @@ convergence study the caller owns, not a setting.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Dict, Tuple
 import warnings
 
@@ -74,6 +75,7 @@ import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.linalg import splu, cg, LinearOperator
 
+from wavesim.constants import EPS0
 from wavesim.grid import FDTDGrid
 from wavesim.parts import (body_parts, conductor_bodies, part_id,
                            pec_node_mask)
@@ -204,6 +206,20 @@ def _face_eps(eps: np.ndarray, node_pec: np.ndarray, axis: int) -> np.ndarray:
     return face
 
 
+def _face_slices(axis: int):
+    """``(low, high)`` index tuples pairing each node with its ``+axis`` neighbour.
+
+    Every face-wise loop in this module — assembly, flux, energy, the gradient —
+    walks the same pairing, so it is written once. ``arr[low]`` and ``arr[high]``
+    are the values at the two ends of every face along ``axis``.
+    """
+    lo = [slice(None)] * 3
+    hi = [slice(None)] * 3
+    lo[axis] = slice(0, -1)
+    hi[axis] = slice(1, None)
+    return tuple(lo), tuple(hi)
+
+
 def _face_coefs(grid: FDTDGrid, node_pec: np.ndarray) -> Tuple[np.ndarray, ...]:
     """Per-face conductances of the ε-weighted Laplacian, one array per axis.
 
@@ -285,11 +301,8 @@ def _assemble(coefs, fixed: np.ndarray):
     for axis, coef in enumerate(coefs):
         if coef.size == 0:
             continue
-        lo = [slice(None)] * 3
-        hi = [slice(None)] * 3
-        lo[axis] = slice(0, -1)
-        hi[axis] = slice(1, None)
-        for src, nbr in ((tuple(lo), tuple(hi)), (tuple(hi), tuple(lo))):
+        lo, hi = _face_slices(axis)
+        for src, nbr in ((lo, hi), (hi, lo)):
             i_src = free_idx[src]
             live = i_src >= 0
             diag[src] += np.where(live, coef, 0.0)
@@ -316,6 +329,91 @@ def _assemble(coefs, fixed: np.ndarray):
     B = coo_matrix((cat(data_B), (cat(rows_B), cat(cols_B))),
                    shape=(n_free, int(fixed.sum()))).tocsr()
     return A, B, free_idx
+
+
+# ====================================================================== #
+# Derived quantities
+#
+# Everything below is computed from the *same* face coefficients the operator
+# was assembled from, never from a fresh discretisation of the same integral.
+# That is what makes the answers consistent with each other rather than merely
+# close: the reported charge is exactly the flux the solved equations balanced,
+# and the reported energy is exactly the quadratic form of the operator that
+# produced φ. Re-deriving either — integrating ½ε|E|² over cells, say — would
+# introduce a second discretisation whose disagreement with the first is
+# indistinguishable from a bug.
+# ====================================================================== #
+
+def _node_flux(coefs, phi: np.ndarray) -> np.ndarray:
+    """Net outward ε-weighted flux from each node's dual cell.
+
+    ``Σ_faces c_f (φ_n − φ_nbr)`` at every node, which is Gauss's law over that
+    node's control volume divided by ε₀: multiply by ε₀ and it is the enclosed
+    charge in coulombs.
+
+    Free nodes come out at zero to solver accuracy — that *is* the equation that
+    was solved — so the charge lands entirely on pinned nodes, conductor surfaces
+    and Dirichlet walls. That makes this its own consistency check.
+    """
+    out = np.zeros_like(phi)
+    for axis, coef in enumerate(coefs):
+        if coef.size == 0:
+            continue
+        lo, hi = _face_slices(axis)
+        flux = coef * (phi[lo] - phi[hi])
+        out[lo] += flux
+        out[hi] -= flux
+    return out
+
+
+def _field_energy(coefs, phi: np.ndarray) -> float:
+    """Electrostatic energy in joules, ``½ε₀ Σ_faces c_f (Δφ_f)²``.
+
+    Each term is ``ε·(A·d)·(Δφ/d)² = ε·V_face·E²``, so the sum is the usual
+    ``∫ε|E|²`` with every face weighted by the volume it owns — the quadratic
+    form of the operator, evaluated on its own solution.
+    """
+    total = 0.0
+    for axis, coef in enumerate(coefs):
+        if coef.size == 0:
+            continue
+        lo, hi = _face_slices(axis)
+        total += float(np.sum(coef * (phi[hi] - phi[lo]) ** 2))
+    return 0.5 * EPS0 * total
+
+
+def _gradient(grid: FDTDGrid, phi: np.ndarray) -> Tuple[np.ndarray, ...]:
+    """``E = −∇φ`` on the Yee E-edges, as three ``(Nx, Ny, Nz)`` arrays.
+
+    ``Ex[i,j,k] = −(φ[i+1,j,k] − φ[i,j,k]) / dxp[i]`` — the edge joining the two
+    nodes, which is exactly where ``Ex`` lives, so this needs no interpolation
+    and is not an approximation of the staggering but a statement of it.
+
+    The last index along each axis has no node beyond it to difference against
+    and is left at zero, matching the FDTD arrays, whose final edge lies on the
+    domain boundary.
+    """
+    primary = (grid.dxp, grid.dyp, grid.dzp)
+    out = []
+    for axis in range(3):
+        E = np.zeros_like(phi)
+        n = phi.shape[axis]
+        if n > 1:
+            lo, hi = _face_slices(axis)
+            shape = [1, 1, 1]
+            shape[axis] = n - 1
+            E[lo] = -(phi[hi] - phi[lo]) / primary[axis][:n - 1].reshape(shape)
+        out.append(E)
+    return tuple(out)
+
+
+def _pad_face_array(face: np.ndarray, axis: int, shape) -> np.ndarray:
+    """Grow a per-face array to full grid shape, zero in the missing last slot."""
+    out = np.zeros(shape, dtype=np.float64)
+    lo, _ = _face_slices(axis)
+    if face.size:
+        out[lo] = face
+    return out
 
 
 # ====================================================================== #
@@ -383,8 +481,9 @@ class ElectrostaticSolution:
     """Result of one electrostatic solve.
 
     ``phi`` is the potential in volts on the Yee nodes, shape ``(Nx, Ny, Nz)``.
-    Derived fields (E, D, energy, charge, capacitance) are added in the next
-    commit; everything needed to compute them is retained here.
+    The fields and integrals derived from it are computed on first access and
+    cached; all of them reuse ``coefs``, the face conductances the operator was
+    built from, so they agree with φ and with each other by construction.
     """
     phi: np.ndarray
     grid: FDTDGrid
@@ -395,10 +494,95 @@ class ElectrostaticSolution:
     n_unknowns: int
     iterations: int = 0
     node_pec: np.ndarray = field(default=None, repr=False)
+    coefs: Tuple[np.ndarray, ...] = field(default=None, repr=False)
+    body_labels: np.ndarray = field(default=None, repr=False)
+    part_body: Dict[str, int] = field(default_factory=dict, repr=False)
+
+    # -- potential ------------------------------------------------------ #
 
     def potential_at(self, x: float, y: float, z: float) -> float:
         """φ at the node nearest a physical position, in volts."""
         return float(self.phi[self.grid.position_to_index(x, y, z)])
+
+    # -- fields --------------------------------------------------------- #
+
+    @cached_property
+    def E(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(Ex, Ey, Ez)`` in V/m, on the Yee E-edges.
+
+        Same staggering and same shapes as ``grid.Ex``/``Ey``/``Ez``, so these
+        drop straight into the existing monitors and plotting helpers. E comes
+        out identically zero inside a conductor without being masked: every edge
+        there joins two nodes of one body, which the solve holds at one
+        potential.
+        """
+        return _gradient(self.grid, self.phi)
+
+    @cached_property
+    def D(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(Dx, Dy, Dz)`` in C/m², ``D = ε₀ ε_r E`` on the same edges.
+
+        The permittivity is the *face* permittivity :func:`_face_eps` produced
+        for the operator, not the raw ``eps_*`` array. On a face straddling a
+        conductor surface those differ — the raw array holds whatever the
+        voxeliser left inside the metal — and using the raw value would make the
+        flux through the conductor surface, hence its charge, inconsistent with
+        the equations that were actually solved.
+        """
+        eps = (self.grid.eps_x, self.grid.eps_y, self.grid.eps_z)
+        shape = self.phi.shape
+        out = []
+        for axis, E in enumerate(self.E):
+            face = _face_eps(eps[axis], self.node_pec, axis)
+            out.append(EPS0 * _pad_face_array(face, axis, shape) * E)
+        return tuple(out)
+
+    def E_magnitude(self) -> np.ndarray:
+        """``|E|`` in V/m interpolated onto the nodes, for display.
+
+        The three components live on different edges, so a magnitude needs them
+        brought to a common point; each node averages the two collinear edges
+        meeting there. This is an interpolation for plotting — the quantitative
+        results above use the components where they actually live.
+        """
+        total = np.zeros(self.phi.shape, dtype=np.float64)
+        for axis, E in enumerate(self.E):
+            lo, hi = _face_slices(axis)
+            centred = np.array(E, dtype=np.float64)
+            if E.shape[axis] > 1:
+                centred[hi] = 0.5 * (E[hi] + E[lo])
+            total += centred ** 2
+        return np.sqrt(total)
+
+    # -- integrals ------------------------------------------------------ #
+
+    @cached_property
+    def energy(self) -> float:
+        """Total electrostatic energy in the domain, in joules."""
+        return _field_energy(self.coefs, self.phi)
+
+    @cached_property
+    def node_charge(self) -> np.ndarray:
+        """Charge in coulombs enclosed by each node's dual cell.
+
+        Nonzero only on conductor surfaces and Dirichlet walls; free nodes carry
+        no net charge, which is the equation that was solved.
+        """
+        return EPS0 * _node_flux(self.coefs, self.phi)
+
+    def charge(self, name: str) -> float:
+        """Total charge in coulombs on the named conductor.
+
+        Gauss's law over a surface enclosing the part's body: the flux out of
+        every node the conductor occupies, which telescopes to the flux through
+        its surface because interior nodes are surrounded by their own potential.
+        """
+        body = self.part_body.get(name)
+        if body is None:
+            known = ", ".join(sorted(self.part_body)) or "none"
+            raise KeyError(f"no conductor named {name!r} in this solution; "
+                           f"available: {known}")
+        return float(self.node_charge[self.body_labels == body].sum())
 
 
 # ====================================================================== #
@@ -492,7 +676,13 @@ class Electrostatics:
         bc = _resolve_boundary(boundary)
         node_pec = pec_node_mask(grid)
 
-        fixed, phi_fixed, n_grounded = self._pin_conductors(node_pec)
+        labels, n_bodies = conductor_bodies(grid)
+        occupants = body_parts(grid)
+        part_body = {name: b + 1
+                     for b, names in enumerate(occupants) for name in names}
+
+        fixed, phi_fixed, n_grounded = self._pin_conductors(
+            labels, n_bodies, occupants)
         self._pin_boundary(bc, fixed, phi_fixed)
 
         if not fixed.any():
@@ -518,11 +708,12 @@ class Electrostatics:
         return ElectrostaticSolution(
             phi=phi, grid=grid, potentials=dict(self.potentials), boundary=bc,
             grounded_bodies=n_grounded, method=chosen, n_unknowns=n_free,
-            iterations=iterations, node_pec=node_pec)
+            iterations=iterations, node_pec=node_pec, coefs=coefs,
+            body_labels=labels, part_body=part_body)
 
     # -- pinning -------------------------------------------------------- #
 
-    def _pin_conductors(self, node_pec):
+    def _pin_conductors(self, labels, n_bodies, occupants):
         """Pin every conductor node to its body's potential.
 
         Works body by body rather than part by part, because a body is the thing
@@ -537,11 +728,9 @@ class Electrostatics:
         fixed = np.zeros(shape, dtype=bool)
         phi_fixed = np.zeros(shape, dtype=np.float64)
 
-        labels, n_bodies = conductor_bodies(grid)
         if n_bodies == 0:
             return fixed, phi_fixed, 0
 
-        occupants = body_parts(grid)
         n_grounded = 0
         for body in range(1, n_bodies + 1):
             names = [n for n in occupants[body - 1] if n in self.potentials]
@@ -629,3 +818,132 @@ def _linear_solve(A: csr_matrix, b: np.ndarray, method: str,
     if info < 0:
         raise RuntimeError(f"conjugate gradients failed with info={info}")
     return x, count
+
+
+# ====================================================================== #
+# Capacitance
+# ====================================================================== #
+
+@dataclass
+class CapacitanceMatrix:
+    """Capacitance between a set of named conductors, in farads.
+
+    ``maxwell[i][j]`` is ``∂Q_i/∂V_j`` with every other conductor held at 0 V —
+    the *Maxwell* (short-circuit) matrix, which is what a field solver measures
+    directly and what circuit extraction consumes. Its diagonal is positive, its
+    off-diagonals negative (raising one conductor pulls negative charge onto its
+    neighbours), and each row sums to the capacitance from that conductor to
+    whatever plays the role of ground.
+
+    :meth:`mutual` converts to the two-terminal capacitances people draw as
+    lumped components between pairs of pins. The two are routinely confused, and
+    reporting one under the other's name is off by more than a sign, so both are
+    named explicitly rather than one being "the" capacitance matrix.
+    """
+    names: Tuple[str, ...]
+    maxwell: np.ndarray
+
+    def mutual(self) -> np.ndarray:
+        """Two-terminal capacitances: off-diagonal ``−C_ij``, diagonal to ground.
+
+        ``mutual[i][j]`` (i ≠ j) is the lumped capacitor between conductors i and
+        j; ``mutual[i][i]`` is the one from conductor i to ground, i.e. the row
+        sum of the Maxwell matrix.
+        """
+        out = -self.maxwell.copy()
+        np.fill_diagonal(out, self.maxwell.sum(axis=1))
+        return out
+
+    def between(self, a: str, b: str) -> float:
+        """Two-terminal capacitance in farads between two named conductors."""
+        i, j = self.names.index(a), self.names.index(b)
+        return float(self.mutual()[i, j])
+
+    def to_ground(self, a: str) -> float:
+        """Capacitance in farads from one conductor to ground."""
+        i = self.names.index(a)
+        return float(self.maxwell[i].sum())
+
+
+def capacitance_matrix(grid: FDTDGrid, names=None, *, boundary='ground',
+                       **solve_kw) -> CapacitanceMatrix:
+    """Extract the capacitance matrix by energising one conductor at a time.
+
+    Runs one solve per conductor with that conductor at 1 V and the rest at 0 V,
+    reading a column of the matrix off the resulting charges. There is no
+    cheaper route: the columns are genuinely independent solutions, and reusing
+    a factorisation across them was measured not to pay (see :data:`AUTO_METHOD`).
+
+    Parameters
+    ----------
+    names : sequence of str, optional
+        Conductors to include, defaulting to every named part. Parts that turn
+        out to be the same body are refused, since they cannot be driven
+        independently.
+    boundary : str, number or dict
+        As :meth:`Electrostatics.solve`. Defaults to a grounded box, which makes
+        the box the reference conductor and gives every conductor a capacitance
+        to ground. With an all-Neumann box instead, the rows sum to zero and the
+        Maxwell matrix is rank-deficient — correctly so, since there is no
+        ground to have a capacitance to — while the mutual capacitances remain
+        exact. That is the normal way to measure a shielded structure, not an
+        error. Note that a conductor touching a Dirichlet face is shorted to it
+        as soon as this drives that conductor, and says so.
+    **solve_kw
+        Passed through to :meth:`Electrostatics.solve` (``method``, ``rtol``, …).
+
+    Returns
+    -------
+    CapacitanceMatrix
+    """
+    names = tuple(names if names is not None else sorted(grid.pec_names or {}))
+    if len(names) < 1:
+        raise ValueError("no named PEC parts to extract capacitance between; "
+                         "name them at placement (see wavesim.parts)")
+
+    bodies = body_parts(grid)
+    owner = {n: b for b, group in enumerate(bodies) for n in group}
+    seen = {}
+    for n in names:
+        if n not in owner:
+            part_id(grid, n)      # raises with the list of names, if unknown
+            raise ValueError(f"part {n!r} occupies no conductor body")
+        if owner[n] in seen:
+            raise ValueError(
+                f"parts {seen[owner[n]]!r} and {n!r} are the same conductor, so "
+                f"they cannot be driven independently and have no capacitance "
+                f"between them. Drop one, or check wavesim.parts.check_shorts().")
+        seen[owner[n]] = n
+
+    n_cond = len(names)
+    C = np.zeros((n_cond, n_cond), dtype=np.float64)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for j, driven in enumerate(names):
+            es = Electrostatics(grid)
+            for n in names:
+                es.set_potential(n, 1.0 if n == driven else 0.0)
+            sol = es.solve(boundary=boundary, **solve_kw)
+            for i, probe in enumerate(names):
+                C[i, j] = sol.charge(probe)
+    # The per-solve grounding notice is identical every time; say it once.
+    for w in caught[:1]:
+        warnings.warn(w.message, UserWarning, stacklevel=2)
+
+    # A matrix whose rows sum to zero is *not* an error: with no path to ground
+    # the Maxwell matrix is genuinely rank-deficient, and the mutual
+    # capacitances in it are still exactly right — a shielded coax is the
+    # ordinary case. What is useless is a matrix that is numerically all zero,
+    # which means nothing in the model couples to anything: a lone conductor in
+    # a Neumann box, whose field has nowhere to go. Scaled against ε₀·(domain
+    # size), the capacitance any real structure of this size would have, so the
+    # comparison does not depend on the units the model was built in.
+    span = max(float(grid.x[-1] - grid.x[0]), float(grid.y[-1] - grid.y[0]),
+               float(grid.z[-1] - grid.z[0]))
+    if np.abs(C).max() <= 1e-9 * EPS0 * span:
+        raise ValueError(
+            "every extracted capacitance is zero: nothing in the model couples "
+            "to anything else. A single conductor inside an all-Neumann box has "
+            "no capacitance, because no flux can leave it. Give the field "
+            "somewhere to terminate — boundary='ground', or a second conductor.")
+    return CapacitanceMatrix(names=names, maxwell=C)
