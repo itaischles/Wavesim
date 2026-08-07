@@ -56,6 +56,8 @@ from scipy.sparse.linalg import splu
 
 from wavesim.constants import EPS0, ETA0, C0
 from wavesim.grid import FDTDGrid
+from wavesim.parts import pec_node_mask
+from wavesim.pec import build_pec_edge_masks
 
 
 # ====================================================================== #
@@ -135,6 +137,25 @@ def _plane_open_fractions(grid: FDTDGrid, cfg: dict, normal: str, k: int):
         return None, None
     return (np.asarray(_slice(getattr(grid, cfg['edge'][0]), normal, k), float),
             np.asarray(_slice(getattr(grid, cfg['edge'][1]), normal, k), float))
+
+
+def _plane_edge_pec(grid: FDTDGrid, cfg: dict, normal: str, k: int):
+    """``(m_a, m_b)`` — the two transverse E-edge masks the FDTD zeroes, sliced.
+
+    The staircase counterpart of :func:`_plane_open_fractions`: exactly the edges
+    :func:`wavesim.pec.apply_pec_mask` holds at zero, so ``ê`` can be masked on
+    the *edges* the run masks rather than on the nodes ``φ`` is pinned at. The
+    two are not the same set — a node on a conductor surface owns a live edge
+    running out into the gap, and on a coax that edge carries the largest field
+    on the plane. Zeroing it (which masking by :attr:`TEMMode.pec` does) throws
+    that away and the launched/absorbed profile stops being the mode the run
+    carries.
+    """
+    if grid.pec_mask is None:
+        return None, None
+    masks = dict(zip(('Ex', 'Ey', 'Ez'), build_pec_edge_masks(grid.pec_mask)))
+    return (_slice(masks[cfg['E'][0]], normal, k),
+            _slice(masks[cfg['E'][1]], normal, k))
 
 
 def _conformal_node_pec(f_a: np.ndarray, f_b: np.ndarray) -> np.ndarray:
@@ -364,6 +385,13 @@ class TEMMode:
         length and are simply zeroed — the same set
         :func:`wavesim.pec.apply_pec_mask` zeroes, and the reason the PEC mask
         is not applied on top: a partially covered edge must keep its field.
+
+        Both paths therefore zero ``ê`` on exactly the edge set the run holds at
+        zero, the staircase one via :func:`_plane_edge_pec`. Zeroing it on the
+        *nodes* instead — which is what ``Ea[self.pec] = 0`` did — deletes the
+        live edge a surface node owns out into the gap, the one carrying the
+        largest field on a coax plane; see
+        ``docs/mode_solver_staircase_node_mask.md``.
         """
         cfg = _NORMAL_CFG[self.normal]
         phi = self.phi
@@ -383,9 +411,17 @@ class TEMMode:
         if f_a is None:
             Ea[:-1, :] = -(phi[1:, :] - phi[:-1, :]) / da
             Eb[:, :-1] = -(phi[:, 1:] - phi[:, :-1]) / db
-            pec = self.pec
-            Ea[pec] = 0.0
-            Eb[pec] = 0.0
+            # Zero the *edges* the FDTD zeroes, not the nodes φ is pinned at:
+            # a surface node owns a live edge running out into the gap, and
+            # that edge carries the largest field on a coax plane. Masking by
+            # ``self.pec`` (which is now the closed node box, see
+            # :func:`solve_tem_modes`) would delete it. Δφ already vanishes on
+            # the edges buried inside one conductor, so this only removes the
+            # ones the run really holds at zero.
+            m_a, m_b = _plane_edge_pec(grid, cfg, self.normal, k)
+            if m_a is not None:
+                Ea[m_a] = 0.0
+                Eb[m_b] = 0.0
         else:
             La, Lb = f_a[:Na - 1, :] * da, f_b[:, :Nb - 1] * db
             np.divide(-(phi[1:, :] - phi[:-1, :]), La,
@@ -398,11 +434,11 @@ class TEMMode:
         mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
         eta = ETA0 * np.sqrt(mu_a / np.where(eps_a > 0, eps_a, 1.0))
         sa, sb = cfg['h_sign']
+        # Ĥ is built from the already-masked ê, so it inherits its zeros on
+        # both paths — no separate masking, which would only ever remove more
+        # than the run does.
         Ha = sa * Eb / eta
         Hb = sb * Ea / eta
-        if f_a is None:                    # H inherits ê's zeros conformally
-            Ha[pec] = 0.0
-            Hb[pec] = 0.0
 
         E = {cfg['E'][0]: Ea, cfg['E'][1]: Eb}
         H = {cfg['H'][0]: Ha, cfg['H'][1]: Hb}
@@ -425,14 +461,16 @@ class TEMMode:
         and a matched wave of modal voltage ``V`` carries ``P = V²/Z₀``, so a
         no-reflection sheet needs ``s = 1/(Z₀·G)``. Both ``Z₀`` (the energy-
         integral characteristic impedance) and ``G`` are computed on the *same*
-        staggered fields the sheet uses, so their discretisation errors partly
-        cancel and ``s`` stays close to 1 (≈ 1.1 on a coax at 12 cells across the
-        gap, → 1 under transverse refinement).
+        staggered fields the sheet uses, so their discretisation errors cancel.
 
-        Under conformal PEC the cancellation becomes exact for a homogeneous
-        fill: Z₀ and G are then two readings of one open-area energy integral,
-        giving ``G = C·c₀/√ε_r`` against ``Z₀ = √ε_r/(c₀·C)``, so ``s = 1`` to
-        round-off rather than to within a percent. An inhomogeneous
+        For a homogeneous fill the cancellation is exact on **both** paths: Z₀
+        and G are then two readings of one energy integral, ``G = C·c₀/√ε_r``
+        against ``Z₀ = √ε_r/(c₀·C)``, so ``s = 1`` to round-off. That holds only
+        because ``ê`` vanishes on exactly the edges whose face coefficient
+        contributes nothing to the energy — masking it by the node mask instead
+        left the staircase path reading ≈1.006, which looked like a
+        discretisation floor and was not (see
+        ``docs/mode_solver_staircase_node_mask.md``). An inhomogeneous
         cross-section still has a genuine residue.
 
         Requires the mode's ``impedance`` (solve with ``compute_params=True``).
@@ -688,14 +726,23 @@ def solve_tem_modes(grid: FDTDGrid, *,
 
     # Conformal cut-cell geometry, if the grid carries it. The conductor mask
     # then comes from the cut edges rather than from the cell-centred
-    # ``pec_mask``, because φ lives on the nodes those edges connect.
+    # ``pec_mask``, because φ lives on the nodes those edges connect. On the
+    # staircase path the same reasoning applies, and the node mask is the one
+    # the FDTD itself shorts — :func:`~wavesim.parts.pec_node_mask`, i.e. the
+    # end points of every edge ``build_pec_edge_masks`` zeroes. Slicing
+    # ``pec_mask`` and calling it a node mask instead kept each conductor's
+    # low-side surface node and dropped its high-side one, leaving every
+    # staircase conductor a cell short along each axis on its high side only:
+    # −7.7% in C' on a parallel-plate line, −8.1% on a coarse coax, and a port
+    # solved on geometry the run does not step. See
+    # ``docs/mode_solver_staircase_node_mask.md``.
     fa_full, fb_full = _plane_open_fractions(grid, cfg, normal, k)
     if fa_full is not None:
         pec_full = _conformal_node_pec(fa_full, fb_full)
     elif grid.pec_mask is None:
         pec_full = np.zeros(eps_a_full.shape, dtype=bool)
     else:
-        pec_full = _slice(grid.pec_mask, normal, k).astype(bool)
+        pec_full = _slice(pec_node_mask(grid), normal, k)
 
     full_shape = eps_a_full.shape  # the PlaneSource-compatible 2D shape
 
@@ -1133,10 +1180,9 @@ def _fv_energy(phi, eps_a, eps_b, da_w, db_w, pec, f_a, f_b) -> float:
     homogeneous fill (the filled and air operators are then scalar multiples,
     so φ = φ_air and every face coefficient scales by ε_r).
 
-    The legacy staircase path keeps its collocated ``np.gradient`` integral
-    instead — it is bit-identical to every recorded result and to
-    ``tests/test_homogeneous_fill.py``, and the conformal path is where the
-    cut-cell areas have to appear.
+    Both paths use it since S5d; ``f_a``/``f_b`` of ``None`` reduce the open
+    lengths to the full ones, so the staircase path is the same integral over
+    uncut geometry.
     """
     ca, cb = _face_coefs(eps_a, eps_b, da_w, db_w, pec, f_a, f_b)
     e = 0.0

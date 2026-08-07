@@ -630,18 +630,23 @@ def test_coax_capacitance_converges_under_refinement():
     assert errs[-1] < 0.03
 
 
-@pytest.mark.slow
-def test_both_solvers_bracket_the_analytic_coax():
-    """A known, systematic difference between the two — recorded, not hidden.
+def test_both_solvers_agree_on_the_coax_to_round_off():
+    """The 2D mode solver and this 3D solve return the *same* C', to round-off.
 
-    The mode solver's staircase path takes its conductor nodes by slicing
-    ``pec_mask`` directly, which places a block's high-side surface one cell
-    short of where the metal actually ends. This module instead derives them
-    from the FDTD's own zeroed-edge masks, which puts the surface at the true
-    extent. So on the same grid the mode solver models a slightly smaller inner
-    conductor and reads low, while this reads high, and the two straddle the
-    analytic value until the mesh is fine enough for it not to matter. Both
-    converge; neither is wrong; they are not interchangeable at coarse mesh.
+    They share no code beyond the node mask: this module assembles a 3D Poisson
+    operator and reads C from ``∮ε∇φ·dA`` on the conductor, the mode solver
+    assembles a 2D one and reads C from its own quadratic form. Agreement to
+    ~1e-15 on a staircased circle is therefore a real cross-check of both, and
+    it only holds because both take their conductor nodes from the FDTD's own
+    zeroed-edge masks (:func:`~wavesim.parts.pec_node_mask`).
+
+    It used to *bracket* the analytic value instead — the mode solver read low
+    (−5.3% at N=48) and this read high (+6.5%) — because the mode solver sliced
+    ``pec_mask`` as if it were a node mask and so modelled every conductor a
+    cell short on its high side. That is the bug in
+    ``docs/mode_solver_staircase_node_mask.md``, and this test is how it was
+    found. The remaining +6.5% is shared staircase error, which
+    :func:`test_coax_capacitance_converges_under_refinement` pins.
     """
     N = 48
     g, C_3d = _coax_capacitance(N)
@@ -649,10 +654,8 @@ def test_both_solvers_bracket_the_analytic_coax():
         warnings.simplefilter("ignore")
         C_2d = ws.solve_tem_modes(g, normal='z',
                                   position=24e-3 / N)[0].capacitance
-    exact = _coax_analytic()
-    assert C_2d < exact < C_3d
-    assert abs(C_3d / exact - 1) < 0.10
-    assert abs(C_2d / exact - 1) < 0.10
+    assert C_2d == pytest.approx(C_3d, rel=1e-12)
+    assert abs(C_3d / _coax_analytic() - 1) < 0.10
 
 
 # ====================================================================== #

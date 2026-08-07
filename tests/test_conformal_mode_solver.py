@@ -26,6 +26,8 @@ import pytest
 import wavesim as ws
 from wavesim.mode_solver import (_conformal_node_pec, _face_coefs,
                                  solve_tem_modes)
+from wavesim.parts import pec_node_mask
+from wavesim.pec import build_pec_edge_masks
 
 from conformal_shapes import coax_fractions
 
@@ -74,16 +76,23 @@ def _coax(cell, geometry='conformal', eps_r=1.0, centre_shift=0.0):
 def _binary_fractions(mask):
     """0/1 open fractions describing exactly the staircase ``mask``.
 
-    An edge is covered iff both of the nodes it joins are, which is the inverse
-    of :func:`_conformal_node_pec`; the two round-trip, so the conformal branch
-    must land on precisely the legacy potential.
+    An edge is covered iff the FDTD zeroes it, i.e. iff any of the four cells
+    touching it is PEC (:func:`~wavesim.pec.build_pec_edge_masks`) — the rule
+    the run itself applies, and the one the staircase mode solve now reads its
+    conductor off. :func:`_conformal_node_pec` on these fractions returns the
+    closed node box, so the two paths describe the same conductor and the
+    conformal branch must land on precisely the staircase potential.
+
+    Stating it as "covered iff both end nodes are PEC cells" instead (which is
+    what this did while the staircase branch sliced ``pec_mask`` as if it were a
+    node mask) describes a conductor one cell smaller on every high side — see
+    ``docs/mode_solver_staircase_node_mask.md``.
     """
-    fx, fy = np.ones(mask.shape), np.ones(mask.shape)
-    fx[:-1] = ~(mask[:-1] & mask[1:])
-    fy[:, :-1] = ~(mask[:, :-1] & mask[:, 1:])
-    fz = np.ones(mask.shape)
+    ex, ey, ez = build_pec_edge_masks(mask)
+    fx, fy, fz = (~ex).astype(float), (~ey).astype(float), (~ez).astype(float)
     return dict(pec_edge_open_x=fx, pec_edge_open_y=fy, pec_edge_open_z=fz,
-                pec_face_open_x=fy, pec_face_open_y=fx, pec_face_open_z=fz)
+                pec_face_open_x=fy, pec_face_open_y=fx,
+                pec_face_open_z=np.ones(mask.shape))
 
 
 def _mode(grid, **kw):
@@ -100,13 +109,17 @@ def _z0_err(cell, geometry):
 # ---------------------------------------------------------------------- #
 
 def test_node_mask_round_trips_the_edge_fractions():
-    """``_conformal_node_pec`` inverts ``_binary_fractions`` exactly."""
+    """``_conformal_node_pec`` inverts ``_binary_fractions`` exactly.
+
+    Both sides are the conductor the *run* steps: the end points of every edge
+    the staircase rule zeroes, which is what :func:`~wavesim.parts.pec_node_mask`
+    returns and what the staircase mode solve pins.
+    """
     grid = _coax(1.5e-3, 'staircase')
-    m = grid.pec_mask
-    fr = _binary_fractions(m)
+    fr = _binary_fractions(grid.pec_mask)
     node = _conformal_node_pec(fr['pec_edge_open_x'][:, :, 1],
                                fr['pec_edge_open_y'][:, :, 1])
-    assert np.array_equal(node, m[:, :, 1])
+    assert np.array_equal(node, pec_node_mask(grid)[:, :, 1])
 
 
 def test_all_open_fractions_mean_no_conductor():
@@ -184,20 +197,30 @@ def test_conformal_impedance_beats_the_staircase_target():
     Measured against the analytic 65.871 Ω (error, |Z₀/Z_analytic − 1|):
 
         cell (mm)   staircase = binary   conformal
-        0.5000            +6.86%           -0.79%
-        0.3750            +3.15%           -0.50%
-        0.2500            +3.59%           -0.27%
-        0.1875            +2.04%           -0.17%
+        0.5000            -5.24%           -0.79%
+        0.3750            -5.79%           -0.50%
+        0.2500            -2.59%           -0.27%
+        0.1875            -2.57%           -0.17%
 
     ``binary`` — the staircase conductor pushed through the conformal code path
-    — is now *identical* to ``staircase``, because S5d gave both the same
-    finite-volume energy integral. Before it, staircase read +14.37% here and
-    the two columns differed; that gap was the old collocated ``np.gradient``
-    capacitance, not the geometry.
+    — is *identical* to ``staircase``, because S5d gave both the same
+    finite-volume energy integral and both now read the conductor off the same
+    edge rule. Before S5d, staircase read +14.37% here and the two columns
+    differed; that gap was the old collocated ``np.gradient`` capacitance, not
+    the geometry.
+
+    The staircase column changed sign when the node-mask bug was fixed
+    (``docs/mode_solver_staircase_node_mask.md``): its conductor used to be a
+    cell short on every high side, which widened the coax gap and read Z₀ high
+    (+6.86% at 0.5 mm). The dilated conductor the run actually steps is the
+    slightly *fat* one, so the error is now negative — and it is the error the
+    FDTD line itself has, which is the point: mid-line V/I on the reference coax
+    measures 61.53 Ω against the mode's 62.42 Ω at 0.5 mm (+1.4%), where the old
+    mask claimed 70.39 Ω (+13.4%).
 
     What is left is the geometry alone, and it is worth reading the whole column
     rather than the endpoints: only the cut cells make the sequence monotone.
-    Staircase wobbles (3.59 after 3.15) because refining a staircase
+    Staircase wobbles (5.79 after 5.24) because refining a staircase
     re-rasterises the conductor rather than resolving it.
     """
     assert _z0_err(0.5e-3, 'conformal') < 0.02
@@ -207,8 +230,8 @@ def test_conformal_impedance_beats_the_staircase_target():
 def test_conformal_impedance_converges_faster_than_first_order():
     """The staircase error is O(h); the conformal error is not.
 
-    Measured order over a 2× refinement is ≈1.55 (0.79% → 0.27%) against ≈0.95
-    for the staircase (14.37% → 7.46%). It is not the O(h²) the plan hoped for,
+    Measured order over a 2× refinement is ≈1.55 (0.79% → 0.27%) against ≈1.02
+    for the staircase (5.24% → 2.59%). It is not the O(h²) the plan hoped for,
     and the residue is the mode solver's remaining half-cell bookkeeping — φ
     lives on nodes while the legacy stencil pairs primary face lengths with
     dual centre distances, invisible on a uniform mesh but not free of error.
@@ -288,14 +311,17 @@ def test_launched_h_sheet_carries_the_exact_modal_current():
     in the gap, i.e. a valid magnetostatic field. Measured on the reference coax
     at 0.5 mm, loops of ±8/10/12 cells:
 
-        staircase   1.0052 → 1.0034 → 1.0016   (spread 3.6e-3)
-        conformal   1.0004 → 1.0005 → 1.0004   (spread 1.0e-4)
+        staircase   1.00025 → 1.00032 → 1.00024   (spread 8.5e-5)
+        conformal   1.00036 → 1.00049 → 1.00038   (spread 1.3e-4)
 
-    A staircase Ĥ carries spurious distributed curl in what should be empty gap,
-    so the enclosed current depends on where you measure it. That is why only
-    the conformal launch traps a DC current (R8 in the plan): its deposited
-    static field is genuinely curl-free, hence a null mode of the leapfrog that
-    nothing removes, while the staircase one has curl, couples to E, and decays.
+    Both paths carry the modal current to better than 0.05% and both are
+    curl-free in the gap to ~1e-4. The staircase column used to read
+    1.0052 → 1.0034 → 1.0016 (spread 3.6e-3), and that drift was read as
+    spurious staircase curl; it was the undersized conductor
+    (``docs/mode_solver_staircase_node_mask.md``). With the conductor the run
+    actually steps, the staircase Ĥ is as loop-independent as the conformal one,
+    so no contrast is asserted here — what R8 needs of the conformal launch is
+    tested where it is used, in ``tests/test_modal_port.py``.
 
     Before S5d both ratios sat ~7% high (1.0758 → 1.0720 for staircase). That
     offset was the *capacitance integral*, not the launch: it inflated Z₀ by the
@@ -303,22 +329,14 @@ def test_launched_h_sheet_carries_the_exact_modal_current():
     """
     cell = 0.5e-3
     ic = jc = int(round(0.5 * int(round(2 * B_OUT / cell))))
-    ratios = {}
     for geometry in ('staircase', 'conformal'):
         grid = _coax(cell, geometry)
         mode = _mode(grid)
         _E, H = mode._staggered_port_fields(grid)
-        ratios[geometry] = [_circulation(H, grid, ic, jc, m) * mode.impedance
-                            for m in (8, 10, 12)]
-
-    conf = np.array(ratios['conformal'])
-    assert np.abs(conf - 1.0).max() < 5e-3, f"modal current off by {conf}"
-    assert np.ptp(conf) < 5e-4, f"conformal Ĥ not curl-free in the gap: {conf}"
-
-    # The staircase launch drifts with the contour: its Ĥ is not curl-free.
-    stair = np.array(ratios['staircase'])
-    assert np.ptp(stair) > 10 * np.ptp(conf), (
-        f"staircase Ĥ no longer drifts with the loop: {stair}")
+        r = np.array([_circulation(H, grid, ic, jc, m) * mode.impedance
+                      for m in (8, 10, 12)])
+        assert np.abs(r - 1.0).max() < 5e-3, f"{geometry} modal current off: {r}"
+        assert np.ptp(r) < 5e-4, f"{geometry} Ĥ not curl-free in the gap: {r}"
 
 
 def test_admittance_scale_is_unity_for_a_homogeneous_fill():
@@ -329,13 +347,18 @@ def test_admittance_scale_is_unity_for_a_homogeneous_fill():
     homogeneous fill they agree identically: G = C·c₀/√ε_r and Z₀ = √ε_r/(c₀C).
     The residual ~3e-9 is the tabulated η₀ against 1/(ε₀c₀), not discretisation.
 
-    Staircase measures 1.0058 at this resolution and drifts toward 1 only under
-    refinement, which is what the plan expected conformal PEC to remove.
+    The **staircase** path collapses to the same 1 — it did not while ``ê`` was
+    masked by the node mask. G sums ``ê²`` over the edges, Z₀ sums ``(Δφ)²`` over
+    the face coefficients of the same edges, so the two are one integral only if
+    ``ê`` vanishes on exactly the edges whose coefficient contributes nothing.
+    Masking ``ê`` by :attr:`TEMMode.pec` killed live surface-to-gap edges the
+    energy still counted, and the leftover 1.0058 at this resolution was that
+    mismatch, not a discretisation floor. Both paths now mask ``ê`` on the edge
+    set their own PEC rule zeroes, so both give 1 — see
+    ``docs/mode_solver_staircase_node_mask.md``.
     """
-    for eps_r in (1.0, 2.3):
-        grid = _coax(0.5e-3, 'conformal', eps_r=eps_r)
-        assert _mode(grid).numerical_admittance_scale(grid) == \
-            pytest.approx(1.0, rel=1e-6)
-
-    grid = _coax(0.5e-3, 'staircase')
-    assert _mode(grid).numerical_admittance_scale(grid) > 1.001
+    for geometry in ('conformal', 'staircase'):
+        for eps_r in (1.0, 2.3):
+            grid = _coax(0.5e-3, geometry, eps_r=eps_r)
+            assert _mode(grid).numerical_admittance_scale(grid) == \
+                pytest.approx(1.0, rel=1e-6)

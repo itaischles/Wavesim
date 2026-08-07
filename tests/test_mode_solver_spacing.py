@@ -70,7 +70,12 @@ def _parallel_plate(n=40, eps_r=1.0, graded=True, width=8e-3):
     lo, hi = int(0.2 * n), int(0.8 * n)
     grid.pec_mask = np.broadcast_to((j <= lo) | (j >= hi),
                                     (grid.Nx, grid.Ny, grid.Nz)).copy()
-    return grid, lo, hi
+    # Returned as *node* indices of the two metal faces: the lower plate fills
+    # cells 0..lo, i.e. y[0] → y[lo+1], so its surface is the node lo+1; the
+    # upper fills cells hi.., so its surface is the node hi. The gap is the
+    # nodes between, and y[hi] − y[lo+1] is the separation — which is what the
+    # solver's node mask (:func:`~wavesim.parts.pec_node_mask`) marks.
+    return grid, lo + 1, hi
 
 
 def _solve(grid):
@@ -121,7 +126,11 @@ def _with_legacy_pairing(fn):
 
 
 def _plate_field(mode, grid, lo, hi):
-    """``Δφ / dyp`` across each gap edge — the discrete E, which must be uniform."""
+    """``Δφ / dyp`` across each gap edge — the discrete E, which must be uniform.
+
+    ``lo``/``hi`` are the two metal-face *nodes*, so the edges ``lo``..``hi−1``
+    are exactly the gap and every one of them is a live edge of the run.
+    """
     phi = mode.phi[grid.Nx // 2, :]
     j = np.arange(lo, hi)
     return -(phi[j + 1] - phi[j]) / grid.dyp[j]
@@ -162,16 +171,19 @@ def test_the_old_pairing_fails_that_test():
 def test_graded_mesh_capacitance_is_the_analytic_value(eps_r):
     """C = ε₀ε_r·W/d exactly, with ``W`` the dual measure of the transverse
     extent (``_node_dual(dxp).sum()``, i.e. x[0] → xc[-1]) and ``d`` the plate
-    separation. There is no fringing to argue about: the plates span the full
-    extent and the side walls carry zero flux.
+    separation ``y[hi] − y[lo]`` between the two metal-face nodes. There is no
+    fringing to argue about: the plates span the full extent and the side walls
+    carry zero flux.
+
+    The separation is exact only because the solver marks the conductor's own
+    surface node. Slicing ``pec_mask`` as if it were a node mask put the lower
+    face one cell low and made this read ``d + dyp[lo−1]`` — 1/13 of the drop
+    per step against a true 1/12, the bug in
+    ``docs/mode_solver_staircase_node_mask.md``.
 
     Asserted on :func:`_fv_energy`, the operator's own quadratic form, because
-    that is what S5b changed. ``mode.capacitance`` on the *staircase* path still
-    comes from the older collocated ``np.gradient`` integral, which reads 3.9%
-    low on this case — a known and deliberate hold-over (S5 left it alone so
-    every recorded staircase number stays bit-identical), and the same effect
-    the conformal work's "binary" column quantified when switching to this
-    integral took the reference coax's Z₀ error from +14.4% to +6.9%.
+    that is what S5b changed — and since S5d it is also where
+    ``mode.capacitance`` comes from on both paths.
     """
     grid, lo, hi = _parallel_plate(eps_r=eps_r)
     mode = _solve(grid)
