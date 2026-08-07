@@ -44,6 +44,27 @@ Which nodes are metal is *not* read off ``pec_mask`` directly. It comes from
 FDTD applies, so the electrostatic conductor and the FDTD conductor are the same
 object. See that module for why the shortcut is wrong.
 
+Cut cells
+---------
+On a grid carrying conformal (Dey–Mittra) open fractions the solve runs on the
+cut geometry, not on its staircased approximation, so the conductor here is the
+one the FDTD steps at sub-cell resolution too. The whole of that support is one
+substitution — :func:`_open_lengths` — because the fraction belongs on the
+node-to-node **distance** and nowhere else: a node just outside the metal sits
+the open part of an edge away from the surface, so its coupling grows as
+``1/f``, which is the correct Dirichlet behaviour, and a fully covered edge
+(``f = 0``) drops out of the operator entirely with its two endpoints pinned
+instead. That is :mod:`wavesim.mode_solver`'s derivation from the conformal
+Faraday contour, unchanged; every weight below is the staircase weight times an
+open fraction, so an all-1.0 grid reproduces the staircase assembly bit for bit.
+
+The face *area* is deliberately not scaled. Beyond the derivation saying so, the
+grid does not carry the number that would be needed: ``pec_face_open_*`` are the
+open areas of the **primary** H faces, which span nodes, whereas the control
+volume here is a node's *dual* cell, whose faces are a different set of surfaces
+the voxeliser never measured. Scaling by the H-face fraction would be using a
+plausible-looking array for a quantity it is not.
+
 Boundary conditions
 -------------------
 PML is meaningless in statics — there is no wave to absorb — so the domain box
@@ -220,7 +241,67 @@ def _face_slices(axis: int):
     return tuple(lo), tuple(hi)
 
 
-def _face_coefs(grid: FDTDGrid, node_pec: np.ndarray) -> Tuple[np.ndarray, ...]:
+# The smallest open fraction the operator will carry. This is *not* the
+# covered/not-covered test — that stays exactly ``f == 0.0``, so the set of
+# edges this module calls metal is the identical set
+# :func:`wavesim.pec.build_conformal_edge_masks` hands the field update, and the
+# two solvers cannot drift apart on the question of where the conductor is.
+#
+# It is a floor on the coefficient. A conductor face lying on the node ruler
+# voxelises to a fraction like 1.7e-15 rather than to 0 — round-off, not
+# geometry — and such an edge is alive by the test above while its ``1/f`` weight
+# is 1e15 times its neighbours'. The FDTD never notices (it multiplies by the
+# open length, so a vanishing edge simply contributes nothing); a linear solve
+# does, because that weight lands on a matrix row. Clamping the *length* from
+# below leaves the edge live and still overwhelmingly strongly coupled — 1e9 is
+# a Dirichlet pin by any measure — without putting an infinity in the operator.
+#
+# Distinct from :data:`wavesim.grid.FDTDGrid.conformal_area_threshold`, which
+# exists because ``dt/(μA)`` diverges on a sliver face. There is no dt here and
+# no instability to cure; this is conditioning alone, and it clamps a length
+# rather than an area.
+MIN_OPEN_FRACTION = 1e-9
+
+
+def _open_lengths(grid: FDTDGrid) -> Tuple[Tuple[np.ndarray, ...], int]:
+    """Open node-to-node distance along each axis in metres, and a sliver count.
+
+    Returns ``((Lx, Ly, Lz), n_clamped)``. Each ``L`` is indexed like the edge it
+    measures — ``Lx[i,j,k]`` is the open length of the Yee edge ``Ex[i,j,k]``,
+    joining node ``(i,j,k)`` to ``(i+1,j,k)`` — and is the single quantity that
+    carries cut-cell geometry into this module. The operator divides by it, and
+    so does ``E = −∇φ``, which is what keeps the field consistent with the
+    equations that produced it.
+
+    Without cut geometry this is just the primary width, returned **broadcast**
+    rather than expanded: the staircase path keeps a length-``N`` array reshaped
+    to ``(N,1,1)``, since materialising three full grids of a constant would cost
+    hundreds of megabytes on a large model to say nothing new.
+
+    A fully covered edge keeps ``L = 0`` exactly, which drops it from the
+    operator; only a strictly positive fraction below :data:`MIN_OPEN_FRACTION`
+    is clamped, and ``n_clamped`` counts those.
+    """
+    primary = (grid.dxp, grid.dyp, grid.dzp)
+    fracs = (grid.pec_edge_open_x, grid.pec_edge_open_y, grid.pec_edge_open_z)
+
+    out, n_clamped = [], 0
+    for axis in range(3):
+        shape = [1, 1, 1]
+        shape[axis] = primary[axis].size
+        width = np.asarray(primary[axis], dtype=np.float64).reshape(shape)
+        if not grid.is_conformal:
+            out.append(width)
+            continue
+        f = np.asarray(fracs[axis], dtype=np.float64)
+        sliver = (f > 0.0) & (f < MIN_OPEN_FRACTION)
+        n_clamped += int(np.count_nonzero(sliver))
+        out.append(np.where(sliver, MIN_OPEN_FRACTION, f) * width)
+    return tuple(out), n_clamped
+
+
+def _face_coefs(grid: FDTDGrid, node_pec: np.ndarray,
+                lengths: Tuple[np.ndarray, ...]) -> Tuple[np.ndarray, ...]:
     """Per-face conductances of the ε-weighted Laplacian, one array per axis.
 
     ``cx[i,j,k]`` couples node ``(i,j,k)`` to ``(i+1,j,k)`` and is
@@ -237,9 +318,15 @@ def _face_coefs(grid: FDTDGrid, node_pec: np.ndarray) -> Tuple[np.ndarray, ...]:
     widths are equal to the last bit, and costs a full order of accuracy on a
     graded one; :mod:`wavesim.mode_solver` carries the same note because the
     same mistake was made and measured there.
+
+    ``lengths`` supplies that distance, from :func:`_open_lengths`, and is the
+    only route by which cut cells enter: under conformal PEC it is the *open*
+    part of the edge, so the coefficient rises as ``1/f``. A fully covered edge
+    has zero length and is given a zero coefficient rather than an infinite one —
+    it carries no flux equation at all, and the constraint it stands for (equal φ
+    at its two ends) is imposed by those nodes being pinned instead.
     """
     dual = (_node_dual(grid.dxp), _node_dual(grid.dyp), _node_dual(grid.dzp))
-    primary = (grid.dxp, grid.dyp, grid.dzp)
     eps = (grid.eps_x, grid.eps_y, grid.eps_z)
 
     def spread(vec, axis):
@@ -250,12 +337,14 @@ def _face_coefs(grid: FDTDGrid, node_pec: np.ndarray) -> Tuple[np.ndarray, ...]:
 
     out = []
     for axis in range(3):
-        n = grid.eps_x.shape[axis]
         others = [a for a in range(3) if a != axis]
         area = spread(dual[others[0]], others[0]) * spread(dual[others[1]],
                                                            others[1])
-        distance = spread(primary[axis][:n - 1], axis)
-        out.append(_face_eps(eps[axis], node_pec, axis) * area / distance)
+        lo, _ = _face_slices(axis)
+        distance = np.broadcast_to(lengths[axis], grid.eps_x.shape)[lo]
+        numerator = _face_eps(eps[axis], node_pec, axis) * area
+        out.append(np.divide(numerator, distance, out=np.zeros_like(numerator),
+                             where=distance > 0.0))
     return tuple(out)
 
 
@@ -382,27 +471,34 @@ def _field_energy(coefs, phi: np.ndarray) -> float:
     return 0.5 * EPS0 * total
 
 
-def _gradient(grid: FDTDGrid, phi: np.ndarray) -> Tuple[np.ndarray, ...]:
+def _gradient(grid: FDTDGrid, phi: np.ndarray,
+              lengths: Tuple[np.ndarray, ...]) -> Tuple[np.ndarray, ...]:
     """``E = −∇φ`` on the Yee E-edges, as three ``(Nx, Ny, Nz)`` arrays.
 
-    ``Ex[i,j,k] = −(φ[i+1,j,k] − φ[i,j,k]) / dxp[i]`` — the edge joining the two
-    nodes, which is exactly where ``Ex`` lives, so this needs no interpolation
-    and is not an approximation of the staggering but a statement of it.
+    ``Ex[i,j,k] = −(φ[i+1,j,k] − φ[i,j,k]) / Lx[i,j,k]`` — the edge joining the
+    two nodes, which is exactly where ``Ex`` lives, so this needs no
+    interpolation and is not an approximation of the staggering but a statement
+    of it.
 
-    The last index along each axis has no node beyond it to difference against
-    and is left at zero, matching the FDTD arrays, whose final edge lies on the
-    domain boundary.
+    The divisor is the edge's **open** length from :func:`_open_lengths`, which
+    on a staircase grid is just its width. That is the same field the conformal
+    FDTD carries on that edge (:meth:`wavesim.mode_solver.TEMMode._staggered_port_fields`
+    divides by the identical quantity) and the same one the operator's
+    coefficients were built from, so the potential, the field and the charge are
+    three readings of one discretisation rather than three discretisations.
+
+    A fully covered edge has no open length and is left at zero — E genuinely
+    vanishes inside a conductor. So is the last index along each axis, which has
+    no node beyond it to difference against, matching the FDTD arrays, whose
+    final edge lies on the domain boundary.
     """
-    primary = (grid.dxp, grid.dyp, grid.dzp)
     out = []
     for axis in range(3):
         E = np.zeros_like(phi)
-        n = phi.shape[axis]
-        if n > 1:
+        if phi.shape[axis] > 1:
             lo, hi = _face_slices(axis)
-            shape = [1, 1, 1]
-            shape[axis] = n - 1
-            E[lo] = -(phi[hi] - phi[lo]) / primary[axis][:n - 1].reshape(shape)
+            L = np.broadcast_to(lengths[axis], phi.shape)[lo]
+            np.divide(-(phi[hi] - phi[lo]), L, out=E[lo], where=L > 0.0)
         out.append(E)
     return tuple(out)
 
@@ -495,6 +591,7 @@ class ElectrostaticSolution:
     iterations: int = 0
     node_pec: np.ndarray = field(default=None, repr=False)
     coefs: Tuple[np.ndarray, ...] = field(default=None, repr=False)
+    open_lengths: Tuple[np.ndarray, ...] = field(default=None, repr=False)
     body_labels: np.ndarray = field(default=None, repr=False)
     part_body: Dict[str, int] = field(default_factory=dict, repr=False)
 
@@ -514,9 +611,22 @@ class ElectrostaticSolution:
         drop straight into the existing monitors and plotting helpers. E comes
         out identically zero inside a conductor without being masked: every edge
         there joins two nodes of one body, which the solve holds at one
-        potential.
+        potential. Under conformal PEC it is the *open* part of each edge that
+        carries the field, which is what the divisor accounts for.
         """
-        return _gradient(self.grid, self.phi)
+        return _gradient(self.grid, self.phi, self._lengths)
+
+    @property
+    def _lengths(self) -> Tuple[np.ndarray, ...]:
+        """The open edge lengths the operator was built from.
+
+        Recomputed only for a solution assembled by hand rather than by
+        :meth:`Electrostatics.solve`; the geometry is a property of the grid, so
+        the two agree.
+        """
+        if self.open_lengths is None:
+            return _open_lengths(self.grid)[0]
+        return self.open_lengths
 
     @cached_property
     def D(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -692,7 +802,19 @@ class Electrostatics:
                 "an additive constant. Ground a part, or make at least one face "
                 "Dirichlet (e.g. boundary='ground').")
 
-        coefs = _face_coefs(grid, node_pec)
+        lengths, n_clamped = _open_lengths(grid)
+        if n_clamped:
+            warnings.warn(
+                f"{n_clamped} cut edge(s) were open by less than "
+                f"{MIN_OPEN_FRACTION:g} of their length and were clamped to it. "
+                f"A conductor face lying on the node ruler voxelises to a "
+                f"round-off fraction rather than to zero, and that is what this "
+                f"usually is — harmless, since such an edge is a Dirichlet pin "
+                f"either way. Genuine slivers that fine are below the resolution "
+                f"at which a cut cell means anything; move the geometry off the "
+                f"ruler or coarsen the mesh.", stacklevel=2)
+
+        coefs = _face_coefs(grid, node_pec, lengths)
         A, B, free_idx = _assemble(coefs, fixed)
         n_free = A.shape[0]
 
@@ -709,7 +831,7 @@ class Electrostatics:
             phi=phi, grid=grid, potentials=dict(self.potentials), boundary=bc,
             grounded_bodies=n_grounded, method=chosen, n_unknowns=n_free,
             iterations=iterations, node_pec=node_pec, coefs=coefs,
-            body_labels=labels, part_body=part_body)
+            open_lengths=lengths, body_labels=labels, part_body=part_body)
 
     # -- pinning -------------------------------------------------------- #
 

@@ -76,3 +76,32 @@ def coax_fractions(grid, cx, cy, r_inner, r_outer, nsub=64):
 
     return dict(pec_edge_open_x=fx, pec_edge_open_y=fy, pec_edge_open_z=fz,
                 pec_face_open_x=fy, pec_face_open_y=fx, pec_face_open_z=faz)
+
+
+def binary_fractions(mask):
+    """0/1 open fractions describing exactly the staircase ``mask``.
+
+    An edge is covered iff the FDTD zeroes it, i.e. iff any of the four cells
+    touching it is PEC (:func:`~wavesim.pec.build_pec_edge_masks`) — the rule
+    the run itself applies, and the one the staircase solvers read their
+    conductor off. :func:`~wavesim.mode_solver._conformal_node_pec` and
+    :func:`~wavesim.parts.pec_node_mask` on these fractions both return the
+    closed node box, so the staircase and conformal code paths describe the same
+    conductor and must land on precisely the same potential.
+
+    Stating it as "covered iff both end nodes are PEC cells" instead (which is
+    what this did while the staircase mode solve sliced ``pec_mask`` as if it
+    were a node mask) describes a conductor one cell smaller on every high side
+    — see ``docs/mode_solver_staircase_node_mask.md``.
+
+    This is how the conformal *code path* is separated from the cut cells
+    themselves: whatever it computes on these fractions is what the staircase
+    assembly computes, or the reduction property has been broken.
+    """
+    from wavesim.pec import build_pec_edge_masks
+
+    ex, ey, ez = build_pec_edge_masks(mask)
+    fx, fy, fz = (~ex).astype(float), (~ey).astype(float), (~ez).astype(float)
+    return dict(pec_edge_open_x=fx, pec_edge_open_y=fy, pec_edge_open_z=fz,
+                pec_face_open_x=fy, pec_face_open_y=fx,
+                pec_face_open_z=np.ones(mask.shape))
