@@ -86,6 +86,7 @@ _LAZY = {
         "plot_voltage_current",
         "plot_field_slices_3d", "animate_field_slices_3d", "plot_energy",
         "plot_tem_mode",
+        "plot_electrostatic_slice",
     )
 }
 

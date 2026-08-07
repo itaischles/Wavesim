@@ -503,6 +503,40 @@ def _gradient(grid: FDTDGrid, phi: np.ndarray,
     return tuple(out)
 
 
+def _to_nodes(components: Tuple[np.ndarray, ...]) -> Tuple[np.ndarray, ...]:
+    """Collocate three edge-centred components onto the nodes.
+
+    The three components live on three different edge families, so any question
+    about the vector at a point — its magnitude, its direction, a plot of one
+    component against another's coordinates — needs them brought to one place
+    first. Each node averages the two collinear edges meeting there.
+
+    The walls are one-sided rather than averaged. Node 0 has no edge below it,
+    and the last node's edge *above* it is not carried by the arrays (``N``
+    cells, ``N`` slots, the ``N``-th node absent), so at both ends the single
+    edge that exists is the answer. Averaging the top node against the absent
+    edge instead would read exactly half the field there — the same missing-end
+    trap :func:`_node_dual` documents for the control volumes.
+
+    This is display-grade interpolation. Every quantitative result in this
+    module uses the components where they actually live.
+    """
+    out = []
+    for axis, E in enumerate(components):
+        centred = np.array(E, dtype=np.float64)
+        n = E.shape[axis]
+        if n > 1:
+            lo, hi = _face_slices(axis)
+            centred[hi] = 0.5 * (E[hi] + E[lo])
+            end = [slice(None)] * 3
+            end[axis] = -1
+            prev = [slice(None)] * 3
+            prev[axis] = n - 2
+            centred[tuple(end)] = E[tuple(prev)]
+        out.append(centred)
+    return tuple(out)
+
+
 def _pad_face_array(face: np.ndarray, axis: int, shape) -> np.ndarray:
     """Grow a per-face array to full grid shape, zero in the missing last slot."""
     out = np.zeros(shape, dtype=np.float64)
@@ -647,22 +681,29 @@ class ElectrostaticSolution:
             out.append(EPS0 * _pad_face_array(face, axis, shape) * E)
         return tuple(out)
 
-    def E_magnitude(self) -> np.ndarray:
-        """``|E|`` in V/m interpolated onto the nodes, for display.
+    @cached_property
+    def E_nodes(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(Ex, Ey, Ez)`` in V/m collocated onto the nodes, for display.
 
-        The three components live on different edges, so a magnitude needs them
-        brought to a common point; each node averages the two collinear edges
-        meeting there. This is an interpolation for plotting — the quantitative
-        results above use the components where they actually live.
+        The same three components as :attr:`E`, brought to one sample point by
+        :func:`_to_nodes` so that they share φ's coordinate grid and can be
+        drawn, differenced or combined against each other. Interpolated, so not
+        what to measure with — see :attr:`E`.
         """
-        total = np.zeros(self.phi.shape, dtype=np.float64)
-        for axis, E in enumerate(self.E):
-            lo, hi = _face_slices(axis)
-            centred = np.array(E, dtype=np.float64)
-            if E.shape[axis] > 1:
-                centred[hi] = 0.5 * (E[hi] + E[lo])
-            total += centred ** 2
-        return np.sqrt(total)
+        return _to_nodes(self.E)
+
+    @cached_property
+    def D_nodes(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(Dx, Dy, Dz)`` in C/m² collocated onto the nodes, for display."""
+        return _to_nodes(self.D)
+
+    def E_magnitude(self) -> np.ndarray:
+        """``|E|`` in V/m on the nodes."""
+        return np.sqrt(sum(c ** 2 for c in self.E_nodes))
+
+    def D_magnitude(self) -> np.ndarray:
+        """``|D|`` in C/m² on the nodes."""
+        return np.sqrt(sum(c ** 2 for c in self.D_nodes))
 
     # -- integrals ------------------------------------------------------ #
 

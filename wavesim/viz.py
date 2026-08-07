@@ -20,6 +20,9 @@ FIELD DIAGNOSTICS (2D / single slice):
 FIELD DIAGNOSTICS (full 3D):
     plot_field_slices_3d()    — orthogonal XY/XZ/YZ slice triptych
     animate_field_slices_3d() — multi-plane time animation (general)
+
+ELECTROSTATIC SOLUTIONS (no time stepping):
+    plot_electrostatic_slice() — one quantity (φ, |E|, a component) on one plane
 """
 
 import numpy as np
@@ -945,6 +948,205 @@ def animate_field_slices_3d(panels, times=None, interval_ms: int = 60,
                                    interval=interval_ms, blit=False)
     plt.tight_layout()
     return anim
+
+
+# ======================================================================= #
+# ELECTROSTATIC SOLUTIONS
+# ======================================================================= #
+#
+# One plane, one quantity — the same way you look at a SnapshotMonitor frame,
+# because it is the same question asked of a solution rather than of a run:
+# pick a cut, pick what to see on it. ``normal``/``position`` follow that class
+# exactly ('z' -> XY, 'y' -> XZ, 'x' -> YZ, position in metres along the
+# normal), so the two do not need separate conventions remembered.
+#
+# Where the samples sit is the one thing that is *not* shared with it. A
+# snapshot collocates to cell centres; an electrostatic solution collocates to
+# **nodes**, because that is where φ is defined and moving φ to please the
+# other quantities would be moving the only exact thing in the picture. E and D
+# come to the nodes instead (ElectrostaticSolution.E_nodes), so one coordinate
+# grid still serves every quantity — which is the property that makes the plots
+# comparable to each other.
+
+# quantity name -> (how to get it from the solution, colour-bar label)
+_ES_QUANTITIES = {
+    'phi':  (lambda s: s.phi,            'φ (V)'),
+    '|E|':  (lambda s: s.E_magnitude(),  '|E| (V/m)'),
+    'Ex':   (lambda s: s.E_nodes[0],     'Ex (V/m)'),
+    'Ey':   (lambda s: s.E_nodes[1],     'Ey (V/m)'),
+    'Ez':   (lambda s: s.E_nodes[2],     'Ez (V/m)'),
+    '|D|':  (lambda s: s.D_magnitude(),  '|D| (C/m²)'),
+    'Dx':   (lambda s: s.D_nodes[0],     'Dx (C/m²)'),
+    'Dy':   (lambda s: s.D_nodes[1],     'Dy (C/m²)'),
+    'Dz':   (lambda s: s.D_nodes[2],     'Dz (C/m²)'),
+}
+
+# normal -> (axis sliced, the two in-plane axes, their labels), matching
+# SnapshotMonitor and mode_solver: 'z' -> XY, 'y' -> XZ, 'x' -> YZ.
+_ES_PLANES = {
+    'z': (2, 0, 1, 'x', 'y'),
+    'y': (1, 0, 2, 'x', 'z'),
+    'x': (0, 1, 2, 'y', 'z'),
+}
+
+
+def _node_edges(nodes: np.ndarray, centres: np.ndarray, n: int) -> np.ndarray:
+    """The ``n+1`` drawing boundaries for ``n`` node-centred samples.
+
+    ``pcolormesh(shading='flat')`` wants boundaries, and for a node-centred
+    array they are *not* ``grid.x``: that array holds the ``n+1`` boundaries of
+    ``n`` **cells**, while these are ``n`` samples sitting *at* nodes. Drawing
+    one against the other shifts the whole picture half a cell — the same
+    off-by-half-a-cell trap :mod:`wavesim.parts` and :mod:`wavesim.pec` both
+    document, arriving in the plotting layer.
+
+    Node ``i`` owns the half cell either side of it, so the boundaries are the
+    cell centres, closed by the two end nodes themselves. That is exactly the
+    dual cell :func:`wavesim.electrostatics._node_dual` integrates over, half
+    cells at the walls included, which is what puts a Neumann symmetry plane on
+    the edge of the picture rather than half a cell inside it.
+    """
+    if n < 2:
+        return nodes[:2]
+    return np.concatenate([nodes[:1], centres[:n - 1], nodes[n - 1:n]])
+
+
+def plot_electrostatic_slice(sol, quantity: str = 'phi', normal: str = 'z',
+                             position: float = None, ax=None, cmap: str = None,
+                             symmetric: bool = None, conductors: bool = True,
+                             aspect: str = 'equal'):
+    """
+    2D colour map of one electrostatic quantity on one plane.
+
+    The solution equivalent of :func:`plot_field_snapshot`: choose a cut plane
+    and what to see on it.
+
+    Parameters
+    ----------
+    sol : wavesim.electrostatics.ElectrostaticSolution
+    quantity : str
+        ``'phi'`` (the default), ``'|E|'``, ``'|D|'``, or a single component
+        ``'Ex'``/``'Ey'``/``'Ez'``/``'Dx'``/``'Dy'``/``'Dz'``. Everything is
+        drawn on the nodes, so all of them share one coordinate grid.
+    normal : {'z', 'y', 'x'}
+        Axis the plane is perpendicular to, as :class:`~wavesim.monitors.SnapshotMonitor`:
+        ``'z'`` gives an XY plane, ``'y'`` an XZ plane, ``'x'`` a YZ plane.
+    position : float, optional
+        Where to cut, in metres along ``normal``, snapped to the nearest node.
+        Defaults to the middle of the domain.
+    ax : matplotlib Axes, optional
+        Draw into an existing axes instead of a new figure. The caller then owns
+        the title.
+    cmap : str, optional
+        Defaults to ``'RdBu_r'`` for signed data and ``'inferno'`` otherwise.
+    symmetric : bool, optional
+        Force a zero-centred (diverging) scale. Auto-detected from the sign of
+        the plane when omitted, so a potential that goes negative is drawn
+        against a diverging scale and ``|E|`` never is.
+    conductors : bool
+        Outline the conductors. Taken from the node mask the solve actually
+        pinned, not from ``pec_mask`` — the two differ by half a cell on every
+        high-side surface, so a ``pec_mask`` outline would not sit on the
+        equipotential the picture shows.
+    aspect : str
+        Axes aspect ratio, ``'equal'`` by default so a cross-section is drawn in
+        true proportion — a field picture at a distorted aspect misleads about
+        the geometry of the field. When this owns the figure it is shaped to the
+        plane's own extents, so an elongated cut comes out wide and short rather
+        than as a sliver in a square. Pass ``'auto'`` to stretch the plane to
+        fill the axes instead, which is worth it for a very long, thin domain.
+
+    Returns
+    -------
+    (fig, ax)
+    """
+    if quantity not in _ES_QUANTITIES:
+        raise ValueError(f"quantity must be one of {sorted(_ES_QUANTITIES)}, "
+                         f"got {quantity!r}")
+    if normal not in _ES_PLANES:
+        raise ValueError(f"normal must be 'x', 'y' or 'z', got {normal!r}")
+
+    getter, label = _ES_QUANTITIES[quantity]
+    n_axis, a_axis, b_axis, a_name, b_name = _ES_PLANES[normal]
+
+    grid = sol.grid
+    nodes = (grid.x, grid.y, grid.z)
+    centres = (grid.xc, grid.yc, grid.zc)
+    shape = sol.phi.shape
+
+    idx = (shape[n_axis] // 2 if position is None
+           else grid.axis_index(normal, position))
+    idx = min(idx, shape[n_axis] - 1)          # the N-th node is not carried
+    plane = np.take(np.asarray(getter(sol)), idx, axis=n_axis)
+
+    ae = _node_edges(nodes[a_axis], centres[a_axis], shape[a_axis])
+    be = _node_edges(nodes[b_axis], centres[b_axis], shape[b_axis])
+
+    if ax is None:
+        # Shape the figure to the plane, so an equal-aspect cut through a long
+        # thin domain is a wide short picture rather than a sliver adrift in a
+        # square one. Bounded, because a 100:1 domain would otherwise ask for a
+        # figure too flat to label.
+        ratio = float(be[-1] - be[0]) / max(float(ae[-1] - ae[0]), 1e-30)
+        height = min(max(7.0 * ratio, 2.6), 7.5) if aspect == 'equal' else 6.0
+        fig, ax = plt.subplots(figsize=(8.0, height + 1.2))
+    else:
+        fig = ax.figure
+
+    vmax = float(np.max(np.abs(plane)))
+    if vmax < 1e-30:
+        vmax = 1.0
+    if symmetric is None:
+        symmetric = bool(np.any(plane < 0.0))
+    if cmap is None:
+        cmap = 'RdBu_r' if symmetric else 'inferno'
+
+    im = ax.pcolormesh(ae, be, plane.T, shading='flat', cmap=cmap,
+                       vmin=-vmax if symmetric else 0.0, vmax=vmax)
+    cbar = plt.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label(label, fontsize=10)
+
+    if conductors:
+        _draw_conductor_outline(ax, sol, n_axis, a_axis, b_axis, idx)
+
+    ax.set_aspect(aspect)
+    ax.set_xlabel(f'{a_name} (m)')
+    ax.set_ylabel(f'{b_name} (m)')
+    if ax.get_title() == '':
+        ax.set_title(f'{label}   —   {normal} = {nodes[n_axis][idx]:.4g} m\n'
+                     f'{_es_conditions(sol)}')
+    plt.tight_layout()
+    return fig, ax
+
+
+def _draw_conductor_outline(ax, sol, n_axis: int, a_axis: int, b_axis: int,
+                            idx: int, color='dimgray'):
+    """Contour the solved conductor on one plane of a slice plot.
+
+    ``sol.node_pec`` is node-centred like everything else drawn here, so the
+    outline lands on the same ruler as the field and on the equipotential the
+    colours show. A plane wholly inside or wholly outside metal has no boundary
+    to draw and is skipped, rather than contouring a constant.
+    """
+    pec = sol.node_pec
+    if pec is None:
+        return
+    plane = np.take(pec, idx, axis=n_axis)
+    if not plane.any() or plane.all() or min(plane.shape) < 2:
+        return
+    nodes = (sol.grid.x, sol.grid.y, sol.grid.z)
+    ax.contour(nodes[a_axis][:plane.shape[0]], nodes[b_axis][:plane.shape[1]],
+               plane.T.astype(float), levels=[0.5], colors=color,
+               linewidths=1.4)
+
+
+def _es_conditions(sol) -> str:
+    """The drive conditions, so a picture is self-describing."""
+    driven = ", ".join(f'{n} = {v:g} V'
+                       for n, v in sorted(sol.potentials.items()))
+    if sol.grounded_bodies:
+        driven += (", " if driven else "") + f'{sol.grounded_bodies} grounded'
+    return driven or "no assigned potentials"
 
 
 def plot_energy(monitor, dt: float, ax=None):
