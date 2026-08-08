@@ -251,7 +251,12 @@ def unnamed_pec_mask(grid: FDTDGrid) -> np.ndarray:
 # it off the edge masks gets this right without anyone having to reason it out,
 # and switches to the conformal rule by itself when the grid carries cut cells —
 # where the same corner contact is genuinely *not* a short, because the exact
-# rule zeroes an edge only when its open length is zero.
+# rule zeroes an edge only when the metal actually reaches it.
+#
+# The mode solver pins φ on this, on both paths, precisely so that "the
+# conductor" means one thing across the two solvers. Deciding it from the open
+# fractions instead misses an edge lying *in* a grid-aligned conductor surface,
+# whose own open length is full and which the run shorts all the same.
 # ====================================================================== #
 
 def _edge_masks(grid: FDTDGrid, cell_mask: np.ndarray = None) -> tuple:

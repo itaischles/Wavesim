@@ -81,27 +81,44 @@ def coax_fractions(grid, cx, cy, r_inner, r_outer, nsub=64):
 def binary_fractions(mask):
     """0/1 open fractions describing exactly the staircase ``mask``.
 
-    An edge is covered iff the FDTD zeroes it, i.e. iff any of the four cells
-    touching it is PEC (:func:`~wavesim.pec.build_pec_edge_masks`) — the rule
-    the run itself applies, and the one the staircase solvers read their
-    conductor off. :func:`~wavesim.mode_solver._conformal_node_pec` and
+    One convention, applied to both kinds of array: **covered iff the metal
+    reaches it**, i.e. iff any cell touching it is PEC. For an edge that is the
+    four cells around it (:func:`~wavesim.pec.build_pec_edge_masks`) and for a
+    face the two it separates. Both readings say the same thing — a Yee element
+    lying *on* a staircased conductor's surface is in the closure of the metal,
+    and carries no tangential field — and it is the rule the run itself applies.
+    :func:`~wavesim.mode_solver._conformal_node_pec` and
     :func:`~wavesim.parts.pec_node_mask` on these fractions both return the
     closed node box, so the staircase and conformal code paths describe the same
     conductor and must land on precisely the same potential.
 
-    Stating it as "covered iff both end nodes are PEC cells" instead (which is
-    what this did while the staircase mode solve sliced ``pec_mask`` as if it
-    were a node mask) describes a conductor one cell smaller on every high side
-    — see ``docs/mode_solver_staircase_node_mask.md``.
+    Keeping the two consistent matters, because
+    :func:`~wavesim.pec.build_conformal_edge_masks` reads the *faces* to find
+    edges tangent to a grid-aligned surface. With this convention that clause
+    reproduces the staircase dilation exactly — ``Ez`` is covered iff
+    ``dilate(mask, (x, y))``, which is what an Hx face dilated along y and an Hy
+    face dilated along x come to. Describing the faces some other way (this
+    carried the coax's z-invariant identity ``face_x ≡ edge_y`` for a while,
+    which is only true for a z-invariant solid) makes the fixture claim metal
+    where there is none, and the edge rule believes it.
+
+    Stating the edge rule as "covered iff both end nodes are PEC cells" instead
+    (which is what this did while the staircase mode solve sliced ``pec_mask`` as
+    if it were a node mask) describes a conductor one cell smaller on every high
+    side — see ``docs/mode_solver_staircase_node_mask.md``.
 
     This is how the conformal *code path* is separated from the cut cells
     themselves: whatever it computes on these fractions is what the staircase
     assembly computes, or the reduction property has been broken.
     """
-    from wavesim.pec import build_pec_edge_masks
+    from wavesim.pec import build_pec_edge_masks, _dilate
 
     ex, ey, ez = build_pec_edge_masks(mask)
-    fx, fy, fz = (~ex).astype(float), (~ey).astype(float), (~ez).astype(float)
-    return dict(pec_edge_open_x=fx, pec_edge_open_y=fy, pec_edge_open_z=fz,
-                pec_face_open_x=fy, pec_face_open_y=fx,
-                pec_face_open_z=np.ones(mask.shape))
+    return dict(
+        pec_edge_open_x=(~ex).astype(float),
+        pec_edge_open_y=(~ey).astype(float),
+        pec_edge_open_z=(~ez).astype(float),
+        # Hx separates cells (i-1, i); Hy (j-1, j); Hz (k-1, k).
+        pec_face_open_x=(~_dilate(mask, (0,))).astype(float),
+        pec_face_open_y=(~_dilate(mask, (1,))).astype(float),
+        pec_face_open_z=(~_dilate(mask, (2,))).astype(float))

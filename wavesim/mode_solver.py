@@ -57,7 +57,8 @@ from scipy.sparse.linalg import splu
 from wavesim.constants import EPS0, ETA0, C0
 from wavesim.grid import FDTDGrid
 from wavesim.parts import pec_node_mask
-from wavesim.pec import build_pec_edge_masks
+from wavesim.pec import (build_pec_edge_masks,
+                         COVERED_FRACTION_TOL as _COVERED_FRACTION_TOL)
 
 
 # ====================================================================== #
@@ -117,9 +118,15 @@ _NORMAL_CFG = {
 # φ divided by the OPEN edge length instead of the full one** — the open
 # fraction lands on the stencil's centre distance, not on its face length. The
 # rest follows: a fully covered edge (``L = 0``) forces φ equal at its two
-# endpoints, which is the conductor equipotential condition, and it is exactly
-# the set of edges :func:`wavesim.pec.apply_pec_mask` zeroes. Nothing has to be
+# endpoints, which is the conductor equipotential condition. Nothing has to be
 # assumed about which side of a cut edge the metal lies on.
+#
+# ``L = 0`` is not the whole of what the run holds at zero, though — an edge
+# lying *in* a grid-aligned conductor surface has a full open length and is still
+# a tangential E on PEC. The conductor φ is pinned on therefore comes from
+# :func:`~wavesim.parts.pec_node_mask`, i.e. from the edge masks the FDTD
+# actually applies (:func:`wavesim.pec.build_conformal_edge_masks`), and not from
+# the fractions directly; the two agree wherever the geometry genuinely cuts.
 #
 # Every weight below is the legacy weight times an open fraction, so a grid
 # whose fractions are all 1.0 reproduces the staircase assembly bit-for-bit on
@@ -159,7 +166,7 @@ def _plane_edge_pec(grid: FDTDGrid, cfg: dict, normal: str, k: int):
 
 
 def _conformal_node_pec(f_a: np.ndarray, f_b: np.ndarray) -> np.ndarray:
-    """Nodes lying inside the conductor, from the cut-edge open fractions.
+    """Nodes lying inside the conductor, from the *transverse* cut fractions.
 
     A node is in the metal iff at least one edge meeting it is *fully* covered:
     a covered edge lies wholly inside the conductor, so both of its endpoints
@@ -176,6 +183,13 @@ def _conformal_node_pec(f_a: np.ndarray, f_b: np.ndarray) -> np.ndarray:
     Two conductors closer than one cell would be merged by the index adjacency
     (the labelling cannot tell a partially-open edge from a gap); that is below
     the resolution at which a cut cell means anything.
+
+    Not what :func:`_build_mode` pins on any more — see
+    :func:`~wavesim.parts.pec_node_mask`, which asks the same question of the
+    run's own edge masks and so also catches an edge lying *in* a grid-aligned
+    surface, whose own open fraction is a full 1.0. Kept because it is the plane-
+    local statement of the rule, and because the two agreeing on a genuinely cut
+    geometry is worth being able to assert.
     """
     covered = (f_a == 0.0) | (f_b == 0.0)
     covered[1:, :] |= (f_a[:-1, :] == 0.0)
@@ -183,42 +197,33 @@ def _conformal_node_pec(f_a: np.ndarray, f_b: np.ndarray) -> np.ndarray:
     return covered
 
 
-# An open fraction at or below this is a *covered* edge. The exact ``== 0.0``
-# test used elsewhere in this module is not enough for the port-plane rule below,
-# because an analytic or voxelised fraction generator lands a grid-aligned
-# conductor face on the node ruler to within round-off, not exactly: a face
-# tangent to the mesh produces fractions like 1.7e-15 rather than 0.0. Such an
-# edge is covered in every sense that matters — its ``ê = −Δφ/(f·d)`` divides a
-# round-off numerator by a round-off denominator — but it fails ``== 0.0`` and so
-# escapes both :func:`_conformal_node_pec` and
-# :func:`wavesim.pec.build_conformal_edge_masks`. The threshold is far below any
-# fraction a real cut produces (the smallest on the reference coax is 0.125) and
-# far above the ~1e-16 round-off floor, so it separates the two cleanly.
-COVERED_FRACTION_TOL = 1e-9
+# The covered-fraction threshold this module used to carry for the port rule
+# below, now :data:`wavesim.pec.COVERED_FRACTION_TOL` — the FDTD's edge masking
+# is where it belongs, and one definition is the point: an edge this module calls
+# covered has to be one the run holds at zero. Re-exported under the old name.
+COVERED_FRACTION_TOL = _COVERED_FRACTION_TOL
 
 
-def port_plane_pinned_nodes(f_a: np.ndarray, f_b: np.ndarray,
-                            tol: float = COVERED_FRACTION_TOL) -> np.ndarray:
-    """Nodes on the mode plane that lie *on or inside* the conductor.
+def port_plane_pinned_nodes(grid: FDTDGrid, normal: str, k: int) -> np.ndarray:
+    """Nodes on the plane at ``normal``-index ``k`` that lie on or inside metal.
 
-    The same rule as :func:`_conformal_node_pec` — a node is metal iff one of the
-    (up to four) transverse edges meeting it is fully covered — but tested to
-    ``tol`` rather than exactly, and returned for the port machinery rather than
-    for the conductor labelling. See :attr:`COVERED_FRACTION_TOL` for why the
-    tolerance is needed and :meth:`ModalPort._setup` for what it is used for.
+    Literally the set :func:`_build_mode` pins ``φ`` at rather than solves for —
+    the plane slice of :func:`~wavesim.parts.pec_node_mask`, asked of the same
+    grid — and it has to stay literal. At a pinned node the discrete divergence
+    ``∇·(ε ê)``, which the Laplacian drives to zero at every *free* node, is
+    unconstrained; what it holds instead is the mode's induced **surface
+    charge**, physically real and nonzero. That is harmless in the bulk, where
+    the leapfrog carries it, and is the whole problem on a
+    :class:`~wavesim.sources.ModalPort`'s ghost-H plane, where there is no
+    leapfrog to carry it. A pin computed from a *different* rule than the solve
+    used misses exactly the nodes the two disagree about, which is where the
+    residual is.
 
-    These are precisely the nodes at which ``φ`` is *pinned* rather than solved,
-    so the discrete divergence ``∇·(ε ê)`` — which the Laplacian drives to zero at
-    every free node — is unconstrained there. What it holds instead is the mode's
-    induced **surface charge**, which is physically real and nonzero. That is
-    harmless in the bulk, where the leapfrog carries it, and is the whole problem
-    on a :class:`~wavesim.sources.ModalPort`'s ghost-H plane, where there is no
-    leapfrog to carry it.
+    Deriving it from the transverse open fractions is not the same question and
+    was the earlier answer here: it cannot see a node held by an edge that lies
+    *in* a grid-aligned conductor surface, whose own open fraction is a full 1.0.
     """
-    m = (f_a <= tol) | (f_b <= tol)
-    m[1:, :] |= (f_a[:-1, :] <= tol)
-    m[:, 1:] |= (f_b[:, :-1] <= tol)
-    return m
+    return _slice(pec_node_mask(grid), normal, k)
 
 
 def _plane_to_grid(normal: str, k: int, a: np.ndarray, b: np.ndarray):
@@ -382,15 +387,24 @@ class TEMMode:
         conformal Faraday contour of the longitudinal H face vanish, i.e. that
         makes ``ê`` a genuine TEM (``H_n = 0``) field of the *cut* grid rather
         than of the staircased one. Fully covered edges divide by zero open
-        length and are simply zeroed — the same set
-        :func:`wavesim.pec.apply_pec_mask` zeroes, and the reason the PEC mask
-        is not applied on top: a partially covered edge must keep its field.
+        length and are simply zeroed; a partially covered edge must keep its
+        field, which is why no mask is applied on top.
 
-        Both paths therefore zero ``ê`` on exactly the edge set the run holds at
-        zero, the staircase one via :func:`_plane_edge_pec`. Zeroing it on the
-        *nodes* instead — which is what ``Ea[self.pec] = 0`` did — deletes the
-        live edge a surface node owns out into the gap, the one carrying the
-        largest field on a coax plane; see
+        Both paths still come out zero on exactly the edge set the run holds at
+        zero — but they get there differently, and the difference matters. The
+        staircase path masks explicitly, via :func:`_plane_edge_pec`. The
+        conformal path masks nothing: ``φ`` is pinned on the node mask the FDTD
+        shorts (:func:`~wavesim.parts.pec_node_mask`), so ``Δφ`` already vanishes
+        on every such edge, including one lying *in* a grid-aligned surface whose
+        own open length is full. Masking ``ê`` there afterwards instead would
+        zero the edge without telling ``φ``, and ``ê`` would stop being a null
+        vector of the transverse divergence at the free nodes beside it — which
+        is the one property a modal sheet cannot do without, since that
+        divergence is what its ghost H deposits every step.
+
+        Zeroing it on the *nodes* — which is what ``Ea[self.pec] = 0`` did —
+        deletes the live edge a surface node owns out into the gap, the one
+        carrying the largest field on a coax plane; see
         ``docs/mode_solver_staircase_node_mask.md``.
         """
         cfg = _NORMAL_CFG[self.normal]
@@ -428,6 +442,14 @@ class TEMMode:
                       out=Ea[:-1, :], where=La > 0.0)
             np.divide(-(phi[:, 1:] - phi[:, :-1]), Lb,
                       out=Eb[:, :-1], where=Lb > 0.0)
+            # Nothing is masked afterwards on this path, and nothing needs to
+            # be: φ is pinned on the node mask the FDTD shorts, so Δφ already
+            # vanishes on every edge the run holds at zero — including an edge
+            # lying *in* a grid-aligned surface, which is fully open by its own
+            # measure. Post-masking ``ê`` instead would zero the edge without
+            # telling φ, and ``ê`` would stop being a null vector of the
+            # transverse divergence at the free nodes next to it — which is the
+            # one property a modal sheet cannot do without.
 
         # η = η₀·√(μ_r/ε_r) on the plane, exactly as :func:`_build_mode`.
         eps_a = _slice(getattr(grid, cfg['eps'][0]), self.normal, k)
@@ -736,10 +758,16 @@ def solve_tem_modes(grid: FDTDGrid, *,
     # −7.7% in C' on a parallel-plate line, −8.1% on a coarse coax, and a port
     # solved on geometry the run does not step. See
     # ``docs/mode_solver_staircase_node_mask.md``.
+    #
+    # Both paths ask :func:`~wavesim.parts.pec_node_mask`, which reads whichever
+    # edge rule the grid is actually running. Asking the conformal fractions
+    # directly (:func:`_conformal_node_pec`) is the same answer on a cut cell and
+    # the wrong one where the conductor is tangent to the grid: an edge lying in
+    # a grid-aligned surface is fully open by its own measure, the run holds it
+    # at zero all the same, and a φ that does not know that comes out with a
+    # potential drop along a conductor surface.
     fa_full, fb_full = _plane_open_fractions(grid, cfg, normal, k)
-    if fa_full is not None:
-        pec_full = _conformal_node_pec(fa_full, fb_full)
-    elif grid.pec_mask is None:
+    if fa_full is None and grid.pec_mask is None:
         pec_full = np.zeros(eps_a_full.shape, dtype=bool)
     else:
         pec_full = _slice(pec_node_mask(grid), normal, k)
@@ -961,8 +989,11 @@ def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):
     open edge length the conformal derivation asks for, rather than the
     uniform-mesh-equivalent ``f·dual`` S5 settled for. A fully covered edge (``f = 0``) gets coefficient 0
     and carries no flux equation at all; both of its endpoints are pinned by
-    :func:`_conformal_node_pec`, so the constraint it stands for (equal φ) is
-    imposed by the pinning instead.
+    :func:`~wavesim.parts.pec_node_mask`, so the constraint it stands for (equal
+    φ) is imposed by the pinning instead. An edge lying *in* a grid-aligned
+    surface keeps a full ``f`` and so keeps its flux equation — but the same
+    pinning holds both its endpoints too, so ``Δφ`` is zero across it and the
+    equation is satisfied trivially.
 
     Both arrays are returned once per face, not once per direction, and the
     assembly walks each face twice — the two views share the same coefficient.

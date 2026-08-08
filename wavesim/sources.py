@@ -1195,9 +1195,8 @@ class ModalPort:
 
     # -- one-time compile ---------------------------------------------------- #
     def _setup(self, grid: FDTDGrid) -> None:
-        from wavesim.mode_solver import (_plane_to_grid, _NORMAL_CFG,
-                                         _launch_time_shift, _normal_width,
-                                         _plane_open_fractions,
+        from wavesim.mode_solver import (_plane_to_grid, _launch_time_shift,
+                                         _normal_width,
                                          port_plane_pinned_nodes)
 
         normal = self.mode.normal
@@ -1241,9 +1240,7 @@ class ModalPort:
         # See :meth:`apply_post_E` for what goes wrong without this.
         self._pin = None
         if grid.is_conformal:
-            cfg = _NORMAL_CFG[normal]
-            f_a, f_b = _plane_open_fractions(grid, cfg, normal, k)
-            pinned = port_plane_pinned_nodes(f_a, f_b)
+            pinned = port_plane_pinned_nodes(grid, normal, k)
             a, b = np.nonzero(pinned)
             if a.size:
                 ii, jj, kk = _plane_to_grid(normal, self._h_k, a, b)
@@ -1327,11 +1324,21 @@ class ModalPort:
         staircase run never saw it only because
         :func:`wavesim.pec.build_pec_edge_masks` **dilates**, so every one of those
         conductor-node edges was already zeroed for an unrelated reason. The
-        conformal rule of :func:`wavesim.pec.build_conformal_edge_masks` — zero an
-        edge iff its own open length is zero — is right in the bulk (plan S3) and
-        leaves these alive, because an edge running *along* a grid-aligned
+        conformal rule as first written — zero an edge iff its own open length is
+        zero — left them alive, because an edge running *along* a grid-aligned
         conductor surface is fully open even though both of its endpoints are on
-        the metal. Removing the dilation removed an accidental guard.
+        the metal. That turned out to be the defect and not the price of being
+        exact: such an edge is a tangential E on a PEC boundary.
+        :func:`wavesim.pec.build_conformal_edge_masks` now finds it through the
+        fully covered H face on the metal side, and the same integral landing on
+        the *transverse* E of the mode plane — which is inside the domain, and is
+        what every downstream monitor sees — went with it.
+
+        What is left for this hook is the case that rule cannot see: it needs a
+        covered face, and a conductor that varies along the port normal need not
+        present one. On every cross-section in the test suite the two agree and
+        this is redundant (``tests/test_modal_port_ghost_plane.py``); it is kept
+        because the plane it guards is open loop, where being wrong is unbounded.
 
         Measured on the plan's reference coax at ``d`` = 0.5 mm with a 1 GHz
         modulated Gaussian: ``max|Ez|`` on the ghost plane reached 6.87e3 V/m
@@ -1345,6 +1352,13 @@ class ModalPort:
         a quarter cell off-lattice takes the count of affected edges to zero; a
         grid-aligned *rectangular* conductor, where every surface node qualifies,
         takes it from 6 to 117.
+
+        The nodes are the ones :func:`~wavesim.mode_solver._build_mode` pinned
+        ``φ`` at, read back from the same
+        :func:`~wavesim.mode_solver.port_plane_pinned_nodes`. That has to be the
+        *same* set, not a second opinion assembled from the open fractions: the
+        residual lives exactly where φ was pinned, so a pin computed some other
+        way misses precisely the nodes the two rules disagree about.
 
         Zeroing here rather than in :meth:`apply` is deliberate: ``apply`` runs
         *before* the E update, so it would leave one step's worth of the residual

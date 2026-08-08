@@ -69,8 +69,12 @@ def apply_pec_faces(grid: FDTDGrid,
 
 def _dilate(mask: np.ndarray, axes: tuple) -> np.ndarray:
     """``mask`` OR-ed with itself shifted one cell in the ``+`` direction of each
-    axis in ``axes`` — i.e. the union over the 2×2 block of cells that share an
-    edge running along the *remaining* axis."""
+    axis in ``axes`` — entry ``i`` along such an axis picks up entry ``i-1``.
+
+    With two axes this is the union over the 2×2 block of cells that share an
+    edge running along the *remaining* axis (:func:`build_pec_edge_masks`); with
+    one it is the union over the pair of H faces an edge separates
+    (:func:`_edges_bounding_covered_faces`)."""
     out = mask.copy()
     for ax in axes:
         src = out.copy()
@@ -126,12 +130,13 @@ def apply_pec_mask(grid: FDTDGrid) -> FDTDGrid:
     Conformal PEC
     -------------
     With cut-cell geometry present the dilation is **replaced** by the
-    geometrically exact rule — zero an edge iff its open length is zero. The
-    dilation was a conservative over-zeroing that bought E/H consistency at the
-    price of losing the sub-cell geometry; under conformal PEC that consistency
-    comes from E and H being derived from the *same* cut geometry instead, which
-    is the proper fix rather than the safe one. See
-    :func:`build_conformal_edge_masks`.
+    geometrically exact rule of :func:`build_conformal_edge_masks`: zero an edge
+    iff none of it is open, or it bounds an H face that is itself fully covered.
+    The dilation was a conservative over-zeroing that bought E/H consistency at
+    the price of losing the sub-cell geometry; under conformal PEC that
+    consistency comes from E and H being derived from the *same* cut geometry
+    instead, which is the proper fix rather than the safe one. The second clause
+    is part of being exact, not a retreat toward the dilation — see there.
     """
     if grid.is_conformal:
         return _apply_conformal_edge_mask(grid)
@@ -154,29 +159,99 @@ def apply_pec_mask(grid: FDTDGrid) -> FDTDGrid:
     return grid
 
 
-def build_conformal_edge_masks(grid: FDTDGrid) -> tuple:
+# An open fraction at or below this counts as *covered*. An exact ``== 0.0`` test
+# is not enough: a conductor face lying **on** the grid ruler is a tangency, and a
+# fraction generator — analytic or voxelised — resolves it to round-off, not to
+# zero. Such an edge or face produces fractions like 1.7e-15, which is covered in
+# every sense that matters but escapes the exact test. The threshold sits far
+# below any fraction a real cut produces (the smallest on the reference coax is
+# 0.062) and far above the ~1e-16 round-off floor, so it separates the two
+# cleanly. :mod:`wavesim.mode_solver` re-exports it for the port machinery.
+COVERED_FRACTION_TOL = 1e-9
+
+
+def _edges_bounding_covered_faces(grid: FDTDGrid, tol: float) -> tuple:
+    """Per-component E masks for edges that **bound a fully covered H face**.
+
+    A face with zero open area lies wholly inside the conductor, so the four
+    edges of its Faraday contour lie in the conductor's *closure* — either
+    strictly inside it, or tangent to its surface. Tangential E vanishes on a PEC
+    surface, so either way the edge carries no field.
+
+    That second case is the one this rule exists for, because it is the one an
+    edge's own open fraction cannot see. An edge running **along** a grid-aligned
+    conductor face is not covered by the conductor at all — its open fraction is
+    a full 1.0 — yet it lies in the surface and must be zero. The face it bounds
+    on the metal side is what gives it away.
+
+    The adjacency is :mod:`wavesim.update`'s: ``Hz[i,j,k]`` spans nodes
+    ``(i..i+1, j..j+1)``, so its contour is ``Ex[i,j,k]``, ``Ex[i,j+1,k]``,
+    ``Ey[i,j,k]``, ``Ey[i+1,j,k]``. Inverting that, ``Ex[i,j,k]`` bounds
+    ``Hy[i,j,k-1..k]`` and ``Hz[i,j-1..j,k]`` — the two face families whose
+    normals are perpendicular to x, each OR-ed one step back along the third
+    axis. Hence one :func:`_dilate` per family.
+    """
+    cov_x = grid.pec_face_open_x <= tol
+    cov_y = grid.pec_face_open_y <= tol
+    cov_z = grid.pec_face_open_z <= tol
+    return (_dilate(cov_y, (2,)) | _dilate(cov_z, (1,)),    # Ex — Hy, Hz
+            _dilate(cov_z, (0,)) | _dilate(cov_x, (2,)),    # Ey — Hz, Hx
+            _dilate(cov_x, (1,)) | _dilate(cov_y, (0,)))    # Ez — Hx, Hy
+
+
+def build_conformal_edge_masks(grid: FDTDGrid,
+                               tol: float = COVERED_FRACTION_TOL) -> tuple:
     """Per-component E masks from cut geometry: ``(ex, ey, ez)``.
 
-    An edge is inside the conductor iff **none** of it is open. A partially
-    covered edge stays alive and carries the field on its open part — that is
-    what the unknown means in the conformal formulation, and it is exactly the
-    sub-cell information the staircase dilation threw away.
+    An edge is dead iff **none of it is open**, *or* it bounds an H face that is
+    itself fully covered (:func:`_edges_bounding_covered_faces`). A partially
+    covered edge with a live neighbouring face stays alive and carries the field
+    on its open part — that is what the unknown means in the conformal
+    formulation, and it is exactly the sub-cell information the staircase
+    dilation threw away.
 
-    Note this is a *weaker* condition than the staircase rule it replaces, which
-    zeroed an edge when any of the four cells touching it was PEC. E therefore
-    survives closer to the metal than before, and that is intended: the H update
-    now integrates the same cut contour, so the two agree. Restoring the
-    dilation on top of this would reintroduce the mismatch in the other
-    direction.
+    The second clause is not a re-run of that dilation. It fires only where the
+    conductor is **tangent to the grid**, which is where the first clause has a
+    blind spot: an edge lying in a grid-aligned conductor surface is fully open
+    by its own measure, and is nonetheless a tangential E on a PEC boundary. On a
+    cut cell — a surface crossing a cell at an angle — no face is fully covered
+    and the clause does nothing, so the sub-cell geometry survives untouched. At
+    the other extreme, on an all-or-nothing (0/1) geometry whose faces are read
+    the only way that geometry can read them — covered iff either cell the face
+    separates is metal, since such a face lies in the closure of the metal — the
+    clause reproduces :func:`build_pec_edge_masks` **exactly**, which is the right
+    answer there. It has to: if a cell touching an edge is solid metal, one of
+    the faces that edge bounds is a face of that cell.
+
+    Leaving those edges alive is what broke a :class:`~wavesim.sources.ModalPort`
+    on a conformal grid. The sheet's transverse divergence deposits the mode's
+    induced surface charge onto its own plane every step; on a staircase grid the
+    conductor swallows it, because the dilation held exactly those edges at zero.
+    Without the guard it integrates with nothing to restore it: on the plan's
+    reference coax the port-plane field reached 20× the physical field, static,
+    and the whole line went with it. See ``ModalPort.apply_post_E`` for the same
+    integral one plane over, and ``tests/test_conformal_tangent_edges.py``.
+
+    It also removes a mismatch the conformal H update already had on its own. A
+    fully covered face gets ``inv_A = 0`` from :func:`_guarded_inverse` and so
+    freezes — while, before this, the edges of its contour kept carrying E. E and
+    H now agree there, which is the same consistency argument that made clamping
+    the right treatment for sliver faces.
     """
-    return (grid.pec_edge_open_x == 0.0,
-            grid.pec_edge_open_y == 0.0,
-            grid.pec_edge_open_z == 0.0)
+    covered = _edges_bounding_covered_faces(grid, tol)
+    return (covered[0] | (grid.pec_edge_open_x <= tol),
+            covered[1] | (grid.pec_edge_open_y <= tol),
+            covered[2] | (grid.pec_edge_open_z <= tol))
 
 
 def _apply_conformal_edge_mask(grid: FDTDGrid) -> FDTDGrid:
-    """Zero E on fully covered edges; cached like the staircase edge masks."""
-    key = (grid.pec_edge_open_x, grid.pec_edge_open_y, grid.pec_edge_open_z)
+    """Zero E on fully covered edges; cached like the staircase edge masks.
+
+    Keyed on all six fraction arrays, not just the three edge ones: the tangency
+    clause of :func:`build_conformal_edge_masks` reads the face fractions too.
+    """
+    key = (grid.pec_edge_open_x, grid.pec_edge_open_y, grid.pec_edge_open_z,
+           grid.pec_face_open_x, grid.pec_face_open_y, grid.pec_face_open_z)
 
     cache = getattr(grid, '_conformal_edge_cache', None)
     if cache is None or any(a is not b for a, b in zip(cache[0], key)):

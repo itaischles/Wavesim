@@ -11,10 +11,19 @@ on the conductor, where the residual is the mode's real induced surface charge.
 That residual is not conformal-specific: it measures the same either way. The
 staircase run never showed it because ``build_pec_edge_masks`` dilates and had
 already zeroed every conductor-node edge for an unrelated reason. The conformal
-rule — zero an edge iff its own open length is zero — correctly keeps alive an
-edge running *along* a grid-aligned conductor surface, and so removed that
+rule *as first written* — zero an edge iff its own open length is zero — kept
+alive an edge running along a grid-aligned conductor surface, and so removed that
 accidental guard. Measured on the reference coax it reached 6.9e3 V/m on the
 ghost plane against 0.35 V/m one cell in.
+
+Keeping that edge alive turned out to be the defect, not the feature: an edge
+lying *in* a PEC surface is a tangential E on a conductor and must be zero, which
+:func:`wavesim.pec.build_conformal_edge_masks` now reads off the fully covered H
+face on the metal side. So what holds this plane down is the edge mask, and the
+sensitivity tests below disarm *that*. :meth:`ModalPort.apply_post_E` survives as
+a second line — the geometric rule needs a covered face to see the tangency, and
+a conductor that varies along the port normal need not present one — but it no
+longer has a case in this file where it is the thing doing the work.
 
 Everything here drives :meth:`wavesim.simulation.Simulation.run`. The guard lives
 in a hook that only the real time loop calls, and plan R7 is the precedent for
@@ -22,10 +31,13 @@ why testing a guard at the wrong entry point proves nothing: check it from
 outside the solver, on the path a user actually takes.
 """
 
+import contextlib
+
 import numpy as np
 import pytest
 
 import wavesim as ws
+import wavesim.pec as pec
 from wavesim.mode_solver import solve_tem_modes
 
 from conformal_shapes import coax_fractions
@@ -72,11 +84,34 @@ def _coax(conformal=True, offset=0.0, threshold=0.4):
     return grid
 
 
+@contextlib.contextmanager
+def _stale_edge_rule():
+    """Put :func:`wavesim.pec.build_conformal_edge_masks` back to its first form
+    — zero an edge iff its *own* open length is zero, blind to whether it lies in
+    a conductor surface. The tangency clause is what the tests here are sensitive
+    to, so this is how they show they are not passing for free.
+
+    Patched on the :mod:`wavesim.pec` global, which is what the FDTD's per-step
+    masking looks up. :mod:`wavesim.parts` bound the name at import, so the mode
+    solve and the conductor labelling are left alone and the only thing that
+    moves is the edge set the run holds at zero.
+    """
+    original = pec.build_conformal_edge_masks
+    pec.build_conformal_edge_masks = lambda grid, tol=0.0: (
+        grid.pec_edge_open_x == 0.0,
+        grid.pec_edge_open_y == 0.0,
+        grid.pec_edge_open_z == 0.0)
+    try:
+        yield
+    finally:
+        pec.build_conformal_edge_masks = original
+
+
 def _run(grid, steps=400, backend='numba', amplitude=1.0, disarm=False):
     """Drive the real time loop; return ``(launch, absorb)``.
 
-    ``disarm`` clears the guard after setup, which is how the tests below show
-    they are actually sensitive to it rather than passing for free.
+    ``disarm`` clears the port's own ``_pin`` after setup, isolating it from the
+    edge mask so the tests below can say which of the two moved a result.
     """
     k_hi = grid.Nz - 1
     lo = solve_tem_modes(grid, normal='z', position=CELL, compute_params=True)[0]
@@ -132,18 +167,57 @@ def test_ghost_plane_carries_no_spurious_normal_E(backend):
     assert ghost < 1e-6 * line
 
 
-def test_the_guard_is_what_keeps_it_quiet():
-    """Sensitivity check: disarm the guard and the same run blows up.
+def test_disarming_both_guards_brings_the_defect_straight_back():
+    """Sensitivity check: the case still excites the defect, by 1e3x.
 
     Without this the test above could pass because the case is too gentle to
-    excite the defect, which is the R7 failure mode in a different costume.
+    excite it, which is the R7 failure mode in a different costume.
+
+    Both guards have to come off, because on *this* cross-section either one
+    alone is sufficient: the edge rule kills the tangent surface edges, and the
+    pin separately holds the same plane's pinned nodes down. That redundancy is
+    the honest finding — this file no longer has a case that isolates the pin,
+    and :func:`test_the_pin_zeroes_nothing_the_edge_mask_left_alive` is the other
+    half of saying so.
+    """
+    grid = _coax(conformal=True)
+    with _stale_edge_rule():
+        launch, absorb = _run(grid, disarm=True)
+    ghost, line = _ghost_vs_line(grid, launch, absorb)
+    assert ghost > 1e3 * line, (
+        f"the reference case no longer excites the defect (ghost {ghost:.4g} "
+        f"vs line {line:.4g}); it is not testing the guards any more")
+
+
+def test_the_edge_rule_alone_is_enough():
+    """With the pin disarmed, the edge mask holds the plane on its own.
+
+    The direction that matters for the fix: the guard that came out of the
+    geometry subsumes the port-local one. (The converse also holds here — see
+    the docstring above — which is why the sensitivity test disarms both.)
     """
     grid = _coax(conformal=True)
     launch, absorb = _run(grid, disarm=True)
     ghost, line = _ghost_vs_line(grid, launch, absorb)
-    assert ghost > 1e3 * line, (
-        f"the reference case no longer excites the defect (ghost {ghost:.4g} "
-        f"vs line {line:.4g}); it is not testing the guard any more")
+    assert ghost < 1e-6 * line
+
+
+def test_the_pin_zeroes_nothing_the_edge_mask_left_alive():
+    """``apply_post_E`` is second line, and on this geometry it is redundant.
+
+    Every node it pins already has its normal-E edge held at zero by
+    :func:`~wavesim.pec.build_conformal_edge_masks`. Asserted rather than assumed
+    because it is the reason the test above disarms the edge rule instead of the
+    pin — and because if this ever stops holding, the pin has started doing work
+    and deserves its own case.
+    """
+    grid = _coax(conformal=True)
+    launch, absorb = _run(grid, steps=1)
+    ez_masked = pec.build_conformal_edge_masks(grid)[2]
+    for port in (launch, absorb):
+        comp, ii, jj, kk = port._pin
+        assert comp == 'Ez'
+        assert np.all(ez_masked[ii, jj, kk])
 
 
 def test_it_is_the_sheet_not_the_drive():
@@ -153,12 +227,14 @@ def test_it_is_the_sheet_not_the_drive():
     whenever the port sees any voltage, so a pure *absorber* accumulates the same
     residual. Seeded rather than driven, to have a field for the ports to see.
 
-    The comparison is armed-against-disarmed on the *same* seeded run, rather
+    The comparison is unguarded-against-guarded on the *same* seeded run, rather
     than ghost-against-line: seeding a modal profile over a finite span of ``z``
     puts a genuine ``Ez`` transient at the seam, so the line is not a quiet
-    reference here and only the guard's own effect is a clean signal.
+    reference here and only the guards' own effect is a clean signal. Both come
+    off together for the reason
+    :func:`test_disarming_both_guards_brings_the_defect_straight_back` gives.
     """
-    def seeded_ghost(disarm):
+    def seeded_ghost(stale):
         grid = _coax(conformal=True)
         mode = solve_tem_modes(grid, normal='z', position=CELL,
                                compute_params=True)[0]
@@ -166,15 +242,19 @@ def test_it_is_the_sheet_not_the_drive():
         mid = grid.Nz // 2
         for comp, prof in E.items():
             getattr(grid, comp)[:, :, mid - 4:mid + 4] += prof[:, :, None]
-        ws.apply_pec_mask(grid)
-        launch, absorb = _run(grid, amplitude=0.0, disarm=disarm)
+        # Masking the seed has to happen under the same rule as the run: it is
+        # what fills the grid's edge-mask cache, and a cache filled by the fixed
+        # rule would quietly survive the patch.
+        with _stale_edge_rule() if stale else contextlib.nullcontext():
+            ws.apply_pec_mask(grid)
+            launch, absorb = _run(grid, amplitude=0.0, disarm=stale)
         return _ghost_vs_line(grid, launch, absorb)
 
-    ghost_bad, _ = seeded_ghost(disarm=True)
-    ghost_ok, line = seeded_ghost(disarm=False)
+    ghost_bad, _ = seeded_ghost(stale=True)
+    ghost_ok, line = seeded_ghost(stale=False)
     assert ghost_bad > 1e3 * ghost_ok, (
-        f"with no drive at all the guard should still be doing the work: "
-        f"disarmed {ghost_bad:.4g} V/m vs armed {ghost_ok:.4g} V/m")
+        f"with no drive at all the guards should still be doing the work: "
+        f"unguarded {ghost_bad:.4g} V/m vs guarded {ghost_ok:.4g} V/m")
     assert ghost_ok < line
 
 
@@ -194,22 +274,37 @@ def test_guard_is_absent_on_a_staircase_grid():
     assert np.array_equal(grid.Ez, before)
 
 
-def test_guard_zeroes_nothing_live_when_the_geometry_is_off_lattice():
-    """The guard must be a no-op unless a conductor surface lands on the nodes.
+def test_the_guard_barely_reaches_a_live_edge_off_lattice():
+    """The guard must stay a near no-op unless a surface lands on the nodes.
 
     Shifting the axis a quarter cell leaves the cut cells every bit as small —
-    this is not a small-cut phenomenon — but no node lies on the metal, so no
-    *live* edge is pinned. If this ever starts zeroing live edges, the guard has
-    become an over-zeroing dilation and is eating real conformal field.
+    this is not a small-cut phenomenon — but almost no node lies on the metal, so
+    almost no *live* edge is pinned. If this ever starts zeroing live edges in
+    quantity, the guard has become an over-zeroing dilation and is eating real
+    conformal field.
+
+    'Almost' is one node out of 406 on this case, and it earns it: the pin is now
+    the set the mode solve pinned ``φ`` at, which is the set the run shorts, and
+    the run shorts that node through two 1.5%-open sliver edges whose H face has
+    already rounded to zero area. A node the FDTD holds at one potential is a
+    node on the conductor, whatever its fractions say to three decimal places.
     """
     grid = _coax(conformal=True, offset=0.25 * CELL)
     launch, _absorb = _run(grid, steps=60)
     comp, ii, jj, kk = launch._pin
     assert comp == 'Ez'
-    live = grid.pec_edge_open_z[ii, jj, kk] > 0.0
-    assert not np.any(live), (
-        f"{int(np.count_nonzero(live))} live Ez edges pinned on an off-lattice "
+    live = np.nonzero(grid.pec_edge_open_z[ii, jj, kk] > 0.0)[0]
+    assert live.size <= 0.01 * ii.size, (
+        f"{live.size} of {ii.size} pinned Ez edges are live on an off-lattice "
         f"geometry — the guard is over-zeroing")
+    # And each one is a node the run really does short: some edge meeting it is
+    # held at zero, which is the whole definition of the pinned set.
+    ex, ey, ez = pec.build_conformal_edge_masks(grid)
+    for n in live:
+        i, j, kg = int(ii[n]), int(jj[n]), int(kk[n])
+        assert (ex[i, j, kg] or ex[i - 1, j, kg]
+                or ey[i, j, kg] or ey[i, j - 1, kg]
+                or ez[i, j, kg] or ez[i, j, kg - 1])
 
 
 def test_the_line_is_untouched_on_the_reference_coax():
