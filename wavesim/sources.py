@@ -1152,6 +1152,43 @@ class ModalPort:
     (the Yee z-curl does not update the ``k=0`` E-plane, so a low face must sit at
     least one cell in).
 
+    **Port record.** Each step appends to ``times``, ``voltages`` and
+    ``currents``, all co-timed at step ``n``. ``V`` is the ε-weighted modal
+    projection of the plane E (``Eⁿ``); ``I`` is the modal projection of the H
+    plane **one cell inside** the ghost plane, signed **positive into the
+    domain**, so ``V·I`` is the power the port delivers inward. Its quadrature is
+    the Poynting pairing
+
+        ``I = ±Σ_c ê_c · H_c · dA_open,c``
+
+    over the transverse cells (``ê`` the same 1 V-normalised staggered profile
+    the sheet itself is built from, ``±`` the face sign). For a pure mode of
+    modal voltage ``V`` propagating along +normal this returns ``G·V``, with
+
+        ``G = Σ_c (ê_c²/η_c)·dA_open,c``
+
+    the **discrete modal conductance** of
+    :meth:`~wavesim.mode_solver.TEMMode.numerical_admittance_scale`. Being the
+    Poynting pairing rather than a least-squares fit, ``V·I`` *is* the modal
+    power through the plane; and because ``G`` is a pure profile/grid quadrature,
+    the record needs no ``Z₀`` — it works on a mode solved with
+    ``compute_params=False``. ``H`` is stored at ``n±½``, so ``I`` is the average
+    of the two half-step projections straddling ``n`` (the first step averages
+    against zero, where the fields are ~0).
+
+    ``reference_impedance`` is the impedance the ``(V, I)`` pair is
+    self-consistent against, ``Z_ref = 1/(s·G)``: the sheet writes
+    ``H = s·V·ĥ``, so ``s·G`` is its terminating admittance *as this same
+    read-back measures it*. Wave amplitudes follow as
+
+        ``a = (V + Z_ref·I)/2``   (incident, into the domain)
+        ``b = (V − Z_ref·I)/2``   (outgoing, into the port)
+
+    so ``S_ji = FFT(b_j)/FFT(a_i)``. Referencing to ``Z_ref`` rather than to
+    ``Z₀`` is what makes a matched absorber read ``a = 0`` to round-off instead
+    of carrying ``(1−s)/2`` of spurious reflection; with ``s`` derived (the
+    default) the two coincide, ``Z_ref == Z₀`` identically.
+
     Parameters
     ----------
     mode : TEMMode
@@ -1192,11 +1229,15 @@ class ModalPort:
         self._ready = False
         self.times: list = []
         self.voltages: list = []
+        self.currents: list = []
+        self.modal_conductance: float | None = None   # G, set at setup
+        self.reference_impedance: float | None = None  # 1/(s·G), set at setup
 
     # -- one-time compile ---------------------------------------------------- #
     def _setup(self, grid: FDTDGrid) -> None:
         from wavesim.mode_solver import (_plane_to_grid, _launch_time_shift,
-                                         _normal_width,
+                                         _normal_width, _plane_open_fractions,
+                                         _slice, _NORMAL_CFG,
                                          port_plane_pinned_nodes)
 
         normal = self.mode.normal
@@ -1227,7 +1268,7 @@ class ModalPort:
         self._edges = ker['edges']
 
         # Staggered H pattern (n̂ × ê)/η, mapped to grid indices on the ghost plane.
-        _E, H = self.mode._staggered_port_fields(grid)
+        E_stag, H = self.mode._staggered_port_fields(grid)
         self._h = {}
         for comp, arr2d in H.items():
             a, b = np.nonzero(arr2d)
@@ -1255,6 +1296,59 @@ class ModalPort:
         else:
             self._scale = self.mode.numerical_admittance_scale(grid)
 
+        # Modal current read-back (see "Port record" in the class docstring).
+        # The H plane read is the one a cell *inside* the ghost plane — the
+        # ghost plane's own H is written by this port every step and would only
+        # play back the sheet law. High face: ghost at k, interior at k-1; low
+        # face: ghost at k-1, interior at k. Both are ``_h_k − sign``.
+        self._i_k = self._h_k - int(self._sign)
+        if not 0 <= self._i_k < n_along:
+            raise ValueError(
+                f"A ModalPort needs an interior H plane to read its current "
+                f"from, but the mode at {normal}-index {k} puts it at "
+                f"{self._i_k}. Solve the mode at least one cell in.")
+        # Weights ±ê·dA on the *paired* H component: Ĥa = sa·êb/η and
+        # Ĥb = sb·êa/η, so η·Ĥ·H·dA — the Poynting pairing — is (s·ê)·H·dA with
+        # no η left in it. Summed against a pure mode (H = V·Ĥ) this returns
+        # G·V, with G the same open-area conductance quadrature
+        # ``numerical_admittance_scale`` builds; G is accumulated here from the
+        # same terms so the two cannot drift apart.
+        cfg = _NORMAL_CFG[normal]
+        prim = {'x': grid.dxp, 'y': grid.dyp, 'z': grid.dzp}
+        dA = prim[cfg['axes'][0]][:, None] * prim[cfg['axes'][1]][None, :]
+        f_open = dict(zip(cfg['E'],
+                          _plane_open_fractions(grid, cfg, normal, k)))
+        mu_p = _slice(getattr(grid, cfg['mu']), normal, k)
+        eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+        pair = {cfg['E'][0]: (cfg['H'][1], cfg['h_sign'][1]),
+                cfg['E'][1]: (cfg['H'][0], cfg['h_sign'][0])}
+        self._i_edges = {}
+        G = 0.0
+        for e_comp, ehat2d in E_stag.items():
+            a, b = np.nonzero(ehat2d)
+            if a.size == 0:
+                continue
+            h_comp, s_h = pair[e_comp]
+            dA_c = dA if f_open[e_comp] is None else dA * f_open[e_comp]
+            ehat = ehat2d[a, b]
+            area = dA_c[a, b]
+            ii, jj, kk = _plane_to_grid(normal, self._i_k, a, b)
+            self._i_edges[h_comp] = (ii, jj, kk, s_h * ehat * area)
+            i2, j2, k2 = _plane_to_grid(normal, k, a, b)
+            epsr = eps_of[e_comp][i2, j2, k2]
+            eta = ETA0 * np.sqrt(mu_p[a, b] / np.where(epsr > 0, epsr, 1.0))
+            G += float(np.sum(ehat ** 2 / eta * area))
+        if G <= 0.0:
+            raise ValueError(
+                "TEM mode has no transverse E energy on the plane; cannot read "
+                "back a modal current.")
+        self.modal_conductance = G
+        # The sheet's own terminating admittance as this read-back measures it
+        # is s·G, so that — not Z₀ — is the reference an ``a`` of exactly zero
+        # falls out of. They are the same number whenever s was derived.
+        self.reference_impedance = 1.0 / (self._scale * G)
+        self._i_prev = 0.0        # previous half-step current, for centring
+
         # Read-back time-shift. The ghost H written here is consumed by the E
         # update as H^{n+½}, so the matched modal voltage must be sampled at
         # n + h_tau, where ``h_tau = dt/2 − dn/(2·v)`` is the *same* E↔H
@@ -1279,6 +1373,19 @@ class ModalPort:
         V = 0.0
         for comp, (ii, jj, kk, w, coef) in self._edges.items():
             V += float(np.dot(getattr(grid, comp)[ii, jj, kk], w))
+        # Modal current on the interior H plane. This hook runs between the H
+        # and E updates, so ``grid.H`` holds H^{n+½} and the projection is the
+        # half-step current; averaging it with the previous half step lands I at
+        # n, alongside V. Read before the ghost write below — a different plane,
+        # so only for clarity. The face sign makes I positive *into* the domain:
+        # the raw quadrature is positive along +normal, which leaves the domain
+        # through a high face and enters it through a low one.
+        i_raw = 0.0
+        for comp, (ii, jj, kk, w) in self._i_edges.items():
+            i_raw += float(np.dot(getattr(grid, comp)[ii, jj, kk], w))
+        i_half = -self._sign * i_raw
+        i_port = 0.5 * (i_half + self._i_prev)
+        self._i_prev = i_half
         # Modal voltage sampled at n + read_tau (read_tau ≤ 0), by linear
         # interpolation over the recent history (newest sample = V^n). Reading a
         # past instant needs only stored samples — no extrapolation. Startup
@@ -1300,6 +1407,7 @@ class ModalPort:
             getattr(grid, comp)[ii, jj, kk] = amp * vals
         self.times.append(t)
         self.voltages.append(V)
+        self.currents.append(i_port)
 
     # -- per-step post-E hook (runs after update_E and the PEC masking) ------- #
     def apply_post_E(self, grid: FDTDGrid, t: float) -> None:

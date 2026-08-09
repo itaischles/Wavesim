@@ -238,3 +238,76 @@ def test_absorber_deposits_no_charge():
     peak_grad = np.max(np.abs(Dx)) / g.dx + 1e-30
     assert gap.max() / peak_grad < 1e-6, (
         f"absorber deposited charge: rel ∇·D = {gap.max()/peak_grad:.2e}")
+
+
+# --------------------------------------------------------------------------- #
+# The modal current read-back: I = G·V by construction, matched ⇒ a = 0.
+# --------------------------------------------------------------------------- #
+
+def _write_modal_h(g, mode, k, V):
+    """Impress ``H = V·Ĥ`` — the pure +z-propagating mode — on H plane ``k``."""
+    from wavesim.mode_solver import _plane_to_grid
+    _E, H = mode._staggered_port_fields(g)
+    for comp, arr2d in H.items():
+        a, b = np.nonzero(arr2d)
+        if a.size == 0:
+            continue
+        ii, jj, kk = _plane_to_grid('z', k, a, b)
+        getattr(g, comp)[ii, jj, kk] = V * arr2d[a, b]
+
+
+def test_current_readback_is_conductance_times_voltage():
+    """A pure +z mode of ``V`` volts on the interior H plane reads back exactly
+    ``I = ∓G·V``: the Poynting pairing against the same open-area quadrature the
+    admittance scale is built from, signed positive *into* the domain — so the
+    +z wave counts negative at a z1 face and positive at a z0 one. ``Z_ref`` is
+    ``1/(s·G)``, which with a derived ``s`` is the mode's ``Z₀`` identically."""
+    V0 = 2.5
+    for k_mode, inward in ((59, -1.0), (1, +1.0)):
+        g, *_ = _coax(nz=60)
+        m = _mode(g, k_mode)
+        port = ws.ModalPort(m, amplitude=0.0)
+        port._setup(g)
+        _write_modal_h(g, m, port._i_k, V0)
+        port.apply(g, 0.0)          # I^{n+½}, centred against a zero history
+        port.apply(g, g.dt)         # both half-steps now hold the same field
+        G = port.modal_conductance
+        assert G > 0.0
+        assert port.currents[-1] == pytest.approx(inward * G * V0, rel=1e-12), (
+            f"modal current read-back off at z-index {k_mode}")
+        assert port.reference_impedance == pytest.approx(m.impedance, rel=1e-12)
+        assert len(port.currents) == len(port.voltages) == len(port.times)
+
+
+@pytest.mark.slow
+def test_wave_amplitudes_separate_at_both_ports():
+    """The ``(V, I)`` record decomposes into travelling waves. On the dual-port
+    coax the launching end reads incident ``a ≈ 1 V`` (its own drive) with a
+    small ``b``; the absorbing end reads ``b`` = the arriving wave with ``a`` at
+    the −20 dB reflection floor — i.e. the sheet is matched *against its own*
+    ``Z_ref``, which is what an S-matrix referenced here needs."""
+    g, c, rp = _coax(nz=60)
+    sim = ws.Simulation(g, cpml=None, pec_faces=('x0', 'x1', 'y0', 'y1'),
+                        backend=BACKEND)
+    wf = ws.GaussianPulse.for_fmax(8e9)
+    drive = ws.ModalPort(_mode(g, g.Nz - 1), amplitude=1.0, waveform=wf)
+    load = ws.ModalPort(_mode(g, 1), amplitude=0.0)
+    sim.add_boundary(drive)
+    sim.add_boundary(load)
+    for _ in range(int(round(1.6e-9 / g.dt))):
+        sim.step()
+
+    def waves(p):
+        v = np.array(p.voltages)
+        zi = p.reference_impedance * np.array(p.currents)
+        return 0.5 * (v + zi), 0.5 * (v - zi)
+
+    a_d, b_d = waves(drive)
+    a_l, b_l = waves(load)
+    assert np.max(np.abs(a_d)) == pytest.approx(1.0, abs=0.05), (
+        f"launch port incident wave {np.max(np.abs(a_d)):.3f} V (want ≈1)")
+    assert np.max(np.abs(b_l)) == pytest.approx(1.0, abs=0.05), (
+        f"load port outgoing wave {np.max(np.abs(b_l)):.3f} V (want ≈1)")
+    rho = np.max(np.abs(a_l)) / np.max(np.abs(b_l))
+    assert rho < 0.1, f"matched load reflects a/b = {rho:.3f} (want < 0.1)"
+    assert np.max(np.abs(b_d)) / np.max(np.abs(a_d)) < 0.1
