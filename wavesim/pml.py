@@ -64,7 +64,7 @@ import numpy as np
 
 from wavesim.grid import FDTDGrid
 from wavesim.loss import loss_coefficients
-from wavesim.pec import conformal_geometry
+from wavesim.pec import conformal_geometry, conformal_edge_eps
 from wavesim.constants import EPS0, MU0, ETA0
 
 
@@ -537,10 +537,18 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     # Sliced on demand rather than materialised, so the lossless path allocates
     # exactly what it did before and evaluates the identical expression.
     loss = loss_coefficients(grid)
+    # The same ε :func:`wavesim.update.update_E` divides by, which on a conformal
+    # grid is not the stored array (:func:`wavesim.pec.conformal_edge_eps`).
+    # "Match update.py exactly" above is the whole contract of this coefficient,
+    # and half a grid stepping one material map while the other half steps
+    # another is not a stability margin anyone budgeted for: on the reference
+    # coax it turns a run that sits at 1.000001 per step into one that grows
+    # 1.0093 and cannot be clamped back.
+    eps_of = dict(zip('xyz', conformal_edge_eps(grid)))
 
     def cb(comp: str, sl) -> np.ndarray:
         if loss is None:
-            return dt / (EPS0 * getattr(grid, 'eps_' + comp)[sl])
+            return dt / (EPS0 * eps_of[comp][sl])
         return getattr(loss, 'Cb_' + comp)[sl]
     # Non-uniform divisors: every H-derivative in the E-side curl is divided by
     # the DUAL width, sampled at sel_* - 1 (Session 4). On a uniform grid these

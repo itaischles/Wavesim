@@ -390,6 +390,106 @@ def conformal_geometry(grid: FDTDGrid):
     return cache[2]
 
 
+# ======================================================================= #
+# Per-edge permittivity across a conductor surface
+# ======================================================================= #
+
+def _axis_slice(ndim: int, axis: int, lo, hi) -> tuple:
+    """``a[..., lo:hi, ...]`` along ``axis`` of an ``ndim``-dimensional array."""
+    sl = [slice(None)] * ndim
+    sl[axis] = slice(lo, hi)
+    return tuple(sl)
+
+
+def outward_edge_eps(eps: np.ndarray, node_pec: np.ndarray,
+                     axis: int) -> np.ndarray:
+    """ε on each edge along ``axis``, with edges *straddling* metal taking the
+    permittivity of the next edge **outward**.
+
+    ``eps[i]`` is the value stored on the edge joining node ``i`` to node
+    ``i+1`` along ``axis``; ``node_pec`` is
+    :func:`~wavesim.parts.pec_node_mask`. Where exactly one of the two end nodes
+    is on a conductor, the edge crosses the conductor surface and the ε the
+    voxeliser left on it is not a material property at all — it is whatever
+    filled the metal (typically 1.0). Such an edge borrows the ε of its
+    neighbour on the *free* side, which lies wholly in the dielectric. Every
+    other edge keeps its stored value: it already sits exactly where it is
+    wanted, and averaging it with a neighbour smears an interface that is
+    already in the right place (0.82% of C' on a two-layer parallel plate,
+    against exact).
+
+    Returns a new array of the same shape. The last edge along ``axis`` reaches
+    a node the arrays do not carry, so it is left alone — the same ``N`` slots
+    for ``N+1`` nodes convention :func:`~wavesim.parts.pec_node_mask` documents.
+
+    This is the *whole* rule: :func:`conformal_edge_eps` applies it to the FDTD's
+    material map and :func:`wavesim.mode_solver._face_eps` to the mode solver's
+    face weights, and they call this one function so they cannot disagree. They
+    used to disagree, and that is a class of bug with no symptom until a port is
+    involved: the mode comes out of one material map, the leapfrog steps it on
+    another, and ``ê`` stops being a null vector of the transverse curl that
+    carries it. On a ModalPort's ghost plane — which runs open loop — the
+    leftover then integrates into a static pile.
+    """
+    eps = np.asarray(eps, dtype=np.float64)
+    n = eps.shape[axis]
+    out = eps.copy()
+    if n < 2:
+        return out
+
+    sl = lambda lo, hi: _axis_slice(eps.ndim, axis, lo, hi)       # noqa: E731
+    lo_node = node_pec[sl(0, n - 1)]
+    hi_node = node_pec[sl(1, n)]
+    face = eps[sl(0, n - 1)]
+    outward_hi = eps[sl(1, n)]                                    # edge i+1
+    outward_lo = np.concatenate(                                  # edge i-1
+        [eps[sl(0, 1)], eps[sl(0, n - 2)]], axis=axis)            # clamped at 0
+    fixed = np.where(lo_node & ~hi_node, outward_hi, face)
+    fixed = np.where(hi_node & ~lo_node, outward_lo, fixed)
+    out[sl(0, n - 1)] = fixed
+    return out
+
+
+def conformal_edge_eps(grid: FDTDGrid) -> tuple:
+    """``(eps_x, eps_y, eps_z)`` as the solver must read them on a cut-cell grid.
+
+    On a conformal grid this is the stored map with :func:`outward_edge_eps`
+    applied along each component's own axis; on a staircase grid it is the stored
+    arrays themselves, unchanged and by identity — the dilation of
+    :func:`build_pec_edge_masks` already holds every conductor-straddling edge at
+    zero there, so their ε is never read and repairing it would only be a way to
+    make the two paths differ.
+
+    Cached on the grid, keyed on the *identity* of the three ε arrays and the six
+    fraction arrays: the same scheme, and the same caveat, as
+    :func:`conformal_geometry` — replacing an array invalidates the cache,
+    mutating one in place does not.
+
+    Everything that reads ε during a run goes through here: the E update
+    (:func:`wavesim.update.update_E`, its lossy twin's coefficients, and the
+    Numba kernels), and the wave impedance ``η`` that
+    :mod:`wavesim.mode_solver` builds a port's ``ĥ`` sheet from. Both halves have
+    to move together — repairing the material the leapfrog steps on while leaving
+    the sheet built from the raw map trades one mismatch for another.
+    """
+    if not grid.is_conformal:
+        return grid.eps_x, grid.eps_y, grid.eps_z
+
+    arrays = (grid.eps_x, grid.eps_y, grid.eps_z,
+              grid.pec_edge_open_x, grid.pec_edge_open_y, grid.pec_edge_open_z,
+              grid.pec_face_open_x, grid.pec_face_open_y, grid.pec_face_open_z)
+
+    cache = getattr(grid, '_conformal_eps_cache', None)
+    if cache is None or any(a is not b for a, b in zip(cache[0], arrays)):
+        from wavesim.parts import pec_node_mask       # circular at module level
+        node = pec_node_mask(grid)
+        eps = tuple(outward_edge_eps(getattr(grid, 'eps_' + c), node, ax)
+                    for ax, c in enumerate('xyz'))
+        cache = (arrays, eps)
+        grid._conformal_eps_cache = cache
+    return cache[1]
+
+
 def count_cut_cells(grid: FDTDGrid) -> int:
     """Number of H faces that are partially — not fully — covered by conductor.
 

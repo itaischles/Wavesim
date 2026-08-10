@@ -46,7 +46,7 @@ import numpy as np
 from wavesim.grid import FDTDGrid
 from wavesim.constants import MU0, EPS0
 from wavesim.loss import loss_coefficients
-from wavesim.pec import conformal_geometry
+from wavesim.pec import conformal_geometry, conformal_edge_eps
 
 
 def update_H(grid: FDTDGrid) -> FDTDGrid:
@@ -194,11 +194,19 @@ def update_E(grid: FDTDGrid) -> FDTDGrid:
     conductivity. As with the conformal branch in :func:`update_H`, the lossless
     branch below is left exactly as it was — a model with no lossy material must
     not pay for the two extra full-volume array reads per component.
+
+    ε is read through :func:`wavesim.pec.conformal_edge_eps` rather than off the
+    grid, which returns the stored arrays *by identity* unless the grid is
+    conformal — so the staircase path is untouched and bit-identical. On a cut-cell
+    grid an edge crossing the conductor surface carries whatever ε the voxeliser
+    left inside the metal, and that is the ε this update would otherwise divide
+    by, on an edge whose field lives entirely in the dielectric outside.
     """
     if grid.is_lossy:
         return _update_E_lossy(grid)
 
     dt = grid.dt
+    eps_x, eps_y, eps_z = conformal_edge_eps(grid)
     # Every E derivative differences an H field that sits at a cell CENTRE along
     # the differenced axis (Hz[i,j,k] is at yc[j]), so the denominator is the DUAL
     # width ``dd``. Same Yee ``[:-1]`` alignment and broadcast as ``update_H``, but
@@ -213,26 +221,26 @@ def update_E(grid: FDTDGrid) -> FDTDGrid:
     dHz_dy = (grid.Hz[:, 1:, :] - grid.Hz[:, :-1, :]) / dyd
     if grid.Nz > 1:
         dHy_dz = (grid.Hy[:, :, 1:] - grid.Hy[:, :, :-1]) / dzd
-        grid.Ex[:, 1:, 1:] += (dt / (EPS0 * grid.eps_x[:, 1:, 1:])) * (
+        grid.Ex[:, 1:, 1:] += (dt / (EPS0 * eps_x[:, 1:, 1:])) * (
             dHz_dy[:, :, 1:] - dHy_dz[:, 1:, :]
         )
     else:
-        grid.Ex[:, 1:, :] += (dt / (EPS0 * grid.eps_x[:, 1:, :])) * dHz_dy
+        grid.Ex[:, 1:, :] += (dt / (EPS0 * eps_x[:, 1:, :])) * dHz_dy
 
     # Ey: dHx/dz - dHz/dx
     dHz_dx = (grid.Hz[1:, :, :] - grid.Hz[:-1, :, :]) / dxd
     if grid.Nz > 1:
         dHx_dz = (grid.Hx[:, :, 1:] - grid.Hx[:, :, :-1]) / dzd
-        grid.Ey[1:, :, 1:] += (dt / (EPS0 * grid.eps_y[1:, :, 1:])) * (
+        grid.Ey[1:, :, 1:] += (dt / (EPS0 * eps_y[1:, :, 1:])) * (
             dHx_dz[1:, :, :] - dHz_dx[:, :, 1:]
         )
     else:
-        grid.Ey[1:, :, :] += (dt / (EPS0 * grid.eps_y[1:, :, :])) * (-dHz_dx)
+        grid.Ey[1:, :, :] += (dt / (EPS0 * eps_y[1:, :, :])) * (-dHz_dx)
 
     # Ez: dHy/dx - dHx/dy
     dHy_dx = (grid.Hy[1:, :, :] - grid.Hy[:-1, :, :]) / dxd
     dHx_dy = (grid.Hx[:, 1:, :] - grid.Hx[:, :-1, :]) / dyd
-    grid.Ez[1:, 1:, :] += (dt / (EPS0 * grid.eps_z[1:, 1:, :])) * (
+    grid.Ez[1:, 1:, :] += (dt / (EPS0 * eps_z[1:, 1:, :])) * (
         dHy_dx[:, 1:, :] - dHx_dy[1:, :, :]
     )
 

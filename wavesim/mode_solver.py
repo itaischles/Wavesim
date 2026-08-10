@@ -57,7 +57,8 @@ from scipy.sparse.linalg import splu
 from wavesim.constants import EPS0, ETA0, C0
 from wavesim.grid import FDTDGrid
 from wavesim.parts import pec_node_mask
-from wavesim.pec import (build_pec_edge_masks,
+from wavesim.pec import (build_pec_edge_masks, conformal_edge_eps,
+                         outward_edge_eps,
                          COVERED_FRACTION_TOL as _COVERED_FRACTION_TOL)
 
 
@@ -132,6 +133,24 @@ _NORMAL_CFG = {
 # whose fractions are all 1.0 reproduces the staircase assembly bit-for-bit on
 # any mesh (``tests/test_conformal_mode_solver.py``).
 # ====================================================================== #
+
+
+def _eps_arrays(grid: FDTDGrid) -> dict:
+    """``{'eps_x': ..., 'eps_y': ..., 'eps_z': ...}`` as the *run* reads them.
+
+    :func:`wavesim.pec.conformal_edge_eps` on a cut-cell grid, the stored arrays
+    by identity otherwise. Every ε read in this module goes through here, because
+    a mode is only useful to the extent it was solved on the material its own
+    time loop will step: the ``η`` a port's ``ĥ`` sheet is divided by has to be
+    built from the same map as the Laplacian that produced ``φ``, or ``ê`` is not
+    a null vector of the transverse curl and the port charges its own plane.
+    """
+    return dict(zip(('eps_x', 'eps_y', 'eps_z'), conformal_edge_eps(grid)))
+
+
+def _eps_by_component(grid: FDTDGrid) -> dict:
+    """The same three arrays keyed by field component — ``{'Ex': ...}``."""
+    return dict(zip(('Ex', 'Ey', 'Ez'), conformal_edge_eps(grid)))
 
 
 def _plane_open_fractions(grid: FDTDGrid, cfg: dict, normal: str, k: int):
@@ -451,8 +470,9 @@ class TEMMode:
             # transverse divergence at the free nodes next to it — which is the
             # one property a modal sheet cannot do without.
 
-        # η = η₀·√(μ_r/ε_r) on the plane, exactly as :func:`_build_mode`.
-        eps_a = _slice(getattr(grid, cfg['eps'][0]), self.normal, k)
+        # η = η₀·√(μ_r/ε_r) on the plane, exactly as :func:`_build_mode`, and
+        # read through :func:`_eps_arrays` for the same reason it does.
+        eps_a = _slice(_eps_arrays(grid)[cfg['eps'][0]], self.normal, k)
         mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
         eta = ETA0 * np.sqrt(mu_a / np.where(eps_a > 0, eps_a, 1.0))
         sa, sb = cfg['h_sign']
@@ -517,7 +537,7 @@ class TEMMode:
                           _plane_open_fractions(grid, cfg, self.normal, k)))
         mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
         G = 0.0
-        eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+        eps_of = _eps_by_component(grid)
         for comp in cfg['E']:
             ehat = E_stag[comp]
             dA_c = dA if f_open[comp] is None else dA * f_open[comp]
@@ -594,7 +614,7 @@ class TEMMode:
             ~3% over a 4× frequency range) and still rejects to roughly -55 dB.
         """
         cfg = _NORMAL_CFG[self.normal]
-        eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+        eps_of = _eps_by_component(grid)
         k = self.slice_index
 
         # Port fields are the DISCRETE (Yee-staggered) mode, not the collocated
@@ -741,8 +761,9 @@ def solve_tem_modes(grid: FDTDGrid, *,
     k = grid.axis_index(normal, position)
 
     # --- slice the plane: eps (per transverse component), mu, PEC ----------- #
-    eps_a_full = _slice(getattr(grid, cfg['eps'][0]), normal, k)
-    eps_b_full = _slice(getattr(grid, cfg['eps'][1]), normal, k)
+    eps = _eps_arrays(grid)
+    eps_a_full = _slice(eps[cfg['eps'][0]], normal, k)
+    eps_b_full = _slice(eps[cfg['eps'][1]], normal, k)
     mu_a_full = _slice(getattr(grid, cfg['mu']), normal, k)
     _warn_if_lossy_plane(grid, cfg, normal, k)
 
@@ -821,16 +842,28 @@ def solve_tem_modes(grid: FDTDGrid, *,
         fixed[0, :] = True; fixed[-1, :] = True
         fixed[:, 0] = True; fixed[:, -1] = True
 
+    # Whether :func:`_face_eps` still has the conductor-straddling ε to repair.
+    # On the conformal path it does not: ``eps_a``/``eps_b`` were sliced from
+    # :func:`_eps_arrays`, which already applied that very rule to the whole map
+    # so the FDTD steps the same material. Applying it a second time here is not
+    # a no-op — across a one-cell gap the two end nodes are both metal and the
+    # rule would swap the pair back — and, worse, it would put the mode back on a
+    # map the run does not use, which is the mismatch all of this exists to
+    # close. The staircase path gets no such repair (its dilation zeroes those
+    # edges outright), so there ``_face_eps`` is still the only place the rule
+    # is applied and ``pec`` must reach it.
+    eps_pec = None if f_a is not None else pec
+
     # --- factorise the weighted Laplacian once, reuse for every mode -------- #
     lu, B, free_idx, fixed_cells = _factor_laplacian(eps_a, eps_b, da_w, db_w,
-                                                     fixed, pec, f_a, f_b)
+                                                     fixed, eps_pec, f_a, f_b)
     # Air-filled companion (ε≡1) for the per-unit-length parameters. The PEC
     # one-sided rule is a no-op here (ε is uniformly 1), which is precisely why
     # applying it to the filled solve restores φ == φ_air on a homogeneous fill.
     if compute_params:
         lu_air, B_air, _, _ = _factor_laplacian(
-            np.ones_like(eps_a), np.ones_like(eps_b), da_w, db_w, fixed, pec,
-            f_a, f_b)
+            np.ones_like(eps_a), np.ones_like(eps_b), da_w, db_w, fixed,
+            eps_pec, f_a, f_b)
 
     modes: List[TEMMode] = []
     for Ls in signals:
@@ -842,7 +875,7 @@ def solve_tem_modes(grid: FDTDGrid, *,
             phi_air = _solve_one(lu_air, B_air, free_idx, fixed_cells,
                                  labels, fixed, Ls)
             _attach_params(mode, phi, phi_air, eps_a, eps_b, da_w, db_w,
-                           pec, f_a, f_b)
+                           eps_pec, f_a, f_b)
         modes.append(mode)
 
     return modes
@@ -939,19 +972,19 @@ def _face_eps(eps: np.ndarray, pec, axis: int) -> np.ndarray:
     keeps the filled and air operators exact scalar multiples of one another,
     hence φ = φ_air and ε_eff = ε_r to round-off. Dropping it (direct ε alone)
     reads 2.273 on a homogeneous coax against a true 2.300.
+
+    That rule is :func:`wavesim.pec.outward_edge_eps`, which this defers to and
+    then truncates to the ``N-1`` faces the plane has: it is the same repair the
+    FDTD applies to its own material map on a conformal grid, and the two must be
+    the same function. ``pec = None`` asks for no repair — which is what
+    :func:`solve_tem_modes` passes on the conformal path, where the map it was
+    handed is repaired already.
     """
     n = eps.shape[axis]
     part = (lambda a, s: a[s]) if axis == 0 else (lambda a, s: a[:, s])
-    face = part(eps, np.s_[:n - 1]).copy()
-    if pec is None or face.size == 0:
-        return face
-    lo, hi = part(pec, np.s_[:n - 1]), part(pec, np.s_[1:n])
-    outward_hi = part(eps, np.s_[1:n])                       # face i+1
-    outward_lo = np.concatenate(                             # face i-1, clamped
-        [part(eps, np.s_[:1]), part(eps, np.s_[:n - 2])], axis=axis)
-    face = np.where(lo & ~hi, outward_hi, face)
-    face = np.where(hi & ~lo, outward_lo, face)
-    return face
+    if pec is None or n < 2:
+        return part(eps, np.s_[:n - 1]).copy()
+    return part(outward_edge_eps(eps, pec, axis), np.s_[:n - 1]).copy()
 
 
 def _face_coefs(eps_a, eps_b, da_w, db_w, pec=None, f_a=None, f_b=None):

@@ -60,7 +60,7 @@ from numba import njit, prange
 
 from wavesim.grid import FDTDGrid
 from wavesim.loss import loss_coefficients
-from wavesim.pec import conformal_geometry
+from wavesim.pec import conformal_geometry, conformal_edge_eps
 from wavesim.pml import CPMLArrays
 from wavesim.constants import MU0, EPS0
 
@@ -618,7 +618,7 @@ def update_E(grid: FDTDGrid) -> FDTDGrid:
                         grid.Nx, grid.Ny, grid.Nz)
         return grid
     _update_E(grid.Ex, grid.Ey, grid.Ez, grid.Hx, grid.Hy, grid.Hz,
-              grid.eps_x, grid.eps_y, grid.eps_z,
+              *conformal_edge_eps(grid),
               grid.dt, grid.dxd, grid.dyd, grid.dzd, grid.Nx, grid.Ny, grid.Nz)
     return grid
 
@@ -665,7 +665,7 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     """Numba-accelerated drop-in for :func:`wavesim.pml.update_E_pml`."""
     _update_E_pml(
         grid.Ex, grid.Ey, grid.Ez, grid.Hx, grid.Hy, grid.Hz,
-        grid.eps_x, grid.eps_y, grid.eps_z,
+        *conformal_edge_eps(grid),
         grid.dt, _ravel(cpml.dxd_sE), _ravel(cpml.dyd_sE), _ravel(cpml.dzd_sE),
         grid.Nx, grid.Ny, grid.Nz,
         cpml.sel_xE, cpml.sel_yE, cpml.sel_zE,

@@ -34,6 +34,7 @@ physically correct behaviour of a zero-impedance source.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Tuple, Union
+
 import numpy as np
 
 from wavesim.constants import C0, EPS0, ETA0
@@ -41,6 +42,7 @@ from wavesim.grid import FDTDGrid
 # Shared with VoltageMonitor so a LineSource and a monitor on the same path
 # snap to identical Yee E-edges and agree bit-for-bit on ∫E·dl.
 from wavesim.monitors import _build_path_quadrature
+from wavesim.pec import conformal_edge_eps
 
 
 # ====================================================================== #
@@ -809,7 +811,10 @@ class LineSource(Source):
         geometric (physical lengths) and is unchanged.
         """
         quad = _build_path_quadrature([self.p0, self.p1], grid, 'E', close=False)
-        eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+        # The ε the E update will actually divide by, which on a conformal grid
+        # is not the stored array (:func:`wavesim.pec.conformal_edge_eps`); κ is
+        # this source's model *of* that update and has to track it.
+        eps_of = dict(zip(('Ex', 'Ey', 'Ez'), conformal_edge_eps(grid)))
         edges = {}
         kappa = 0.0
         wsq = 0.0
@@ -1319,7 +1324,7 @@ class ModalPort:
         f_open = dict(zip(cfg['E'],
                           _plane_open_fractions(grid, cfg, normal, k)))
         mu_p = _slice(getattr(grid, cfg['mu']), normal, k)
-        eps_of = {'Ex': grid.eps_x, 'Ey': grid.eps_y, 'Ez': grid.eps_z}
+        eps_of = dict(zip(('Ex', 'Ey', 'Ez'), conformal_edge_eps(grid)))
         pair = {cfg['E'][0]: (cfg['H'][1], cfg['h_sign'][1]),
                 cfg['E'][1]: (cfg['H'][0], cfg['h_sign'][0])}
         self._i_edges = {}

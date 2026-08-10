@@ -67,6 +67,7 @@ import numpy as np
 
 from wavesim.constants import EPS0
 from wavesim.grid import FDTDGrid
+from wavesim.pec import conformal_edge_eps
 
 
 @dataclass(frozen=True)
@@ -94,8 +95,13 @@ def build_loss_coefficients(grid: FDTDGrid) -> LossCoefficients:
     dt = grid.dt
     out = {}
     worst = 0.0
+    # The same ε the lossless update divides by — the stored arrays unless the
+    # grid is conformal (:func:`wavesim.pec.conformal_edge_eps`). σ needs no such
+    # repair: a conductor-straddling edge's stored σ is as meaningless as its ε,
+    # but PEC wins over σ wherever they overlap and the edge is masked anyway.
+    eps_of = dict(zip('xyz', conformal_edge_eps(grid)))
     for c in ('x', 'y', 'z'):
-        eps = getattr(grid, 'eps_' + c)
+        eps = eps_of[c]
         sigma = getattr(grid, 'sigma_' + c)
         # Exactly update.py's lossless coefficient, so k == 0 reproduces it.
         base = dt / (EPS0 * eps)
@@ -133,8 +139,12 @@ def loss_coefficients(grid: FDTDGrid):
     if not grid.is_lossy:
         return None
 
-    arrays = (grid.eps_x, grid.eps_y, grid.eps_z,
-              grid.sigma_x, grid.sigma_y, grid.sigma_z)
+    # Keyed on the ε the coefficients are actually built from, which on a
+    # conformal grid is a derived array — it changes identity when the stored ε
+    # *or* the cut geometry does, so keying on ``grid.eps_*`` would go stale if
+    # only the fractions moved.
+    arrays = conformal_edge_eps(grid) + (grid.sigma_x, grid.sigma_y,
+                                         grid.sigma_z)
     dt = float(grid.dt)
 
     cache = getattr(grid, '_loss_cache', None)
