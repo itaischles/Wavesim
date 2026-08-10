@@ -470,17 +470,25 @@ class TEMMode:
             # transverse divergence at the free nodes next to it — which is the
             # one property a modal sheet cannot do without.
 
-        # η = η₀·√(μ_r/ε_r) on the plane, exactly as :func:`_build_mode`, and
-        # read through :func:`_eps_arrays` for the same reason it does.
-        eps_a = _slice(_eps_arrays(grid)[cfg['eps'][0]], self.normal, k)
+        # η = η₀·√(μ_r/ε_r), read through :func:`_eps_arrays` for the reason it
+        # gives — and read **per component**: ``Ĥa`` is built from ``êb``, so the
+        # η that divides it is the one at ``êb``'s own edge, ``eps_b``. Dividing
+        # both by ``eps_a``'s η (which this did) is exact wherever the two
+        # transverse ε agree and silently wrong where they do not, in the one way
+        # that matters most: it puts a jump in ``ĥ`` that ``ê`` has no matching
+        # jump for, so ``∇_t·ĥ`` stops vanishing even though ``∇_t·(ε ê)`` still
+        # does. On a ModalPort's ghost plane that leftover is what integrates.
+        eps = _eps_arrays(grid)
         mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
-        eta = ETA0 * np.sqrt(mu_a / np.where(eps_a > 0, eps_a, 1.0))
+        eta_a, eta_b = (ETA0 * np.sqrt(mu_a / np.where(e > 0, e, 1.0))
+                        for e in (_slice(eps[cfg['eps'][0]], self.normal, k),
+                                  _slice(eps[cfg['eps'][1]], self.normal, k)))
         sa, sb = cfg['h_sign']
         # Ĥ is built from the already-masked ê, so it inherits its zeros on
         # both paths — no separate masking, which would only ever remove more
         # than the run does.
-        Ha = sa * Eb / eta
-        Hb = sb * Ea / eta
+        Ha = sa * Eb / eta_b
+        Hb = sb * Ea / eta_a
 
         E = {cfg['E'][0]: Ea, cfg['E'][1]: Eb}
         H = {cfg['H'][0]: Ha, cfg['H'][1]: Hb}
