@@ -34,6 +34,7 @@ physically correct behaviour of a zero-impedance source.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Tuple, Union
+import warnings
 
 import numpy as np
 
@@ -1243,7 +1244,9 @@ class ModalPort:
         from wavesim.mode_solver import (_plane_to_grid, _launch_time_shift,
                                          _normal_width, _plane_open_fractions,
                                          _slice, _NORMAL_CFG,
-                                         port_plane_pinned_nodes)
+                                         port_plane_pinned_nodes,
+                                         port_sheet_divergence,
+                                         _SHEET_DIVERGENCE_TOL)
 
         normal = self.mode.normal
         k = self.mode.slice_index
@@ -1292,6 +1295,26 @@ class ModalPort:
                 ii, jj, kk = _plane_to_grid(normal, self._h_k, a, b)
                 self._pin = ({'x': 'Ex', 'y': 'Ey', 'z': 'Ez'}[normal],
                              ii, jj, kk)
+
+        # The sheet must be divergence-free where the mode solve was free to make
+        # it so; nothing downstream can repair it if it is not, because the ghost
+        # plane runs open loop. Measured, not assumed — see
+        # :func:`~wavesim.mode_solver.port_sheet_divergence` for what the number
+        # means and why round-off is thirteen orders below a real failure.
+        self.sheet_divergence = port_sheet_divergence(self.mode, grid)
+        if self.sheet_divergence > _SHEET_DIVERGENCE_TOL:
+            warnings.warn(
+                f"ModalPort on the {normal}-plane at index {k}: the injected "
+                f"sheet has a transverse divergence of {self.sheet_divergence:.3g} "
+                f"(relative; round-off is ~1e-14) at nodes where the mode solver "
+                f"solved for phi and so drove it to zero. The ghost plane is open "
+                f"loop, so this will integrate into a static field on both port "
+                f"planes rather than radiate away. The usual cause is a grid whose "
+                f"permittivity disagrees with its own cut-cell geometry: an edge "
+                f"the open fractions call dielectric carrying the background eps "
+                f"the voxeliser left inside the metal. Check eps_x/eps_y/eps_z "
+                f"against pec_edge_open_* before trusting this port.",
+                RuntimeWarning, stacklevel=2)
 
         # Amplitude calibration of the launch. ``V̄ − 2a`` radiates a forward wave
         # whose modal voltage equals ``a`` for a matched sheet, so ``amplitude`` is

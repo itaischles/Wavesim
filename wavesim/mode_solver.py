@@ -57,8 +57,8 @@ from scipy.sparse.linalg import splu
 from wavesim.constants import EPS0, ETA0, C0
 from wavesim.grid import FDTDGrid
 from wavesim.parts import pec_node_mask
-from wavesim.pec import (build_pec_edge_masks, conformal_edge_eps,
-                         outward_edge_eps,
+from wavesim.pec import (build_pec_edge_masks, build_conformal_edge_masks,
+                         conformal_edge_eps, outward_edge_eps,
                          COVERED_FRACTION_TOL as _COVERED_FRACTION_TOL)
 
 
@@ -243,6 +243,81 @@ def port_plane_pinned_nodes(grid: FDTDGrid, normal: str, k: int) -> np.ndarray:
     *in* a grid-aligned conductor surface, whose own open fraction is a full 1.0.
     """
     return _slice(pec_node_mask(grid), normal, k)
+
+
+def port_sheet_divergence(mode, grid: FDTDGrid) -> float:
+    """How badly ``ê`` fails to be a null vector of the FDTD's transverse curl.
+
+    Returns ``max |∇_t·ĥ|`` over the plane's **free** nodes, divided by the
+    sheet's own scale ``max|ĥ| / min(Δa, Δb)`` — so it is dimensionless, and
+    round-off on a well-posed mode reads ~1e-14 against ~1e-1 for a broken one.
+    Zero free nodes (a plane that is all conductor) returns 0.0.
+
+    This is the *defining* property of a modal sheet, not a diagnostic of one.
+    :class:`~wavesim.sources.ModalPort` overwrites the tangential ``H`` on its
+    ghost plane every step, so that plane runs open loop: what the next Ampère
+    update deposits there can never act back on the ``H`` that produced it, and
+    what it deposits is exactly this divergence. At a *pinned* node the residual
+    is the mode's induced surface charge — physically real, and held down
+    separately (see :meth:`~wavesim.sources.ModalPort.apply_post_E` and
+    :func:`~wavesim.pec.build_conformal_edge_masks`). At a **free** node there is
+    nothing to hold it and nothing that should be there: the mode solver's
+    Laplacian drove ``∇_t·(ε ê)`` to round-off at precisely those nodes. So a
+    free-node residual means the two divergences are not the same operator —
+    ``ê`` solved against one material map, ``ĥ`` stepped on another — and it
+    integrates, step after step, into a static pile on both port planes.
+
+    Measured on the mode's own plane, which is where ``φ`` was solved and pinned.
+    A conductor that varies along the port normal can differ by one cell between
+    that plane and the ghost plane; the same caveat
+    :func:`~wavesim.pec.build_conformal_edge_masks` carries.
+
+    Excluded from the free set, besides the pinned nodes: nodes whose
+    normal-``E`` edge the run holds at zero anyway (a residual deposited there is
+    masked away before it can integrate), and the plane's outer ring, which is
+    either the ground ring the mode solve pinned or the domain wall
+    :func:`~wavesim.pec.apply_pec_faces` shorts, and where the centred difference
+    has no neighbour on one side regardless.
+    """
+    cfg = _NORMAL_CFG[mode.normal]
+    k = mode.slice_index
+    _E, H = mode._staggered_port_fields(grid)
+    Ha, Hb = H[cfg['H'][0]], H[cfg['H'][1]]
+
+    # The transverse curl the normal-E update takes, up to an overall sign:
+    # ``∂_a Hb − ∂_b Ha``, differenced with the upper index onto the node and
+    # divided by the DUAL widths, exactly as :func:`wavesim.update.update_E`.
+    dual = {'x': grid.dxd, 'y': grid.dyd, 'z': grid.dzd}
+    da = dual[cfg['axes'][0]][:-1][:, None]
+    db = dual[cfg['axes'][1]][:-1][None, :]
+    div = np.zeros_like(Ha)
+    div[1:, 1:] = ((Hb[1:, 1:] - Hb[:-1, 1:]) / da[:, :]
+                   - (Ha[1:, 1:] - Ha[1:, :-1]) / db[:, :])
+
+    free = ~port_plane_pinned_nodes(grid, mode.normal, k)
+    axis = 'xyz'.index(mode.normal)
+    dead = build_conformal_edge_masks(grid)[axis] if grid.is_conformal else (
+        build_pec_edge_masks(grid.pec_mask)[axis] if grid.pec_mask is not None
+        else np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=bool))
+    free &= ~_slice(dead, mode.normal, k)
+    free[0, :] = free[-1, :] = free[:, 0] = free[:, -1] = False
+    if not free.any():
+        return 0.0
+
+    prim = {'x': grid.dxp, 'y': grid.dyp, 'z': grid.dzp}
+    scale = max(np.abs(Ha).max(), np.abs(Hb).max()) / min(
+        prim[cfg['axes'][0]].min(), prim[cfg['axes'][1]].min())
+    if scale <= 0.0:
+        return 0.0
+    return float(np.abs(div[free]).max()) / scale
+
+
+# A free-node residual above this fraction of the sheet's own scale is not
+# round-off. The two populations are ~13 orders apart — 1e-14 for a mode and its
+# grid built on one material map, ~1e-1 when they are built on two — so the
+# threshold only has to land somewhere in between, and nothing is sensitive to
+# where.
+_SHEET_DIVERGENCE_TOL = 1e-6
 
 
 def _plane_to_grid(normal: str, k: int, a: np.ndarray, b: np.ndarray):
