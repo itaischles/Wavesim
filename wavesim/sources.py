@@ -35,6 +35,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Tuple, Union
 import warnings
+import weakref
 
 import numpy as np
 
@@ -1117,6 +1118,98 @@ class _ModalLaunch(LineSource):
         self._inject_directional_h(grid)
 
 
+# --------------------------------------------------------------------------- #
+# Co-planar ModalPort bookkeeping
+# --------------------------------------------------------------------------- #
+# Every ModalPort *assigns* its sheet onto the ghost H plane, because the sheet
+# must replace what ``update_H`` left there rather than add to it (``update_H``
+# writes that plane too, in both the staircase and the conformal branch). With
+# two ports on the same face — the multi-conductor S-parameter case — plain
+# assignment in ``Simulation.step``'s boundary loop makes the last port in the
+# list erase every earlier one: not a degradation but a total suppression, since
+# co-planar modes generally span the same cells. The suppressed port then loses
+# its *termination* as well as its drive, while still recording a plausible
+# V(t)/I(t) (both are read-only projections of planes nobody clobbers) — which is
+# why the failure reads as a quiet port rather than as an error.
+#
+# The fix is clear-then-sum across co-planar ports only: the plane carries
+#
+#     H_ghost = Σ_m s_m·(V̄_m − 2·a_m)·ĥ_m
+#
+# Ports sharing a write target find each other through ``_GHOST_GROUPS``, keyed
+# on the grid and the plane actually written (``_h_k``, which is ``k`` for a high
+# face and ``k−1`` for a low one). Each port drops its scalar amplitude into a
+# per-step accumulator and then flushes the running sum, so the result does not
+# depend on boundary-list order and is correct even on the first step, where a
+# port may flush before a later one has run its lazy ``_setup``: whoever flushes
+# last writes the full sum, and the E update only sees the end of the loop.
+#
+# The grid is a mutable dataclass — unhashable, so no WeakKeyDictionary — hence
+# the id key plus a weakref used both to detect id reuse and to drop the entry
+# when the grid dies.
+_GHOST_GROUPS: dict = {}
+
+
+class _GhostPlaneGroup:
+    """The ModalPorts writing one ghost H plane, and their sum for this step."""
+
+    __slots__ = ('t', 'contrib', 'plans')
+
+    def __init__(self) -> None:
+        self.t = None
+        self.contrib: dict = {}    # port -> scalar sheet amplitude this step
+        self.plans: dict = {}      # frozenset(ports) -> scatter plan
+
+    def open_step(self, port, t: float) -> None:
+        """Start a new step's accumulation if this is the first contribution.
+
+        ``t`` advances every step, so a differing ``t`` marks a new step. A port
+        contributing twice under the same ``t`` marks one too: each port applies
+        once per step, so the repeat can only be a fresh run on a re-used grid
+        whose step counter was reset.
+        """
+        if self.t != t or port in self.contrib:
+            self.t = t
+            self.contrib.clear()
+
+    def plan(self, shape: Tuple[int, int, int]) -> dict:
+        """Scatter plan for the current contributor set (built once, cached).
+
+        Per component: the grid indices of the **union** of the contributors'
+        nonzero cells, and each port's offsets into that union. Only the union is
+        written — cells where every mode is zero keep whatever ``update_H`` put
+        there, as they always have.
+        """
+        key = frozenset(self.contrib)
+        plan = self.plans.get(key)
+        if plan is not None:
+            return plan
+        ports = sorted(self.contrib, key=id)
+        comps = {c for p in ports for c in p._h}
+        plan = {}
+        for comp in comps:
+            members = [(p, np.ravel_multi_index(p._h[comp][:3], shape))
+                       for p in ports if comp in p._h]
+            union = np.unique(np.concatenate([f for _, f in members]))
+            plan[comp] = (np.unravel_index(union, shape), union.size,
+                          [(p, np.searchsorted(union, f)) for p, f in members])
+        self.plans[key] = plan
+        return plan
+
+
+def _ghost_group(grid: FDTDGrid, normal: str, h_k: int) -> _GhostPlaneGroup:
+    """The accumulator shared by every ModalPort writing this grid's ``h_k``
+    plane along ``normal`` (created on first use)."""
+    key = (id(grid), normal, h_k)
+    entry = _GHOST_GROUPS.get(key)
+    if entry is not None and entry[0]() is grid:
+        return entry[1]
+    ref = weakref.ref(grid, lambda _r, k=key: _GHOST_GROUPS.pop(k, None))
+    group = _GhostPlaneGroup()
+    _GHOST_GROUPS[key] = (ref, group)
+    return group
+
+
 class ModalPort:
     """One-way modal impedance-sheet port: a TEM absorber / launcher on a face.
 
@@ -1157,6 +1250,24 @@ class ModalPort:
     ``k`` with ``+``; the low-index face (``z0``) writes it at ``k-1`` with ``−``
     (the Yee z-curl does not update the ``k=0`` E-plane, so a low face must sit at
     least one cell in).
+
+    **Co-planar ports.** A multi-conductor cross-section is terminated by one
+    ``ModalPort`` per conductor mode, all writing the *same* ghost plane. They
+    superpose there,
+
+        ``H_ghost = Σ_m s_m·(V̄_m − 2·a_m)·ĥ_m``
+
+    which each port arranges for itself — register them as separate boundaries in
+    any order and the plane carries the sum (see ``_GhostPlaneGroup``). Each
+    ``V̄_m`` is that port's own modal projection, so this is the whole of the
+    coupling the sheet needs.
+
+    One accuracy caveat, and it is *not* about the summation: the conductor-basis
+    modes :func:`~wavesim.mode_solver.solve_tem_modes` returns (energize conductor
+    ``id``, ground the rest) are not mutually orthogonal, so ``V̄_m`` picks up
+    some of mode ``n``'s content and the termination carries a cross-coupling
+    error. That is a property of the modal basis, not of the port, and it is
+    unaddressed here.
 
     **Port record.** Each step appends to ``times``, ``voltages`` and
     ``currents``, all co-timed at step ``n``. ``V`` is the ε-weighted modal
@@ -1284,6 +1395,12 @@ class ModalPort:
                 continue
             ii, jj, kk = _plane_to_grid(normal, self._h_k, a, b)
             self._h[comp] = (ii, jj, kk, arr2d[a, b])
+
+        # Ports sharing this ghost plane must sum onto it, not overwrite each
+        # other; the group is how they find one another. Keyed on the plane
+        # *written*, which is why it can only be joined here, after ``_h_k``.
+        self._shape = (grid.Nx, grid.Ny, grid.Nz)
+        self._group = _ghost_group(grid, normal, self._h_k)
 
         # Ghost-plane normal-E edges to hold at zero (conformal grids only).
         # See :meth:`apply_post_E` for what goes wrong without this.
@@ -1431,11 +1548,38 @@ class ModalPort:
                    + frac * h[-1 - min(i0 + 1, n - 1)])
         a = self.amplitude * (self.waveform(t) if self.waveform is not None else 0.0)
         amp = self._sign * self._scale * (v_shift - 2.0 * a)
-        for comp, (ii, jj, kk, vals) in self._h.items():
-            getattr(grid, comp)[ii, jj, kk] = amp * vals
+        self._write_ghost_h(grid, t, amp)
         self.times.append(t)
         self.voltages.append(V)
         self.currents.append(i_port)
+
+    def _write_ghost_h(self, grid: FDTDGrid, t: float, amp: float) -> None:
+        """Put this port's sheet on the ghost plane, summed with any co-planar
+        peers' (see the ``_GhostPlaneGroup`` notes above ``ModalPort``).
+
+        The write stays a fancy-index **assignment** on ``grid.<comp>``, exactly
+        as the single-port path always did, so it makes no new demand of the
+        backend. Every path that runs boundaries runs them through
+        :meth:`~wavesim.simulation.Simulation.step`, where ``grid.Hx`` &c. are
+        host numpy arrays on all three backends — the CUDA one included, since it
+        keeps the fields on the host between steps. (``run(backend='cuda')`` takes
+        the resident fast path, which does not run boundaries at all: a
+        pre-existing limitation, unrelated to this write.)
+        """
+        group = self._group
+        group.open_step(self, t)
+        group.contrib[self] = amp
+        if len(group.contrib) == 1:
+            # The common case, and the one that has to stay bit-identical: one
+            # port on this plane writes its own pattern, unsummed.
+            for comp, (ii, jj, kk, vals) in self._h.items():
+                getattr(grid, comp)[ii, jj, kk] = amp * vals
+            return
+        for comp, (idx, n, members) in group.plan(self._shape).items():
+            total = np.zeros(n)
+            for port, off in members:
+                total[off] += group.contrib[port] * port._h[comp][3]
+            getattr(grid, comp)[idx] = total
 
     # -- per-step post-E hook (runs after update_E and the PEC masking) ------- #
     def apply_post_E(self, grid: FDTDGrid, t: float) -> None:
