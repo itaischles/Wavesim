@@ -58,6 +58,7 @@ from wavesim.stability import (
     StabilityProbe, probe_growth, max_stable_dt, stability_margin,
     safe_area_threshold, ensure_stable_threshold,
 )
+from wavesim.lumped import LumpedNetwork
 from wavesim.sources import (
     Waveform, GaussianPulse, Sinusoid,
     Source, PointSource, ArraySource, PlaneSource, GaussianBeam,
@@ -136,6 +137,8 @@ __all__ = [
     "Waveform", "GaussianPulse", "Sinusoid",
     "Source", "PointSource", "ArraySource", "PlaneSource", "GaussianBeam",
     "LineSource", "TEMPort", "ModalPort", "SpicePort", "VolumeSource",
+    # lumped R/L/C loads
+    "LumpedNetwork",
     # monitors
     "FieldProbe", "SnapshotMonitor", "PoyntingMonitor", "EnergyMonitor",
     "DissipationMonitor", "VoltageMonitor", "CurrentMonitor", "circular_path",

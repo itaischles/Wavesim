@@ -30,10 +30,14 @@ The import package is named `wavesim`.
 - **Gaussian sources** (baseband envelope + narrowband/CW recipe), plus a
   `Source` abstraction — `PointSource`, `LineSource`, `PlaneSource`,
   `VolumeSource`, `ArraySource`, or subclass your own.
-- **Lumped V-I-Z elements** — `LineSource` places a Thevenin/Norton source,
-  ideal voltage/current source, or passive resistor on a line between two
-  points (semi-implicit, stable for any Z > 0) and self-records its port
-  V(t)/I(t) for impedance and S-parameter extraction.
+- **Lumped R/L/C elements** — `LineSource` places a Thevenin/Norton source,
+  ideal voltage/current source, or passive load on a line between two points,
+  and self-records its port V(t)/I(t) for impedance and S-parameter
+  extraction. The load is any of `resistance=` / `inductance=` /
+  `capacitance=`, or several in `topology='series'`/`'parallel'` — reactances
+  via a trapezoidal companion model, so the scheme stays semi-implicit and
+  stable for any component values. Reach for `SpicePort` only when the
+  termination is genuinely a circuit.
 - **SPICE co-simulation** — `SpicePort` terminates a port with a full ngspice
   circuit (authored in LTspice or any tool), solved in lockstep with the FDTD
   loop. Bidirectional: the port presents its Thevenin equivalent to SPICE and
@@ -142,7 +146,7 @@ replaced by a live ngspice solve: each step the port hands ngspice its Thevenin
 equivalent (the time-centred port voltage `v_mid` behind the discrete
 self-coupling `κ/2`) and injects the returned branch current. If the circuit
 reduces to a Thevenin `(Vs, Z)` this is bit-for-bit identical to
-`LineSource(voltage=Vs, impedance=Z)` — the equivalence is validated to ~1e-12,
+`LineSource(voltage=Vs, resistance=Z)` — the equivalence is validated to ~1e-12,
 and nonlinear terminations (diodes, transistors) run through the same path.
 
 ### Install ngspice + PySpice
@@ -192,7 +196,7 @@ sim  = ws.Simulation(grid, cpml=cpml)
 
 # launch a pulse down a parallel-plate line …
 sim.add_source(ws.LineSource(p0=(15e-3, 15e-3, 0.0), p1=(15e-3, 25e-3, 0.0),
-                             voltage=ws.GaussianPulse.for_fmax(20e9), impedance=50.0))
+                             voltage=ws.GaussianPulse.for_fmax(20e9), resistance=50.0))
 
 # … terminated by a SPICE circuit (driver.net names nodes port1p / 0).
 port = ws.SpicePort(p0=(50e-3, 15e-3, 0.0), p1=(50e-3, 25e-3, 0.0),

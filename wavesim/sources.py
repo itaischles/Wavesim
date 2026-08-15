@@ -27,7 +27,7 @@ A Source captures the three things every excitation has:
 Soft injection (+=) is transparent to passing waves (no impedance mismatch).
 Hard injection (=) reflects waves; every Source here adds (+=), with one
 documented exception: :class:`LineSource` in ideal-voltage mode (``voltage=``
-with no ``impedance=``) pins ∫E·dl on its line, which is a hard write — the
+with no load) pins ∫E·dl on its line, which is a hard write — the
 physically correct behaviour of a zero-impedance source.
 """
 
@@ -41,6 +41,7 @@ import numpy as np
 
 from wavesim.constants import C0, EPS0, ETA0
 from wavesim.grid import FDTDGrid
+from wavesim.lumped import LumpedNetwork
 # Shared with VoltageMonitor so a LineSource and a monitor on the same path
 # snap to identical Yee E-edges and agree bit-for-bit on ∫E·dl.
 from wavesim.monitors import _build_path_quadrature
@@ -666,8 +667,12 @@ class LineSource(Source):
     same path reads. ``p0`` is the "+" terminal; positive port current I(t) is
     delivered out of ``p0`` into the surrounding structure.
 
-    Exactly one of ``voltage`` / ``current`` selects the drive (or neither, for
-    a passive resistor); ``impedance`` composes with either:
+    The **load** is any one of ``resistance`` / ``inductance`` / ``capacitance``,
+    or several of them wired ``topology='series'`` (default) or ``'parallel'``
+    — the lumped R, L, C and their combinations, without needing the ngspice
+    round trip of a :class:`SpicePort`. Exactly one of ``voltage`` / ``current``
+    selects the drive, and composes with the load (or omit both, for a purely
+    passive element):
 
     ==========================  =============================================
     Arguments                   Element
@@ -675,29 +680,41 @@ class LineSource(Source):
     ``voltage=Vs``              Ideal voltage source — pins ∫E·dl = Vs(t)
                                 each step (a *hard* write; reflects incident
                                 waves, as a zero-impedance source must).
-    ``voltage=Vs, impedance=Z`` Thevenin source: V = Vs(t) − I·Z.
+    ``voltage=Vs`` + load       Thevenin source: V = Vs(t) − V_load, the load
+                                in series with the EMF.
     ``current=Is``              Ideal current source — soft impressed current
                                 Is(t) along the line.
-    ``current=Is, impedance=Z`` Norton source: I = Is(t) − V/Z.
-    ``impedance=Z`` only        Passive lumped resistor: I = −V/Z
-                                (e.g. a matched termination).
+    ``current=Is`` + load       Norton source: the load sits in parallel with
+                                the impressed current.
+    load only                   Passive lumped element: a resistor
+                                ``I = −V/R`` (e.g. a matched termination), a
+                                capacitor, an inductor, or a network of them.
     ==========================  =============================================
+
+    Reactive branches are integrated with the trapezoidal companion model —
+    each becomes a resistance plus a history source built from its own previous
+    ``(I, V)`` sample, so the per-step law keeps the single-solve form below
+    (see :mod:`wavesim.lumped`). Every branch resistance is positive and finite,
+    so no value of L or C imposes a timestep limit of its own.
 
     Unlike the static sources above, the injection depends on the local field
     each step (an impedance/feedback relationship), so ``inject`` is overridden.
     An impressed current I spread along the line adds
     ``E_a += dt · I · dl_a / (ε_a · dV_cell)`` on each occupied edge, which
     changes the port voltage by ``κ·I`` with ``κ = Σ dt·dl²/(ε·dV)`` (the line's
-    self-coupling, ohm-like). Impedance modes use the semi-implicit current
+    self-coupling, ohm-like). Loaded modes use the semi-implicit current
 
-        I = (Vs(t) − (Vⁿ + Vⁿ⁺¹)/2) / Z      (Norton: Vs ≡ Z·Is)
+        I = (Vs(t) + V_hist − (Vⁿ + Vⁿ⁺¹)/2) / Z_eq    (Norton: Vs ≡ Z_eq·Is)
 
-    solved for the injected I as ``(Vs − (Vⁿ + V*)/2)/(Z + κ/2)``, where ``V*``
-    is the just-curl-updated line voltage and ``Vⁿ`` the voltage at the end of
-    the previous step. This is the standard Piket-May semi-implicit lumped
-    element, time-centred across the whole step, and is stable for any Z > 0.
-    (Centring on V* alone — or the naive explicit I = (Vs−V)/Z — couples
-    unstably with the leapfrog update once Z is below a few hundred ohms.)
+    solved for the injected I as ``(Vs + V_hist − (Vⁿ + V*)/2)/(Z_eq + κ/2)``,
+    where ``V*`` is the just-curl-updated line voltage and ``Vⁿ`` the voltage at
+    the end of the previous step. ``(Z_eq, V_hist)`` is the load's companion
+    pair for this step — for a plain resistor ``(R, 0)``, recovering the
+    familiar ``I = (Vs − V)/R``. This is the standard Piket-May semi-implicit
+    lumped element, time-centred across the whole step, and is stable for any
+    Z_eq > 0. (Centring on V* alone — or the naive explicit I = (Vs−V)/Z —
+    couples unstably with the leapfrog update once Z is below a few hundred
+    ohms.)
 
     The element self-records its port quantities each step — ``times`` (s),
     ``voltages`` (V, post-injection, what a co-located VoltageMonitor reads) and
@@ -711,14 +728,17 @@ class LineSource(Source):
       ≈ ``Z + κ/2``, not Z — the κ/2 is the parasitic of the stable implicit
       averaging (verified here by matched-launch tests on a parallel-plate
       line). ``self_coupling(grid)`` returns κ so you can pre-compensate
-      (``impedance = Z_target − κ/2``, only possible while that stays > 0) or
-      de-embed. The recorded V(t)/I(t) are exact regardless, so port
+      (``resistance = R_target − κ/2``, only possible while that stays > 0) or
+      de-embed. A reactive load cannot pre-compensate at all: a lumped L or C
+      comes with that κ/2 in series with it, which on a short line is of order
+      100 Ω per edge and is the practical limit on how ideal a discrete
+      capacitor can be. The recorded V(t)/I(t) are exact regardless, so port
       extraction is unaffected.
     * **Co-located elements.** Elements sharing line edges inject
       sequentially, not as a jointly solved circuit, so each contributes its
       own κ/2 in series (a 2-element voltage divider on one line settles to
-      ``Vs·Z_L/(Z + Z_L + κ)``). Combine them into a single equivalent
-      element instead.
+      ``Vs·Z_L/(Z + Z_L + κ)``). Use one element with a ``topology=`` network
+      instead — those branches *are* solved jointly.
 
     The line typically spans the gap between two conductors; endpoints may sit
     just inside PEC (as with the monitors), but keep the driven gap itself in
@@ -730,38 +750,63 @@ class LineSource(Source):
         Endpoints ``(x, y, z)`` in metres; ``p0`` is the "+" terminal. Any
         orientation (oblique lines are split per-axis onto staggered edges).
     voltage : Callable[[float], float], optional
-        Source voltage Vs(t) in volts (Thevenin open-circuit value when
-        ``impedance`` is given).
+        Source voltage Vs(t) in volts (Thevenin open-circuit value when a load
+        is given).
     current : Callable[[float], float], optional
-        Source current Is(t) in amperes (Norton short-circuit value when
-        ``impedance`` is given). Mutually exclusive with ``voltage``.
-    impedance : float, optional
-        Resistive impedance Z in ohms (> 0).
+        Source current Is(t) in amperes (Norton short-circuit value when a load
+        is given). Mutually exclusive with ``voltage``.
+    resistance : float, optional
+        Resistance R in ohms (> 0).
+    inductance : float, optional
+        Inductance L in henries (> 0).
+    capacitance : float, optional
+        Capacitance C in farads (> 0).
+    topology : {'series', 'parallel'}
+        How several of R/L/C are wired between the two terminals; irrelevant
+        with a single one. Default ``'series'``.
     """
+
+    #: Fixed series impedance presented by subclasses that bypass this
+    #: ``__init__`` (a mode's Z₀, or None for an ideal impressed source).
+    #: :class:`LineSource` itself uses ``_element`` instead.
+    impedance: float | None = None
+    _element: LumpedNetwork | None = None
 
     def __init__(self, *,
                  p0: Tuple[float, float, float], p1: Tuple[float, float, float],
                  voltage: Callable[[float], float] | None = None,
                  current: Callable[[float], float] | None = None,
-                 impedance: float | None = None) -> None:
+                 resistance: float | None = None,
+                 inductance: float | None = None,
+                 capacitance: float | None = None,
+                 topology: str = 'series') -> None:
         if voltage is not None and current is not None:
             raise ValueError(
                 "LineSource takes either voltage= or current=, not both.")
-        if voltage is None and current is None and impedance is None:
+        has_load = (resistance is not None or inductance is not None
+                    or capacitance is not None)
+        if voltage is None and current is None and not has_load:
             raise ValueError(
-                "LineSource needs a drive (voltage= or current=) and/or an "
-                "impedance= (impedance alone gives a passive resistor).")
-        if impedance is not None and not impedance > 0:
-            raise ValueError(
-                f"impedance must be a positive resistance in ohms, "
-                f"got {impedance!r}.")
+                "LineSource needs a drive (voltage= or current=) and/or a load "
+                "(resistance=, inductance=, capacitance=; a load alone gives a "
+                "passive lumped element).")
         drive = voltage if voltage is not None else current
         super().__init__(drive if drive is not None else (lambda t: 0.0))
         self.p0 = tuple(p0)
         self.p1 = tuple(p1)
         self.voltage = voltage
         self.current = current
-        self.impedance = impedance
+        self.resistance = resistance
+        self.inductance = inductance
+        self.capacitance = capacitance
+        # The load, as a per-step (Z_eq, V_hist) companion pair; None for an
+        # ideal (unloaded) source, which takes the hard-write / impressed-
+        # current paths in ``inject``. Value validation lives in LumpedNetwork.
+        self._element = (
+            LumpedNetwork(resistance=resistance, inductance=inductance,
+                          capacitance=capacitance, topology=topology)
+            if has_load else None)
+        self.topology = topology
         # Port record (see class docstring).
         self.times: list = []
         self.voltages: list = []
@@ -831,8 +876,8 @@ class LineSource(Source):
     def self_coupling(self, grid: FDTDGrid) -> float:
         """κ in ohms: the port-voltage change per unit injected current per
         step, ``Σ dt·dl²/(ε·dV)`` over the line's edges. The element's
-        effective impedance to the field is ≈ ``impedance + κ/2`` (see class
-        docstring)."""
+        effective impedance to the field is ≈ ``Z_eq + κ/2``, where ``Z_eq`` is
+        the load's companion resistance for the step (see class docstring)."""
         if self._port is None:
             self._port = self._build_port(grid)
         return self._port['kappa']
@@ -858,7 +903,17 @@ class LineSource(Source):
             self._port = self._build_port(grid)
         edges = self._port['edges']
         kappa = self._port['kappa']
-        Z = self.impedance
+        elem = self._element
+        if elem is None:
+            # No R/L/C network: either an ideal source, or a subclass that
+            # bypasses __init__ and presents a fixed series impedance of its
+            # own (a mode's Z₀; None for a pure impressed source).
+            Z, v_hist = self.impedance, 0.0
+        else:
+            # The load, linearised over this step: V_load = −Z·I + V_hist.
+            # Reactive branches hide their memory in V_hist, so the solve below
+            # keeps the plain resistive form (see :mod:`wavesim.lumped`).
+            Z, v_hist = elem.companion(grid.dt)
 
         # Port voltage before injection: V = Σ E·dl (p0 → p1).
         v_before = 0.0
@@ -878,15 +933,29 @@ class LineSource(Source):
             # the previous step (the line edges are untouched between then and
             # this step's curl update), the "new" is v_before + κ·I.
             v_mid = 0.5 * (self._v_prev + v_before)
-            if self.voltage is not None:        # Thevenin
-                i_port = (self.waveform(t) - v_mid) / (Z + 0.5 * kappa)
+            drive = self.waveform(t)
+            if self.voltage is not None:        # Thevenin: load in series
+                i_port = (drive + v_hist - v_mid) / (Z + 0.5 * kappa)
             elif Z is None:                     # ideal current source
-                i_port = self.waveform(t)
-            else:                               # Norton (resistor when Is ≡ 0)
-                i_port = (Z * self.waveform(t) - v_mid) / (Z + 0.5 * kappa)
+                i_port = drive
+            else:                               # Norton: load in parallel
+                i_port = (Z * drive + v_hist - v_mid) / (Z + 0.5 * kappa)
             for comp, (ii, jj, kk, w, coef) in edges.items():
                 getattr(grid, comp)[ii, jj, kk] += coef * i_port
             v_after = v_before + kappa * i_port
+
+            if elem is not None:
+                # Advance the load's integrator with this step's solved sample.
+                # What the *load* sees is not always the port pair: a Norton
+                # drive puts its source current in parallel with the load, a
+                # Thevenin drive its EMF in series with it. The mid-step port
+                # voltage is v_mid + κ·I/2 — i.e. (Vⁿ + Vⁿ⁺¹)/2, the very
+                # quantity the law above was centred on.
+                v_port_mid = v_mid + 0.5 * kappa * i_port
+                if self.voltage is not None:
+                    elem.update(grid.dt, i_port, v_port_mid - drive)
+                else:
+                    elem.update(grid.dt, i_port - drive, v_port_mid)
 
         self._v_prev = v_after
         self.times.append(t)
@@ -1084,7 +1153,7 @@ class _ModalLaunch(LineSource):
         # matched line turns into amplitude·waveform(t) volts forward.
         scale = 1.0 if directional else 2.0
         current = lambda t: amplitude * scale * waveform(t) / z0
-        # Bypass LineSource.__init__ (its p0/p1/impedance validation): this is an
+        # Bypass LineSource.__init__ (its p0/p1/load validation): this is an
         # ideal impressed *current* source (Z=None) on a modal footprint, not a
         # straight line. Mirror the state _build_port / inject need.
         Source.__init__(self, current)
@@ -1663,7 +1732,7 @@ class SpicePort(LineSource):
     ``v_mid`` behind ``κ/2``) and reads the resulting branch current back (see
     :mod:`wavesim.spice`). If the ngspice circuit reduces to a Thévenin
     ``(Vs, Z)`` the injected current matches ``LineSource(voltage=Vs,
-    impedance=Z)`` exactly — the golden equivalence test.
+    resistance=Z)`` exactly — the golden equivalence test.
 
     The port geometry is **either** a straight line (``p0``/``p1``, as in
     :class:`LineSource`) **or** a solved TEM mode (``mode=``, as in
@@ -1706,8 +1775,8 @@ class SpicePort(LineSource):
                  mode=None, directional: bool = True,
                  library_path: str | None = None,
                  sign: float = 1.0, uic: bool = False) -> None:
-        # Bypass LineSource.__init__ (which validates voltage/current/impedance
-        # for the analytic modes); replicate just the state _build_port / inject
+        # Bypass LineSource.__init__ (which validates the analytic modes'
+        # voltage/current/load); replicate just the state _build_port / inject
         # need. The drive is supplied by ngspice, so there is no waveform.
         Source.__init__(self, lambda t: 0.0)
         if mode is None and (p0 is None or p1 is None):

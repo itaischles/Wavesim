@@ -17,8 +17,12 @@ Each FDTD timestep we
    which injects it into Ampère's law.
 
 If the circuit reduces to a Thévenin ``(Vs, Z)`` this returns
-``i = (Vs − v_mid)/(Z + κ/2)`` — identical to the analytic law in
-:class:`~wavesim.sources.LineSource`, which is the golden test for this module.
+``i = (Vs − v_mid)/(Z + κ/2)`` — identical to the analytic law of a resistive
+:class:`~wavesim.sources.LineSource` load. Simple R/L/C terminations do not need
+this module at all: ``LineSource`` solves those itself (see
+:mod:`wavesim.lumped`); ngspice earns its keep on nonlinear or many-component
+circuits. That equivalence, checked against ``LineSource``, is the golden test
+for this module.
 
 Engine
 ------
