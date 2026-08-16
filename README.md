@@ -219,10 +219,11 @@ port = ws.SpicePort(mode=mode, nodes=("port1p", "0"), netlist="driver.net",
 ```
 
 The port reads the modal voltage by an ε-weighted overlap projection (rejecting
-non-modal content), presents `Z₀` to the field (pre-compensated by the discrete
-`κ/2`), and — with `directional=True` (default) — drives the paired H sheet from
-the same port current for a one-way launch. `κ/2` must stay below `Z₀`; a
-low-impedance mode on a coarse transverse grid needs a finer cross-section.
+non-modal content), presents its internal resistance `Z₀` to the field — the
+discrete `κ/2` is a stability term of the semi-implicit solve and is *not*
+pre-compensated for, as a spectral reflection sweep confirms — and, with
+`directional=True` (default), drives the paired H sheet from the same port
+current for a one-way launch.
 
 ---
 

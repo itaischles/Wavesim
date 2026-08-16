@@ -724,16 +724,20 @@ class LineSource(Source):
 
     Two discretisation caveats, both standard for FDTD lumped elements:
 
-    * **Effective impedance.** To the surrounding field the element presents
-      ≈ ``Z + κ/2``, not Z — the κ/2 is the parasitic of the stable implicit
-      averaging (verified here by matched-launch tests on a parallel-plate
-      line). ``self_coupling(grid)`` returns κ so you can pre-compensate
-      (``resistance = R_target − κ/2``, only possible while that stays > 0) or
-      de-embed. A reactive load cannot pre-compensate at all: a lumped L or C
-      comes with that κ/2 in series with it, which on a short line is of order
-      100 Ω per edge and is the practical limit on how ideal a discrete
-      capacitor can be. The recorded V(t)/I(t) are exact regardless, so port
-      extraction is unaffected.
+    * **The cell is bridged, not replaced.** To the surrounding field the element
+      presents exactly ``Z_eq`` — the κ/2 in the solve below is the stability term
+      of the implicit averaging and does *not* appear in the presented impedance
+      (:mod:`tests.test_lumped_element_impedance` measures it spectrally: a 25 Ω
+      resistor reads 25 Ω, not ``R + κ/2`` = 58 Ω). What the element does *not*
+      do is remove its own Yee cell: the cell's gap capacitance
+      ``C_cell = dt/κ = ε·dA/dl`` sits in parallel, as it does with or without the
+      element, so the total across the gap is ``Z_eq ‖ C_cell``. For a component
+      bridging a modelled gap that is the physical answer, since the gap has that
+      capacitance in reality too. For a sub-cell component whose value already
+      accounts for its own body it is not, and the total then moves with the mesh
+      (``C_cell ∝ dA/dl``); refine the port cell transversely to shrink it.
+      The recorded V(t)/I(t) are exact either way, so port extraction is
+      unaffected.
     * **Co-located elements.** Elements sharing line edges inject
       sequentially, not as a jointly solved circuit, so each contributes its
       own κ/2 in series (a 2-element voltage divider on one line settles to
@@ -875,9 +879,14 @@ class LineSource(Source):
 
     def self_coupling(self, grid: FDTDGrid) -> float:
         """κ in ohms: the port-voltage change per unit injected current per
-        step, ``Σ dt·dl²/(ε·dV)`` over the line's edges. The element's
-        effective impedance to the field is ≈ ``Z_eq + κ/2``, where ``Z_eq`` is
-        the load's companion resistance for the step (see class docstring)."""
+        step, ``Σ dt·dl²/(ε·dV)`` over the line's edges.
+
+        Equivalently ``κ = dt/C_cell``: it *is* the port cell's own gap
+        capacitance, in the units the update works in, and ``κ/2 = dt/(2·C_cell)``
+        is that capacitance's trapezoidal companion resistance. It is a stability
+        term of the semi-implicit solve, not a series parasitic — the element
+        presents ``Z_eq`` to the field, with ``C_cell`` in parallel as background
+        (see the class docstring)."""
         if self._port is None:
             self._port = self._build_port(grid)
         return self._port['kappa']

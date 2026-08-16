@@ -22,11 +22,11 @@ Two layers are tested, and they answer different questions:
   grid, for R, L, C and combinations.
 
 What is deliberately *not* asserted here is the impedance the element presents
-to the surrounding field, which carries the documented κ/2 parasitic of the
-implicit averaging (and which the class docstrings of LineSource and TEMPort
-describe differently). That needs a spectral reflection sweep and a decision
-about which description is right; the recorded V(t)/I(t) tested below are exact
-either way.
+to the surrounding field — a different measurement, since the recorded V(t)/I(t)
+tested below are exact whatever the field sees. That one needed a spectral
+reflection sweep and now lives in :mod:`tests.test_lumped_element_impedance`,
+which settles it: the element contributes exactly its companion admittance, with
+no κ/2 in series and no cell capacitance of its own.
 """
 import math
 
