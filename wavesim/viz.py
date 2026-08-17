@@ -700,9 +700,8 @@ def plot_tem_mode(mode, ax=None, n_levels: int = 20, quiver_step: int = None):
     Na, Nb = phi.shape
     a_name, b_name = mode.transverse_axes
 
-    # Transverse node coordinates (true cell boundaries) → correct extents and
-    # cell-center sample positions on a non-uniform mesh. Fall back to a uniform
-    # da/db ruler for legacy modes that carry no node arrays.
+    # Transverse node coordinates → correct extents on a non-uniform mesh. Fall
+    # back to a uniform da/db ruler for legacy modes that carry no node arrays.
     a_nodes = (mode.a_nodes if mode.a_nodes is not None
                else np.arange(Na + 1) * mode.da)
     b_nodes = (mode.b_nodes if mode.b_nodes is not None
@@ -710,9 +709,22 @@ def plot_tem_mode(mode, ax=None, n_levels: int = 20, quiver_step: int = None):
     La, Lb = a_nodes[-1] - a_nodes[0], b_nodes[-1] - b_nodes[0]
     a0, b0 = a_nodes[0], b_nodes[0]
 
-    # Filled potential contours (transpose for origin='lower' imshow/contour).
-    xa = 0.5 * (a_nodes[:-1] + a_nodes[1:])     # cell centres along axis a
-    yb = 0.5 * (b_nodes[:-1] + b_nodes[1:])
+    # Sample positions: φ and the PEC mask are **node**-indexed -- ``phi[i, j]``
+    # is the potential *at* node ``(a_nodes[i], b_nodes[j])``, one primary width
+    # from its neighbour (see ``TEMMode.E``) -- so they are drawn on the nodes,
+    # dropping the last of each, which the (Na, Nb) profiles never represent.
+    # Averaging the nodes into cell centres, as this did, is one constant
+    # half-cell shift on a uniform mesh and so invisible; on a graded mesh the
+    # two rulers are not a rigid shift, and a symmetric cross-section comes out
+    # visibly skewed (a coax pin drawn a whole cell off its own axis, the outer
+    # bore bursting through one corner of the window).
+    #
+    # ``Ea[i]`` lives on the *edge* from node i to i+1, so the quiver below is
+    # half a cell out along its own axis. That is left alone: the arrows are
+    # already strided, and averaging edges onto nodes would smear the exact zero
+    # that marks the metal.
+    xa = a_nodes[:Na]
+    yb = b_nodes[:Nb]
     cf = ax.contourf(xa, yb, phi.T, levels=n_levels, cmap='RdBu_r')
     cbar = plt.colorbar(cf, ax=ax, pad=0.02)
     cbar.set_label('potential φ (V)', fontsize=10)
