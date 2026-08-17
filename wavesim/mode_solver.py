@@ -936,6 +936,19 @@ def solve_tem_modes(grid: FDTDGrid, *,
         ia1 = grid.axis_index(cfg['axes'][0], a1)
         ib0 = grid.axis_index(cfg['axes'][1], b0)
         ib1 = grid.axis_index(cfg['axes'][1], b1)
+        # ``axis_index`` answers in *cells*; these arrays are node-indexed. A rect
+        # covering cells ia0..ia1-1 stands on nodes ia0..ia1, so the slice has to
+        # reach one node further -- ``[ia0:ia1]`` keeps the near edge's node and
+        # drops the far one, which is only invisible while nothing depends on
+        # where the far edge lands. The grounded ring below does: it is laid on
+        # the first and last row of this very sub-rect, so a rect the caller drew
+        # symmetrically about a conductor came out with one wall on the surface
+        # and the opposite wall a node short of it, inside the dielectric. That
+        # is a Dirichlet wall in the wrong place on one side only -- on a coax
+        # port it left φ asymmetric by 6% of full scale between nodes that are
+        # exact mirror images, and put that asymmetry into Z₀.
+        ia1 = min(ia1 + 1, full_shape[0])
+        ib1 = min(ib1 + 1, full_shape[1])
     else:
         ia0, ia1, ib0, ib1 = 0, full_shape[0], 0, full_shape[1]
     sub = np.s_[ia0:ia1, ib0:ib1]
