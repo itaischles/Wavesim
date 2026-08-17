@@ -146,20 +146,20 @@ class SnapshotMonitor:
 #     Ex (i+½, j,   k  )      Hx (i,   j+½, k+½)
 #     Ey (i,   j+½, k  )      Hy (i+½, j,   k+½)
 #     Ez (i,   j,   k+½)      Hz (i+½, j+½, k  )
-# The target is the cell centre (i+½, j+½, k+½). An axis carrying 0.5 is already
-# centred; an axis carrying 0.0 sits on the cell's low node and must be averaged
-# with index+1 to reach the centre. So E components need a 4-point average (their
-# two transverse axes) and H components a 2-point one.
+# This is the one staggering table in the module: the slice collocator below and
+# the path-integral quadrature further down both read it.
+#
+# For the collocator the target is the cell centre (i+½, j+½, k+½). An axis
+# carrying 0.5 is already centred; an axis carrying 0.0 sits on the cell's low
+# node and must be averaged with index+1 to reach the centre. So E components
+# need a 4-point average (their two transverse axes) and H components a 2-point
+# one.
 #
 # Both weights are exactly 0.5 on a non-uniform rectilinear grid: grid.py defines
 # xc[i] = (x[i] + x[i+1]) / 2, so the cell centre is the arithmetic midpoint of
 # the two bounding nodes whatever the local spacing, and linear interpolation to
 # a midpoint is ½/½ regardless of how far apart the samples are. No spacing
 # arrays enter.
-#
-# NOTE: this deliberately does not reuse `_YEE_OFFSETS` further down, which
-# encodes a *different* (transposed) staggering convention — see the comment
-# there.
 _CENTRE_OFFSETS = {
     'Ex': (0.5, 0.0, 0.0), 'Ey': (0.0, 0.5, 0.0), 'Ez': (0.0, 0.0, 0.5),
     'Hx': (0.0, 0.5, 0.5), 'Hy': (0.5, 0.0, 0.5), 'Hz': (0.5, 0.5, 0.0),
@@ -571,44 +571,50 @@ def record_dissipation(monitor: DissipationMonitor,
 # index/weight arrays (a quadrature) and each timestep costs only a few small
 # fancy-indexed dot products.
 
-# Yee stagger offsets in cell units, used by the path-integral monitors.
-#   Ex[i,j,k] at (i, j+1/2, k+1/2) etc.
-#
-# WARNING: this table contradicts the staggering documented in update.py, which
-# puts Ex at (i+1/2, j, k) — the transpose of the offsets below. It is left as-is
-# here because the line-integral monitors and the ports in sources.py share it
-# and were validated against each other with it; changing it shifts every port
-# and probe by half a cell and must be done (and re-validated) as its own change.
-# `_CENTRE_OFFSETS` above follows update.py and is the correct one.
-_YEE_OFFSETS = {
-    'Ex': (0.0, 0.5, 0.5), 'Ey': (0.5, 0.0, 0.5), 'Ez': (0.5, 0.5, 0.0),
-    'Hx': (0.5, 0.0, 0.0), 'Hy': (0.0, 0.5, 0.0), 'Hz': (0.0, 0.0, 0.5),
-}
+def _bin_bounds(grid: FDTDGrid, axis: str, off: float) -> np.ndarray:
+    """Coordinates at which a component's index along ``axis`` steps by one.
+
+    ``off`` is the component's half-cell offset on this axis (from
+    :data:`_CENTRE_OFFSETS`), and the two cases are *not* the same partition:
+
+    * ``off == 0.0`` — the component sits **on the node** ``grid.x[i]`` and is a
+      point sample there (an E component's two transverse axes, an H
+      component's own axis). It owns the territory nearest its node, so the
+      bounds are the midpoints between nodes — the cell centres.
+    * ``off == 0.5`` — the component sits at the cell centre because it *spans
+      the whole primary cell* ``[x[i], x[i+1]]``: an E component along its own
+      axis is the edge across that cell, an H component's transverse axes are
+      the sides of its face. It owns exactly that cell, so the bounds are the
+      interior nodes.
+
+    On a uniform grid the two coincide numerically for the second case — the
+    midpoint between adjacent cell centres *is* the node between them — which is
+    why "nearest centre" served for both before. On a graded mesh they part
+    company by ``(dp[i+1] − dp[i])/4``, and using the wrong one chops a slice
+    off one edge's quadrature weight and hands it to its neighbour.
+    """
+    N = {'x': grid.Nx, 'y': grid.Ny, 'z': grid.Nz}[axis]
+    nodes = grid._coords(axis)                           # x[0..N], length N+1
+    if N == 1:
+        return nodes[:0]                                 # single bin, no bounds
+    if off == 0.0:
+        return 0.5 * (nodes[:N - 1] + nodes[1:N])
+    return nodes[1:N]
 
 
 def _yee_index(grid: FDTDGrid, axis: str, off: float, coords) -> np.ndarray:
-    """Nearest staggered-Yee index along ``axis`` for physical ``coords`` (metres).
+    """Staggered-Yee index along ``axis`` for physical ``coords`` (metres).
 
-    ``off`` is the component's half-cell offset on this axis (from
-    :data:`_YEE_OFFSETS`): ``0.0`` places it on the integer node (coordinate
-    ``grid.x[i]``), ``0.5`` on the cell centre (``grid.xc[i]``). We snap to the
-    nearest actual Yee location, so a non-uniform (rectilinear) grid works — the
-    old ``round(coord/ds - off)`` assumed uniform spacing.
-
-    On a uniform grid this reproduces that rounding for every non-tie position
-    (both reduce to round-half-up); exact half-way ties may pick the neighbour
-    the old even-rounding would not, which is physically inconsequential.
+    A ``searchsorted`` into :func:`_bin_bounds`, clamped to the axis. Positions
+    outside the grid fold onto the first/last index rather than raising, as the
+    monitors have always allowed (a path may end just inside PEC at the edge of
+    the domain).
     """
     N = {'x': grid.Nx, 'y': grid.Ny, 'z': grid.Nz}[axis]
     coords = np.asarray(coords, dtype=np.float64)
     if N == 1:
         return np.zeros(coords.shape, dtype=np.intp)
-    if off == 0.0:
-        locs = grid._coords(axis)[:N]                    # integer-node coords x[0..N-1]
-    else:
-        locs = {'x': grid.xc, 'y': grid.yc, 'z': grid.zc}[axis]   # cell centres
-    bounds = 0.5 * (locs[:-1] + locs[1:])                # midpoints between Yee locs
-    idx = np.searchsorted(bounds, coords, side='right')
+    idx = np.searchsorted(_bin_bounds(grid, axis, off), coords, side='right')
     return np.clip(idx, 0, N - 1).astype(np.intp)
 
 
@@ -677,6 +683,23 @@ def circular_path(cx: float, cy: float, cz: float, radius: float,
     return np.vstack([pts, pts[0]])                  # explicitly closed
 
 
+def _bin_crossings(grid: FDTDGrid, off: tuple, p0, seg) -> np.ndarray:
+    """Parameters ``t`` in [0, 1] where ``p0 + t·seg`` changes Yee index.
+
+    Sorted and always bracketed by 0 and 1, so consecutive pairs enclose runs of
+    the segment over which the index triple is constant. A component's index can
+    step on any of the three axes, so all three sets of boundaries
+    (:func:`_bin_bounds` at that axis' offset) are solved and merged.
+    """
+    ts = [np.array([0.0, 1.0])]
+    for b, b_axis in enumerate('xyz'):
+        if seg[b] == 0.0:                     # never crosses a bound on this axis
+            continue
+        t = (_bin_bounds(grid, b_axis, off[b]) - p0[b]) / seg[b]
+        ts.append(t[(t > 0.0) & (t < 1.0)])
+    return np.unique(np.concatenate(ts))
+
+
 def _build_path_quadrature(path, grid: FDTDGrid, field_name: str,
                            close: bool) -> dict:
     """
@@ -684,15 +707,30 @@ def _build_path_quadrature(path, grid: FDTDGrid, field_name: str,
 
     Returns {component: (ii, jj, kk, w)} such that
         ∫ F·dl  ≈  Σ_comp  Σ_m  F_comp[ii_m, jj_m, kk_m] * w_m
-    with F the E or H field (``field_name`` 'E' or 'H'). Each straight segment
-    is split into sub-steps no longer than half the smallest cell size; every
-    sub-step contributes its vector length, split per axis, at the staggered
-    Yee location of that axis' component nearest the sub-step midpoint.
+    with F the E or H field (``field_name`` 'E' or 'H'). Each straight segment is
+    **clipped exactly** against the bin boundaries of :func:`_bin_bounds`: the
+    parameters at which the segment crosses any component's index boundary are
+    solved for directly, and between two consecutive crossings the index triple
+    is constant, so that run contributes its exact vector length, split per axis.
 
-    Index snapping goes through :func:`_yee_index` (a coordinate lookup), so the
-    quadrature is correct on a non-uniform (rectilinear) grid; ``w`` is already a
-    true physical length and needs no change. Ports (``sources.py``) reuse this
-    so a LineSource and a monitor on the same path agree on ∫E·dl.
+    Exactness is the point. This used to sample the segment at the midpoints of
+    uniform sub-steps half a minimum-cell long, which quantises each edge's
+    weight to a multiple of that sub-step. A uniform grid hides it — every edge
+    is a whole number of sub-steps — but on a graded mesh a wide edge's weight
+    lands up to half a sub-step off its true overlap, so the weights along one
+    path stop being proportional to the edge lengths. The lumped ports in
+    ``sources.py`` inject in proportion to ``w`` and that proportionality is
+    exactly what makes the injected current divergence-free along the line, so
+    the quantisation showed up there as an element depositing charge on its own
+    interior nodes instead of driving the current out of its terminals. Clipping
+    gives a node-to-node path one full edge length on each edge it crosses and
+    nothing on any other, to round-off.
+
+    Index lookup goes through :func:`_yee_index` against :data:`_CENTRE_OFFSETS`
+    (the update.py staggering), so the quadrature is correct on a non-uniform
+    (rectilinear) grid; ``w`` is already a true physical length and needs no
+    change. Ports reuse this, so a LineSource and a monitor on the same path
+    agree on ∫E·dl.
     """
     pts = np.asarray(path, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 2:
@@ -703,9 +741,6 @@ def _build_path_quadrature(path, grid: FDTDGrid, field_name: str,
         pts = np.vstack([pts, pts[0]])
 
     shape = (grid.Nx, grid.Ny, grid.Nz)
-    # grid.dx/dy/dz hold the MINIMUM width per axis on a non-uniform grid, so
-    # this sub-step is <= half the smallest cell anywhere (fine everywhere).
-    max_step = 0.5 * min(grid.dx, grid.dy, grid.dz)
 
     # Accumulate flat-index -> weight per component (duplicates summed).
     flat_idx = {c: [] for c in 'xyz'}
@@ -713,28 +748,21 @@ def _build_path_quadrature(path, grid: FDTDGrid, field_name: str,
 
     for p0, p1 in zip(pts[:-1], pts[1:]):
         seg = p1 - p0
-        length = np.linalg.norm(seg)
-        if length == 0.0:
+        if not np.any(seg):
             continue
-        # Guard the ceil against floating-point dust: when a segment length is an
-        # exact multiple of max_step the count must not tip to one extra sub-step.
-        # On a rectilinear grid ``grid.dx`` (hence max_step) carries the rounding
-        # of ``np.diff``, so an unguarded ceil would add a spurious sub-step and
-        # alias the per-edge weights (a line lying on cell edges bins unevenly).
-        n_sub = max(1, int(np.ceil(length / max_step * (1.0 - 1e-9))))
-        dl = seg / n_sub                              # vector step (m)
-        t_mid = (np.arange(n_sub) + 0.5) / n_sub
-        mids = p0 + t_mid[:, None] * seg              # (n_sub, 3) midpoints
 
         for a, axis in enumerate('xyz'):
-            if dl[a] == 0.0:
+            if seg[a] == 0.0:
                 continue
             comp = field_name + axis
-            off = _YEE_OFFSETS[comp]
+            off = _CENTRE_OFFSETS[comp]
+            # Parameters where this component's index changes, plus the ends.
+            t = _bin_crossings(grid, off, p0, seg)
+            mids = p0 + (0.5 * (t[:-1] + t[1:]))[:, None] * seg
             idx = [_yee_index(grid, b_axis, off[b], mids[:, b])
                    for b, b_axis in enumerate('xyz')]
             flat_idx[axis].append(np.ravel_multi_index(idx, shape))
-            weights[axis].append(np.full(n_sub, dl[a]))
+            weights[axis].append(seg[a] * np.diff(t))
 
     quad = {}
     for axis in 'xyz':

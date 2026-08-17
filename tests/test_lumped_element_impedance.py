@@ -61,12 +61,13 @@ DZ = 4.0e-3                     # the plate width; sets Z0 with the gap
 NY = 9
 J0, J1 = 2, 7                   # gap cells in y; the plates are the rest
 GAP = (J1 - J0) * DY
-# The path quadrature bins an edge by its *nearest* sample point, so endpoints
-# half a cell inside the gap select exactly the five gap edges at full weight —
-# no PEC edge in the path. Including one would both inflate kappa and let the
-# injection charge an edge the PEC mask clears next step, which reads back as a
-# spurious series capacitance at the port (~100 fF here).
-YLO, YHI = (J0 - 0.5) * DY, (J1 - 0.5) * DY
+# The path quadrature bins an E edge by the cell *containing* the sample, so a
+# path running plate face to plate face — both of them node coordinates — picks
+# up exactly the five gap edges at full weight and no PEC edge. Including one
+# would both inflate kappa and let the injection charge an edge the PEC mask
+# clears next step, which reads back as a spurious series capacitance at the
+# port (~100 fF here); the calibration guard below is what catches that.
+YLO, YHI = J0 * DY, J1 * DY
 NX, I_SRC, I_PORT, D_PML = 130, 25, 100, 12
 NSTEPS = 2500
 F_PK = 12e9                     # spectral peak of the (DC-free) drive
