@@ -744,9 +744,22 @@ class LineSource(Source):
       ``Vs·Z_L/(Z + Z_L + κ)``). Use one element with a ``topology=`` network
       instead — those branches *are* solved jointly.
 
-    The line typically spans the gap between two conductors; endpoints may sit
-    just inside PEC (as with the monitors), but keep the driven gap itself in
-    dielectric — E on PEC edges is zeroed every step.
+    The line typically spans the gap between two conductors. **Put the endpoints
+    on the conductor surfaces**, which are node coordinates: the quadrature bins
+    an E edge by the cell containing it, so a surface-to-surface path picks up
+    exactly the gap edges, each at its full length, and no PEC edge. Unlike a
+    VoltageMonitor — for which an endpoint pushed inside the metal is harmless,
+    since E on a PEC edge reads zero — a source must not overhang, because it
+    would inject onto an edge the PEC mask clears again next step. That charge
+    never reaches the circuit and reads back at the port as a spurious series
+    capacitance.
+
+    On a graded mesh a surface-to-surface line also makes the injected current
+    divergence-free: every edge gets the same coefficient, so the element
+    deposits charge only at its two terminals rather than on the nodes in
+    between (see ``tests/test_lumped_nonuniform.py``). A line whose endpoints
+    fall mid-edge is still solved, but that end edge carries a fraction of the
+    current and the adjacent node picks up the difference.
 
     Parameters
     ----------
@@ -854,23 +867,41 @@ class LineSource(Source):
         change per unit current, and ``wsq = Σ w²`` normalises the hard
         (ideal-voltage) write ``E_a = Vs·w_a/wsq``.
 
-        ``dV`` is the **local Yee cell volume at each edge** — the product of the
-        primary cell widths at that index (``dxp[i]·dyp[j]·dzp[k]``), matching the
-        all-primary divisors of :func:`wavesim.update.update_E`. On a uniform grid
-        this is the constant ``dx*dy*dz``; on a rectilinear grid it varies per
-        edge, so κ and the injection stay physically correct. ``wsq`` is purely
-        geometric (physical lengths) and is unchanged.
+        ``dV`` is the **dual-cell volume at each edge** — the volume
+        :func:`wavesim.update.update_E` integrates Ampere's law over there. That
+        is the edge's own length (a *primary* width, ``dxp[i]`` for an Ex edge)
+        times its Ampere face, whose two transverse sides are *dual* widths
+        centred on the edge's nodes (:meth:`~wavesim.grid.FDTDGrid.node_dual_widths`)
+        — the very divisors update_E applies to the H differences. Writing all
+        three as primary widths, as this did, is the same number on a uniform grid
+        and half a cell out of step on a graded one: the injected E then implies a
+        current ``I·(A_dual/A_primary)`` through the edge rather than ``I``, so the
+        element delivers the wrong current to the circuit and κ misstates the port
+        cell's gap capacitance by the same factor. ``wsq`` is purely geometric
+        (physical lengths) and is unchanged.
+
+        Because ``coef`` works out to ``dt·(w/edge length)/(ε·A_dual)``, a path
+        running node-to-node gets the *same* coefficient on every edge it
+        crosses whatever the local grading — the injected current is
+        divergence-free along the line, depositing charge only at the two
+        terminals. That is what lets an element span uneven edges cleanly.
         """
         quad = _build_path_quadrature([self.p0, self.p1], grid, 'E', close=False)
         # The ε the E update will actually divide by, which on a conformal grid
         # is not the stored array (:func:`wavesim.pec.conformal_edge_eps`); κ is
         # this source's model *of* that update and has to track it.
         eps_of = dict(zip(('Ex', 'Ey', 'Ez'), conformal_edge_eps(grid)))
+        # Per-axis widths for the dual-cell volume: primary along an edge's own
+        # axis, node-centred dual across it. Built once, indexed per component.
+        prim = {'x': grid.dxp, 'y': grid.dyp, 'z': grid.dzp}
+        dual = {ax: grid.node_dual_widths(ax) for ax in 'xyz'}
         edges = {}
         kappa = 0.0
         wsq = 0.0
         for comp, (ii, jj, kk, w) in quad.items():
-            dV = grid.dxp[ii] * grid.dyp[jj] * grid.dzp[kk]   # per-edge local volume
+            a = comp[1]                                       # 'x' / 'y' / 'z'
+            wid = {ax: (prim if ax == a else dual)[ax] for ax in 'xyz'}
+            dV = wid['x'][ii] * wid['y'][jj] * wid['z'][kk]    # per-edge dual volume
             coef = grid.dt * w / (EPS0 * eps_of[comp][ii, jj, kk] * dV)
             edges[comp] = (ii, jj, kk, w, coef)
             kappa += float(np.dot(w, coef))

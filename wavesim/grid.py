@@ -114,8 +114,9 @@ class FDTDGrid:
     # Per-axis spacing arrays (metres), length N per axis. Broadcast-ready for
     # the hot loops (NumPy oracle indexes with [None,:,None]; the Numba kernel
     # indexes by loop counter).
-    #   dxp/dyp/dzp : primary widths  — denominators for update_E
-    #   dxd/dyd/dzd : dual widths      — denominators for update_H
+    #   dxp/dyp/dzp : primary widths  — denominators for update_H
+    #   dxd/dyd/dzd : dual widths      — denominators for update_E
+    # (as the module docstring derives; these two labels were swapped here.)
     # ------------------------------------------------------------------ #
     dxp: np.ndarray
     dyp: np.ndarray
@@ -301,6 +302,37 @@ class FDTDGrid:
         return (self.dxd[:, None, None]
                 * self.dyd[None, :, None]
                 * self.dzd[None, None, :])
+
+    def node_dual_widths(self, axis: str) -> np.ndarray:
+        """Dual-cell width centred on each **node** of ``axis`` (length N).
+
+        ``dxd`` is indexed from the low cell centre — ``dxd[i] = xc[i+1] − xc[i]``
+        — so the dual cell straddling node ``n`` is ``dxd[n-1]``, not ``dxd[n]``.
+        This returns that re-indexing, which is exactly the divisor ``update_E``
+        applies to the H difference landing on node ``n`` (see the ``dd[:-1]``
+        broadcast there). Anything that has to reason about a *dual* quantity at
+        an E edge — the Ampere face area a lumped port injects through, a discrete
+        Gauss-law flux — wants this array and not ``dxd``; using ``dxp`` instead
+        is the same value on a uniform grid and half a cell out of step on a
+        graded one.
+
+        Two edge indices have no interior dual cell:
+
+        * ``n = 0`` gets the boundary-truncated half width ``dp[0]/2``. Those
+          edges are frozen — ``update_E`` never writes them — so the value only
+          has to be geometrically honest, never consistent with an update.
+        * a degenerate axis (``N == 1``, the thin axis of a 2D-in-3D run) gets
+          the full cell width: the run is invariant along it, so the whole
+          thickness is the dual extent.
+        """
+        dp = {'x': self.dxp, 'y': self.dyp, 'z': self.dzp}[axis]
+        dd = {'x': self.dxd, 'y': self.dyd, 'z': self.dzd}[axis]
+        if dp.size == 1:
+            return dp.copy()
+        out = np.empty_like(dd)
+        out[1:] = dd[:-1]           # update_E's own divisor at node n
+        out[0] = 0.5 * dp[0]        # truncated half cell at the low boundary
+        return out
 
 
 def _nearest_index(coords: np.ndarray, pos: float) -> int:
