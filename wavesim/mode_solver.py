@@ -598,6 +598,19 @@ class TEMMode:
         ``docs/mode_solver_staircase_node_mask.md``). An inhomogeneous
         cross-section still has a genuine residue.
 
+        ``dA`` is what makes the two readings the *same* integral, and it is an
+        edge's area, not a cell's: the **primary** width along the edge's own
+        axis times the node-centred **dual** width across it, the pairing
+        :func:`_face_coefs` weights the energy by and therefore the one ``C``
+        (hence ``Z₀``) is built from. Two primary widths — which this used — is
+        the same number on a uniform grid and leaves ``G`` too large by
+        ``2r/(1+r)`` per cell on a mesh graded by ``r``, so ``s`` drifts off 1
+        by that ratio with no inhomogeneity anywhere to justify it: 2.4% at
+        r = 1.05, 4.5% at r = 1.10, measured identical on both paths. That is
+        the same failure the paragraph above describes, arrived at down a
+        different road, and the homogeneous ``s = 1`` invariant is what catches
+        it (``tests/test_tem_port_nonuniform.py``).
+
         Requires the mode's ``impedance`` (solve with ``compute_params=True``).
         """
         if self.impedance is None or not self.impedance > 0:
@@ -607,15 +620,22 @@ class TEMMode:
         cfg = _NORMAL_CFG[self.normal]
         E_stag, _H = self._staggered_port_fields(grid)
         k = self.slice_index
-        # Transverse per-cell primary widths → cell area dA on the plane. Under
-        # conformal PEC each component's area is scaled by its own edge's open
-        # fraction, so ``G`` integrates over the open cross-section — the same
-        # open-area weighting the mode's Z₀ comes from, which is what lets the
-        # two discretisation errors keep cancelling in ``s = 1/(Z₀·G)``.
+        # Per-EDGE area dA on the plane: primary along the edge's own axis, dual
+        # across it — the pairing ``_face_coefs`` weights the energy by, so this
+        # integral and the ``C`` behind Z₀ are the same one. Under conformal PEC
+        # each component's area is scaled by its own edge's open fraction, so
+        # ``G`` integrates over the open cross-section — the same open-area
+        # weighting the mode's Z₀ comes from, which is what lets the two
+        # discretisation errors keep cancelling in ``s = 1/(Z₀·G)``.
         prim = {'x': grid.dxp, 'y': grid.dyp, 'z': grid.dzp}
-        wa = prim[cfg['axes'][0]]
-        wb = prim[cfg['axes'][1]]
-        dA = wa[:, None] * wb[None, :]
+        dual = {ax: grid.node_dual_widths(ax) for ax in 'xyz'}
+        ax_a, ax_b = cfg['axes']
+        dA_of = {}
+        for comp in cfg['E']:
+            own = comp[1]
+            wa = (prim if own == ax_a else dual)[ax_a]
+            wb = (prim if own == ax_b else dual)[ax_b]
+            dA_of[comp] = wa[:, None] * wb[None, :]
         f_open = dict(zip(cfg['E'],
                           _plane_open_fractions(grid, cfg, self.normal, k)))
         mu_a = _slice(getattr(grid, cfg['mu']), self.normal, k)
@@ -623,6 +643,7 @@ class TEMMode:
         eps_of = _eps_by_component(grid)
         for comp in cfg['E']:
             ehat = E_stag[comp]
+            dA = dA_of[comp]
             dA_c = dA if f_open[comp] is None else dA * f_open[comp]
             a, b = np.nonzero(ehat)
             if a.size == 0:

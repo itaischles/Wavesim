@@ -272,6 +272,29 @@ def test_kappa_is_dt_over_the_capacitance_the_mode_solver_reports(ratio,
     assert kappa == pytest.approx(grid.dt / slab, rel=1e-12)
 
 
+@pytest.mark.parametrize("conformal", [False, True])
+@pytest.mark.parametrize("ratio", [1.0, 1.02, 1.05, 1.10])
+def test_the_absorber_scale_stays_one_however_the_mesh_is_graded(ratio,
+                                                                conformal):
+    """``numerical_admittance_scale`` is 1 for a homogeneous fill, always.
+
+    ``s = 1/(Z₀·G)`` is built to cancel: for a homogeneous cross-section ``Z₀``
+    and ``G`` are two readings of one energy integral, so ``s`` departs from 1
+    only through genuine inhomogeneity — there is none here at any ratio. It
+    only cancels if both readings weight an edge by ``A_dual·L_prim``; ``G``
+    used two primary widths, which made ``s`` track the *mesh* instead, drifting
+    2.4% at r = 1.05 and 4.5% at r = 1.10 with nothing physical behind it.
+
+    An absorber scaled by that number under-terminates by the same factor, and
+    it would read as a discretisation floor — which is exactly the mistake the
+    method's own docstring records having made once before.
+    """
+    grid = _coax(ratio, conformal)
+    mode = solve_tem_modes(grid, normal='z', position=grid.z[3],
+                           compute_params=True)[0]
+    assert mode.numerical_admittance_scale(grid) == pytest.approx(1.0, abs=1e-7)
+
+
 def test_a_uniform_grid_is_the_port_it_always_was():
     """The correction is a primary-vs-dual difference, so it must vanish exactly
     where the two coincide — bit for bit, not to a tolerance."""
