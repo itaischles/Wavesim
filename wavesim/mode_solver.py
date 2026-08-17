@@ -653,12 +653,35 @@ class TEMMode:
         * **current injection** ``E += κ·Ê·I`` — launches the mode shape;
         * **modal self-coupling** ``κ = dt / (ε₀·Σ_c dV_c·ε_r·Ê_c²)`` — ohms, the
           change in ``V*`` per unit injected current per step. ``dV_c`` is the
-          **local Yee cell volume** at cell ``c`` (the product of the primary
-          widths ``dxp·dyp·dzp`` there, matching the all-primary divisors of
-          :func:`wavesim.update.update_E`, exactly as ``LineSource._build_port``
-          does). On a uniform grid ``dV_c`` is the constant ``dx·dy·dz`` and this
-          reduces to the old ``κ = dt/(ε₀·dV·S)``; on a rectilinear mesh each
-          cell carries its own volume so κ tracks the local spacing.
+          **dual-cell volume** at edge ``c``: the edge's own length (a *primary*
+          width) times its Ampere face, whose two transverse sides are the
+          node-centred *dual* widths
+          (:meth:`~wavesim.grid.FDTDGrid.node_dual_widths`) — the very divisors
+          :func:`wavesim.update.update_E` applies to the H differences, and the
+          same pairing :func:`_face_coefs` builds φ with. On a uniform grid
+          ``dV_c`` is the constant ``dx·dy·dz`` and this reduces to the old
+          ``κ = dt/(ε₀·dV·S)``; on a rectilinear mesh each edge carries its own
+          volume so κ tracks the local spacing.
+
+          Writing all three as primary widths, as this did, is the same number
+          on a uniform grid and half a cell out of step on a graded one. What it
+          costs is not a second-order slip: ``Sv`` is the port's terminal
+          capacitance ``C/ε₀`` only through the summation by parts
+          ``Σ dV·ε_r·Ê² = Σ (ε_r Ê·A_dual)·(Ê·L_prim) = Q_signal`` — which needs
+          ``dV`` to *factorise* into the update's own Ampere face times the edge
+          length, and which the mode's transverse divergence-freedom then
+          collapses onto the conductors. Break the factorisation and the sum
+          stops being a charge: the port deposits ``I·(Sv_dual/Sv_primary)`` on
+          the signal conductor while reporting ``I`` to the circuit. Measured on
+          a coax graded 1.05 per cell on every axis, that is 4.7% of the current
+          simply missing; 7.7% at 1.06-1.10. That the energy weight and the
+          injection divisor want the *same* volume is the identity above, not an
+          analogy with :meth:`~wavesim.sources.LineSource._build_port`.
+
+          ``f_open`` (cut cells) passes straight through this: the conformal
+          operator scales only the centre distance down to the open edge length
+          and leaves the dual face area full, so the volume it wants is
+          ``f·L_prim·A_dual`` — the same ``f`` scaling of the same dual volume.
 
         The returned dict mirrors ``LineSource._build_port`` (``edges``/``kappa``)
         so the existing time-centred (Piket-May) injection runs unchanged. When
@@ -712,8 +735,13 @@ class TEMMode:
 
         # Gather nonzero plane cells per E component. ``S = Σ ε_r Ê²`` normalises
         # the read-back projection (dimensionless, so V*=1 for the pure mode);
-        # ``Sv = Σ dV_c ε_r Ê²`` volume-weights the energy for κ (per-cell local
-        # Yee volume, all-primary as in update_E). On a uniform grid Sv = dV·S.
+        # ``Sv = Σ dV_c ε_r Ê²`` volume-weights the energy for κ. ``dV_c`` is the
+        # per-edge DUAL volume update_E integrates Ampere's law over — primary
+        # along the edge's own axis, node-centred dual across it — which is what
+        # makes Sv the port's terminal charge and not merely an energy. On a
+        # uniform grid Sv = dV·S.
+        prim = {'x': grid.dxp, 'y': grid.dyp, 'z': grid.dzp}
+        dual = {ax: grid.node_dual_widths(ax) for ax in 'xyz'}
         gathered = {}
         S = 0.0
         Sv = 0.0
@@ -727,7 +755,9 @@ class TEMMode:
             ii, jj, kk = _plane_to_grid(self.normal, k, a, b)
             Ehat = Ehat2d[a, b]
             epsr = eps_of[comp][ii, jj, kk]
-            dV_c = grid.dxp[ii] * grid.dyp[jj] * grid.dzp[kk]
+            own = comp[1]                                  # 'x' / 'y' / 'z'
+            wid = {ax: (prim if ax == own else dual)[ax] for ax in 'xyz'}
+            dV_c = wid['x'][ii] * wid['y'][jj] * wid['z'][kk]
             if f_open[comp] is not None:   # cut cells store energy only where open
                 dV_c = dV_c * f_open[comp][a, b]
             gathered[comp] = (ii, jj, kk, Ehat, epsr)
