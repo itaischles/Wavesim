@@ -70,6 +70,9 @@ from wavesim.monitors import (
     record_field, record_snapshot, record_poynting, record_energy,
     record_dissipation, record_voltage, record_current,
 )
+from wavesim.spectrum import (
+    Spectrum, spectrum, transfer_function, impedance, admittance,
+)
 from wavesim.update import update_H, update_E
 from wavesim.simulation import Simulation
 from wavesim.mode_solver import TEMMode, solve_tem_modes
@@ -144,6 +147,8 @@ __all__ = [
     "DissipationMonitor", "VoltageMonitor", "CurrentMonitor", "circular_path",
     "record_field", "record_snapshot", "record_poynting", "record_energy",
     "record_dissipation", "record_voltage", "record_current",
+    # spectra / network quantities
+    "Spectrum", "spectrum", "transfer_function", "impedance", "admittance",
     # update
     "update_H", "update_E",
     # simulation
