@@ -262,6 +262,28 @@ def test_out_of_band_bins_are_masked_not_garbage():
     assert np.nanmax(np.abs(Z.values)) < 2 * R
 
 
+def test_masked_bins_are_nan_in_both_parts():
+    # ``np.nan + 0j`` is complex(nan, 0.0) — a masked bin written that way keeps
+    # a perfectly good zero imaginary part, and an out-of-band reactance then
+    # draws as X = 0, which reads as a resonance instead of as no data.
+    t, v, i, R, C = _rc_series()
+    Z = impedance(_FakePort(t, v, i))
+    out = Z.freqs > 40e9
+    assert np.all(np.isnan(Z.values[out].real))
+    assert np.all(np.isnan(Z.values[out].imag))
+    assert np.all(np.isnan(Z.real[out])) and np.all(np.isnan(Z.imag[out]))
+
+
+def test_series_are_labelled_by_quantity_not_by_unit():
+    # 'I', not 'A': the label names the quantity and rides into plot legends.
+    t, v, i, R, C = _rc_series()
+    port = _FakePort(t, v, i)
+    assert (spectrum(port, 'V').label, spectrum(port, 'V').unit) == ('V', 'V')
+    assert (spectrum(port, 'I').label, spectrum(port, 'I').unit) == ('I', 'A')
+    assert spectrum(CurrentMonitor(t, i)).label == 'I'
+    assert spectrum(port, 'I', label='port 2').label == 'port 2'
+
+
 def test_floor_controls_how_much_band_survives():
     t, v, i, R, C = _rc_series()
     wide = impedance(_FakePort(t, v, i), floor=1e-8)

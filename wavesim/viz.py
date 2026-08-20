@@ -17,6 +17,11 @@ FIELD DIAGNOSTICS (2D / single slice):
     plot_voltage_current() — VoltageMonitor / CurrentMonitor time series
     plot_energy()          — total energy vs time (log scale)
 
+SPECTRA AND NETWORK QUANTITIES (see :mod:`wavesim.spectrum`):
+    plot_spectrum()        — |V(f)|, |I(f)| magnitudes + the usable band
+    plot_bode()            — |Z| and phase, two stacked panels
+    plot_impedance_parts() — R and X (or G and B) on linear axes
+
 FIELD DIAGNOSTICS (full 3D):
     plot_field_slices_3d()    — orthogonal XY/XZ/YZ slice triptych
     animate_field_slices_3d() — multi-plane time animation (general)
@@ -664,6 +669,356 @@ def plot_voltage_current(monitors, ax=None):
     ax.set_title('Voltage / Current Monitors')
     ax.legend(lines, [l.get_label() for l in lines], fontsize=9)
     ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig, ax
+
+
+# ======================================================================= #
+# SPECTRA AND NETWORK QUANTITIES
+# ======================================================================= #
+
+def _freq_axis(freqs):
+    """``(label, scale)`` in whichever SI prefix reads cleanest.
+
+    Time axes elsewhere in this module are hardcoded to nanoseconds, which is
+    right for a run of a few thousand FDTD steps. Frequency is not so
+    obliging — the same package is used on structures whose interesting band is
+    megahertz and on ones where it is hundreds of gigahertz — so the prefix is
+    chosen from the data.
+    """
+    top = float(np.nanmax(freqs)) if len(freqs) else 0.0
+    for scale, name in ((1e12, 'THz'), (1e9, 'GHz'), (1e6, 'MHz'), (1e3, 'kHz')):
+        if top >= scale:
+            return f'Frequency ({name})', scale
+    return 'Frequency (Hz)', 1.0
+
+
+def _as_spectra(items, quantity=None):
+    """Coerce one item, or a list of them, to a list of Spectrum objects.
+
+    Anything :func:`~wavesim.spectrum.spectrum` accepts is transformed here, so
+    a caller can hand these plots a monitor and never mention the transform.
+    A ``(data, 'V')`` pair names the quantity for a port that records both.
+    """
+    from wavesim.spectrum import Spectrum, spectrum
+
+    def is_pair(x):
+        return isinstance(x, tuple) and len(x) == 2 and isinstance(x[1], str)
+
+    if isinstance(items, Spectrum) or is_pair(items):
+        items = [items]
+    elif not isinstance(items, (list, tuple)):
+        items = [items]
+    return [it if isinstance(it, Spectrum)
+            else spectrum(*it) if is_pair(it)
+            else spectrum(it, quantity)
+            for it in items]
+
+
+def _apply_fmax(ax, spectra, fmax, floor, scale):
+    """Set the x-limit (in scaled units) to the usable band, unless pinned.
+
+    An rfft axis runs to Nyquist, which for an FDTD record is hundreds of GHz —
+    typically far past anything the excitation illuminated. Left alone, every
+    one of these plots would be a spike in the leftmost pixel column, so the
+    default view is the band the data actually supports.
+    """
+    from wavesim.spectrum import usable_band
+
+    # DC is a legitimate left edge on a linear axis and impossible on a log one,
+    # where the first positive bin has to stand in for it.
+    positive = spectra[0].freqs[spectra[0].freqs > 0]
+    left = (positive.min() / scale if ax.get_xscale() == 'log' and positive.size
+            else 0.0)
+    if fmax is not None:
+        ax.set_xlim(left, fmax / scale)
+        return
+    _lo, hi = usable_band(*spectra, floor=floor)
+    if np.isfinite(hi) and hi > 0:
+        ax.set_xlim(left, 1.05 * hi / scale)
+
+
+#: Decades (as dB) of :func:`plot_spectrum`'s default y-range below each peak.
+#: Deep enough to show a notch, shallow enough to keep the numerical floor and
+#: its noise off the picture. Override by setting ``ax.set_ylim`` afterwards.
+_SPECTRUM_RANGE_DB = 100.0
+
+
+def _shade_band(ax, spectra, floor, scale):
+    """Shade the frequencies where every spectrum clears ``floor``."""
+    from wavesim.spectrum import usable_band
+
+    lo, hi = usable_band(*spectra, floor=floor)
+    if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+        return None
+    return ax.axvspan(lo / scale, hi / scale, color='0.5', alpha=0.12, zorder=0,
+                      label=f'usable band {lo / scale:.3g}–{hi / scale:.3g}')
+
+
+def plot_spectrum(spectra, quantity=None, ax=None, fmax: float = None,
+                  db: bool = False, floor: float = 1e-3, shade: bool = True):
+    """
+    Magnitude spectra of recorded quantities — |V(f)|, |I(f)|, a probe, …
+
+    The companion to :func:`plot_voltage_current`: the same records, seen in
+    frequency. Voltage-like and current-like spectra go on separate y-axes, as
+    in the time-domain plot, so a port's V and I overlay on one frequency axis
+    without either being squashed flat.
+
+    The shaded span is the *usable band* — where every curve stands at least
+    ``floor`` times its own peak. Outside it the excitation put no energy, and
+    any Z, Y or H computed there would be the quotient of two round-off
+    numbers, which is why :func:`plot_bode` leaves those bins blank. Reading
+    this plot first is how you find out whether the drive actually covered the
+    band you care about.
+
+    Parameters
+    ----------
+    spectra : Spectrum | monitor | port | (port, 'V') | list of them
+        Anything :func:`~wavesim.spectrum.spectrum` accepts is transformed on
+        the way in; a port records both V and I, so name one — ``(port, 'V')``.
+    quantity : {'V', 'I'}, optional
+        Applied to every bare item, for the common case of one port's V or I.
+    ax : matplotlib Axes, optional
+        The left (voltage) axis. A current axis, if created, is attached as
+        ``ax.right_ax``.
+    fmax : float, optional
+        Upper frequency limit (Hz). Defaults to just past the usable band.
+    db : bool
+        Plot 20·log10|X| on a linear axis instead of |X| on a log axis.
+    floor : float
+        Relative level defining the usable band; see
+        :func:`~wavesim.spectrum.usable_band`.
+    shade : bool
+        Draw the usable-band shading.
+
+    Returns
+    -------
+    (fig, ax)
+
+    Notes
+    -----
+    Each y-axis shows a fixed 100 dB below its own peak rather than
+    autoscaling, so a V curve and an I curve — whose absolute levels differ by
+    orders of magnitude — are drawn over the same dynamic range and can be
+    compared by shape. Call ``ax.set_ylim`` afterwards to override.
+    """
+    spectra = _as_spectra(spectra, quantity)
+    if not spectra:
+        raise ValueError("plot_spectrum needs at least one spectrum.")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(9, 4))
+    else:
+        fig = ax.figure
+
+    xlabel, scale = _freq_axis(spectra[0].freqs)
+    # Split by unit so amps and volts never share a scale.
+    volts = [s for s in spectra if s.unit != 'A']
+    amps = [s for s in spectra if s.unit == 'A']
+
+    def draw(axis, group, offset, style):
+        lines, peak = [], 0.0
+        for n, s in enumerate(group):
+            label = s.label or s.unit or f'X{n}'
+            mag = s.magnitude
+            lines += axis.plot(s.freqs / scale, s.db if db else mag,
+                               lw=1.2, ls=style, color=f'C{offset + n}',
+                               label=f'|{label}(f)|')
+            finite = mag[np.isfinite(mag)]
+            peak = max(peak, float(finite.max()) if finite.size else 0.0)
+        # Both groups get the same dynamic range below their own peak. Left to
+        # autoscale, a twin pair picks its own decade count per axis — the V
+        # curve over five decades and the I curve over eight — and the two
+        # shapes stop being comparable, which is the only reason to overlay
+        # them. DYNAMIC_RANGE_DB below the peak, and a little headroom.
+        if peak > 0:
+            if db:
+                top = 20.0 * np.log10(peak)
+                axis.set_ylim(top - _SPECTRUM_RANGE_DB, top + 6.0)
+            else:
+                axis.set_yscale('log')
+                axis.set_ylim(peak * 10 ** (-_SPECTRUM_RANGE_DB / 20.0),
+                              peak * 2.0)
+        return lines
+
+    lines = draw(ax, volts, 0, '-') if volts else []
+    if volts:
+        ax.set_ylabel('|V(f)| (dB)' if db else 'Magnitude (V/Hz)')
+    if amps:
+        ax_i = ax.twinx() if volts else ax
+        if volts:
+            ax.right_ax = ax_i
+        lines += draw(ax_i, amps, len(volts), '--')
+        ax_i.set_ylabel('|I(f)| (dB)' if db else 'Magnitude (A/Hz)')
+    elif db:
+        ax.set_yscale('linear')
+
+    if shade:
+        patch = _shade_band(ax, spectra, floor, scale)
+        if patch is not None:
+            lines.append(patch)
+
+    ax.set_xlabel(xlabel)
+    _apply_fmax(ax, spectra, fmax, floor, scale)
+    ax.set_title('Spectra')
+    ax.legend(lines, [l.get_label() for l in lines], fontsize=9)
+    ax.grid(True, which='both', alpha=0.3)
+    plt.tight_layout()
+    return fig, ax
+
+
+def _phase_deg(s, unwrap: bool):
+    """Phase in degrees, unwrapped within each run of finite bins.
+
+    ``np.unwrap`` propagates a NaN forward through everything after it, so one
+    masked out-of-band gap would erase the rest of the curve. Unwrapping each
+    contiguous run separately keeps every segment the data supports, and the
+    step across a gap is honest — the phase in between is unknown.
+    """
+    ang = np.angle(s.values)
+    if not unwrap:
+        return np.degrees(ang)
+    out = np.full(ang.shape, np.nan)
+    finite = np.isfinite(s.values)
+    if not finite.any():
+        return out
+    edges = np.flatnonzero(np.diff(finite.astype(int)))
+    for a, b in zip(np.concatenate(([0], edges + 1)),
+                    np.concatenate((edges + 1, [finite.size]))):
+        if finite[a]:
+            out[a:b] = np.degrees(np.unwrap(ang[a:b]))
+    return out
+
+
+def plot_bode(spectra, ax=None, fmax: float = None, floor: float = 1e-3,
+              unwrap: bool = True, logf: bool = False):
+    """
+    |Z| and phase against frequency — the two-panel view of Z(f) or Y(f).
+
+    Magnitude on a log axis, phase in degrees below it, sharing the frequency
+    axis. Works for any complex spectrum: an impedance, an admittance, a
+    transfer function.
+
+    Gaps in the curves are not missing data — they are the bins
+    :func:`~wavesim.spectrum.impedance` masked as out-of-band, where there was
+    no drive energy to divide by. If the plot is mostly gap, the excitation did
+    not cover this band; :func:`plot_spectrum` shows where it did.
+
+    Parameters
+    ----------
+    spectra : Spectrum | list of Spectrum
+        One or several, overlaid.
+    ax : matplotlib Axes, optional
+        The magnitude (upper) axis; the phase axis is created below it. Pass
+        one only to place the plot inside an existing figure.
+    fmax : float, optional
+        Upper frequency limit (Hz). Defaults to just past the usable band.
+    floor : float
+        Relative level defining that band.
+    unwrap : bool
+        Plot the unwrapped phase (continuous through ±180° crossings) rather
+        than the principal value.
+    logf : bool
+        Log frequency axis. Off by default: a lumped extraction is usually read
+        over a narrow band, where linear is clearer.
+
+    Returns
+    -------
+    (fig, (ax_mag, ax_phase))
+    """
+    spectra = _as_spectra(spectra)
+    if not spectra:
+        raise ValueError("plot_bode needs at least one spectrum.")
+    if ax is None:
+        fig, (ax_mag, ax_ph) = plt.subplots(
+            2, 1, figsize=(9, 6), sharex=True,
+            gridspec_kw={'height_ratios': [2, 1]})
+    else:
+        fig, ax_mag = ax.figure, ax
+        ax_ph = fig.add_subplot(212, sharex=ax_mag)
+
+    xlabel, scale = _freq_axis(spectra[0].freqs)
+    unit = spectra[0].unit
+    for n, s in enumerate(spectra):
+        f = s.freqs / scale
+        ax_mag.plot(f, s.magnitude, lw=1.3, color=f'C{n}',
+                    label=s.label or f'S{n}')
+        ax_ph.plot(f, _phase_deg(s, unwrap), lw=1.3, color=f'C{n}')
+
+    ax_mag.set_yscale('log')
+    ax_mag.set_ylabel(f'|{spectra[0].label or "X"}|'
+                      + (f' ({unit})' if unit else ''))
+    ax_mag.grid(True, which='both', alpha=0.3)
+    ax_mag.legend(fontsize=9)
+    ax_mag.set_title('Magnitude and phase')
+
+    ax_ph.set_ylabel('Phase (deg)')
+    ax_ph.set_xlabel(xlabel)
+    ax_ph.grid(True, which='both', alpha=0.3)
+    # ±90° is a purely reactive port and 0° a purely resistive one: the lines a
+    # lumped extraction is read against.
+    for y in (-90.0, 0.0, 90.0):
+        ax_ph.axhline(y, color='0.6', lw=0.7, ls=':')
+
+    if logf:
+        ax_mag.set_xscale('log')
+    _apply_fmax(ax_mag, spectra, fmax, floor, scale)
+    plt.tight_layout()
+    return fig, (ax_mag, ax_ph)
+
+
+def plot_impedance_parts(spectra, ax=None, fmax: float = None,
+                         floor: float = 1e-3):
+    """
+    R and X against frequency on linear axes — the view an L or C is read off.
+
+    Real and imaginary parts of Z (or the G and B of an admittance) drawn
+    together in one unit on linear axes, because that is where the lumped
+    content is legible: a series inductance is a straight line X = 2πfL through
+    the origin, a shunt capacitance is B = 2πfC, and a zero crossing of X is a
+    resonance. A log-magnitude Bode view compresses exactly those features.
+
+    Parameters
+    ----------
+    spectra : Spectrum | list of Spectrum
+        One or several, overlaid. Solid lines are the real part, dashed the
+        imaginary.
+    ax : matplotlib Axes, optional
+    fmax : float, optional
+        Upper frequency limit (Hz). Defaults to just past the usable band.
+    floor : float
+        Relative level defining that band.
+
+    Returns
+    -------
+    (fig, ax)
+    """
+    spectra = _as_spectra(spectra)
+    if not spectra:
+        raise ValueError("plot_impedance_parts needs at least one spectrum.")
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(9, 4))
+    else:
+        fig = ax.figure
+
+    xlabel, scale = _freq_axis(spectra[0].freqs)
+    unit = spectra[0].unit
+    re_name, im_name = ('G', 'B') if unit == 'S' else ('R', 'X')
+    for n, s in enumerate(spectra):
+        f = s.freqs / scale
+        tag = f' [{s.label}]' if len(spectra) > 1 and s.label else ''
+        ax.plot(f, s.real, lw=1.3, color=f'C{2 * n}', label=f'{re_name}{tag}')
+        ax.plot(f, s.imag, lw=1.3, ls='--', color=f'C{2 * n + 1}',
+                label=f'{im_name}{tag}')
+
+    ax.axhline(0.0, color='0.6', lw=0.8)      # X = 0 marks a resonance
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(f'{re_name}, {im_name}' + (f' ({unit})' if unit else ''))
+    ax.set_title(f'{re_name} and {im_name} vs frequency')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    _apply_fmax(ax, spectra, fmax, floor, scale)
     plt.tight_layout()
     return fig, ax
 

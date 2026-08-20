@@ -64,6 +64,7 @@ import numpy as np
 
 __all__ = [
     "Spectrum", "spectrum", "transfer_function", "impedance", "admittance",
+    "usable_band",
 ]
 
 
@@ -184,20 +185,22 @@ def _norm_quantity(quantity):
 
 
 def _series_from_port(obj, quantity):
-    """``(times, values, unit, stagger)`` from a self-recording port, or None."""
+    """``(times, values, label, unit, stagger)`` from a port, or None."""
     if not (hasattr(obj, 'voltages') and hasattr(obj, 'currents')):
         return None
     key = _norm_quantity(quantity)
     if key == 'V':
-        return obj.times, obj.voltages, 'V', _STAGGER_E
+        return obj.times, obj.voltages, 'V', 'V', _STAGGER_E
     if key == 'I':
-        return obj.times, obj.currents, 'A', _STAGGER_H
+        return obj.times, obj.currents, 'I', 'A', _STAGGER_H
     raise ValueError(
         f"{type(obj).__name__} records both V and I; say which one: "
         f"spectrum(port, 'V') or spectrum(port, 'I').")
 
 
-# Monitors that record one named quantity: class name -> (kind, unit, stagger).
+# Monitors that record one named quantity. The label and the unit are separate
+# because a current is labelled 'I' and measured in 'A'.
+# class name -> (kind/label, unit, stagger).
 _MONITOR_KINDS = {
     'VoltageMonitor': ('V', 'V', _STAGGER_E),
     'CurrentMonitor': ('I', 'A', _STAGGER_H),
@@ -205,7 +208,7 @@ _MONITOR_KINDS = {
 
 
 def _series_from_monitor(obj, quantity):
-    """``(times, values, unit, stagger)`` from a monitor, or None.
+    """``(times, values, label, unit, stagger)`` from a monitor, or None.
 
     A monitor records exactly one quantity, so ``quantity`` is redundant — but
     naming it (``impedance((vmon, 'V'), (imon, 'I'))``) is natural enough to
@@ -224,18 +227,18 @@ def _series_from_monitor(obj, quantity):
                 f"{type(obj).__name__} records {comp!r}, not a port quantity; "
                 f"drop the {quantity!r} argument.")
         stagger = _STAGGER_H if comp.strip('|')[0].upper() == 'H' else _STAGGER_E
-        return obj.times, obj.values, comp, stagger
+        return obj.times, obj.values, comp, comp, stagger
     kind, unit, stagger = known
     asked = _norm_quantity(quantity)
     if asked is not None and asked != kind:
         raise ValueError(
             f"{type(obj).__name__} records {kind}, but {quantity!r} was asked "
             f"for.")
-    return obj.times, obj.values, unit, stagger
+    return obj.times, obj.values, kind, unit, stagger
 
 
 def _as_series(data, quantity):
-    """Normalise any accepted input to ``(times, values, unit, stagger)``.
+    """Normalise any input to ``(times, values, label, unit, stagger)``.
 
     Accepts a port, a monitor, or a ``(times, values)`` pair. A raw pair has no
     provenance, so its stagger is 0 — pass ``stagger=`` if it is H-derived.
@@ -246,7 +249,7 @@ def _as_series(data, quantity):
             return got
     if isinstance(data, (tuple, list)) and len(data) == 2:
         t, v = data
-        return t, v, '', 0.0
+        return t, v, '', '', 0.0
     raise TypeError(
         "spectrum() takes a monitor, a port, or a (times, values) pair; got "
         f"{type(data).__name__}.")
@@ -409,13 +412,13 @@ def spectrum(data, quantity=None, *, window=None, alpha: float = 0.1,
         The decay check: warn if the peak excursion over the final
         ``tail_frac`` of the record exceeds ``decay_tol`` times the overall peak.
     label : str, optional
-        Name for plots. Defaults to the quantity or component name.
+        Name for plots. Defaults to the quantity ('V', 'I') or component name.
 
     Returns
     -------
     Spectrum
     """
-    times, values, unit, inferred = _as_series(data, quantity)
+    times, values, name, unit, inferred = _as_series(data, quantity)
     v = np.asarray(values, dtype=float)
     if v.ndim != 1:
         raise ValueError(f"Expected a 1D time series, got shape {v.shape}.")
@@ -442,7 +445,7 @@ def spectrum(data, quantity=None, *, window=None, alpha: float = 0.1,
         X = X * np.exp(-2j * np.pi * freqs * (stagger * dt))
 
     return Spectrum(freqs=freqs, values=X, dt=dt,
-                    label=label if label is not None else unit, unit=unit)
+                    label=label if label is not None else name, unit=unit)
 
 
 # ======================================================================= #
@@ -468,6 +471,40 @@ def _unpack(arg):
     return arg, None
 
 
+def usable_band(*spectra, floor: float = 1e-3):
+    """
+    ``(f_lo, f_hi)`` — the span over which every given spectrum carries signal.
+
+    The same test :func:`impedance` and friends use to decide which bins are
+    worth dividing, reported as a contiguous range instead of a mask: the
+    frequencies where each spectrum stands at least ``floor`` times its own
+    peak. Useful for setting a plot's x-limits, for passing to ``band=``, and
+    for answering "how far do I actually believe this?" — a broadband pulse's
+    band is set by its width, not by the Nyquist frequency the axis runs to.
+
+    Returns ``(nan, nan)`` if no bin clears the floor in all of them.
+    """
+    if not spectra:
+        raise ValueError("usable_band needs at least one Spectrum.")
+    mask = np.ones(len(spectra[0]), dtype=bool)
+    for s in spectra:
+        if len(s) != len(mask):
+            raise ValueError("All spectra must share one frequency axis.")
+        mag = np.abs(s.values)
+        finite = np.isfinite(mag)
+        # A spectrum that is identically zero (or all NaN) has no band at all —
+        # without this every bin would clear a floor of zero and the "usable"
+        # range would be the whole axis.
+        peak = np.max(mag[finite]) if finite.any() else 0.0
+        if not peak > 0.0:
+            return float('nan'), float('nan')
+        mask &= finite & (mag >= floor * peak)
+    if not mask.any():
+        return float('nan'), float('nan')
+    f = spectra[0].freqs
+    return float(f[mask].min()), float(f[mask].max())
+
+
 def _ratio(num, den, *, quantity_num, quantity_den, floor, band, label, unit,
            **kw) -> Spectrum:
     """Shared body of transfer_function / impedance / admittance.
@@ -488,7 +525,10 @@ def _ratio(num, den, *, quantity_num, quantity_den, floor, band, label, unit,
 
     with np.errstate(divide='ignore', invalid='ignore'):
         ratio = num.values / den.values
-    ratio = np.where(_in_band(num, den, floor), ratio, np.nan + 0j)
+    # Both parts, deliberately: ``np.nan + 0j`` is ``complex(nan, 0.0)``, whose
+    # imaginary part is a perfectly good zero — an out-of-band reactance would
+    # then plot as X = 0, which reads as a resonance rather than as no data.
+    ratio = np.where(_in_band(num, den, floor), ratio, complex(np.nan, np.nan))
 
     out = Spectrum(freqs=num.freqs, values=ratio, dt=num.dt,
                    label=label, unit=unit)

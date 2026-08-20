@@ -71,7 +71,7 @@ from wavesim.monitors import (
     record_dissipation, record_voltage, record_current,
 )
 from wavesim.spectrum import (
-    Spectrum, spectrum, transfer_function, impedance, admittance,
+    Spectrum, spectrum, transfer_function, impedance, admittance, usable_band,
 )
 from wavesim.update import update_H, update_E
 from wavesim.simulation import Simulation
@@ -88,6 +88,7 @@ _LAZY = {
         "plot_field_snapshot", "animate_snapshots",
         "plot_poynting", "animate_poynting", "plot_monitor_time_series",
         "plot_voltage_current",
+        "plot_spectrum", "plot_bode", "plot_impedance_parts",
         "plot_field_slices_3d", "animate_field_slices_3d", "plot_energy",
         "plot_tem_mode",
         "plot_electrostatic_slice",
@@ -149,6 +150,7 @@ __all__ = [
     "record_dissipation", "record_voltage", "record_current",
     # spectra / network quantities
     "Spectrum", "spectrum", "transfer_function", "impedance", "admittance",
+    "usable_band",
     # update
     "update_H", "update_E",
     # simulation
