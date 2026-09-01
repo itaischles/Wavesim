@@ -291,6 +291,10 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
     # sel_*H order), so they index by the slab counter p — matching update_H's
     # per-cell primary divisor. On a uniform grid they are the constant PML spacing.
     #
+    # The (b, c) coefficients, by contrast, are full slabs shaped exactly like the
+    # psi they drive — sigma_max is material-aware per cell (see wavesim.pml) — so
+    # they are indexed with the same triple as psi, never by p alone.
+    #
     # Conformal PEC (see wavesim.pml.update_H_pml): only the SIX derivatives
     # change, from ``(hi - lo)/dp`` to ``(hi·L_hi - lo·L_lo)·inv_A``; the psi
     # recursion, the signs and the dt/(MU0·mu) correction are untouched. Unlike
@@ -312,11 +316,13 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
                 for k in range(Nz):
                     dEz_dy = (Ez[i, j + 1, k] * Lz[i, j + 1, k]
                               - Ez[i, j, k] * Lz[i, j, k]) * inv_Ax[i, j, k]
-                    psi_Ez_y[i, p, k] = byH[p] * psi_Ez_y[i, p, k] + cyH[p] * dEz_dy
+                    psi_Ez_y[i, p, k] = (byH[i, p, k] * psi_Ez_y[i, p, k]
+                                         + cyH[i, p, k] * dEz_dy)
                 continue
             for k in range(Nz):
                 dEz_dy = (Ez[i, j + 1, k] - Ez[i, j, k]) / dyp[p]
-                psi_Ez_y[i, p, k] = byH[p] * psi_Ez_y[i, p, k] + cyH[p] * dEz_dy
+                psi_Ez_y[i, p, k] = (byH[i, p, k] * psi_Ez_y[i, p, k]
+                                     + cyH[i, p, k] * dEz_dy)
     if Nz > 1:
         for i in prange(Nx):
             for p in range(n_yH):
@@ -331,12 +337,14 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
                         k = sz[p]
                         dEy_dz = (Ey[i, j, k + 1] * Ly[i, j, k + 1]
                                   - Ey[i, j, k] * Ly[i, j, k]) * inv_Ax[i, j, k]
-                        psi_Ey_z[i, j, p] = bzH[p] * psi_Ey_z[i, j, p] + czH[p] * dEy_dz
+                        psi_Ey_z[i, j, p] = (bzH[i, j, p] * psi_Ey_z[i, j, p]
+                                             + czH[i, j, p] * dEy_dz)
                     continue
                 for p in range(n_zH):
                     k = sz[p]
                     dEy_dz = (Ey[i, j, k + 1] - Ey[i, j, k]) / dzp[p]
-                    psi_Ey_z[i, j, p] = bzH[p] * psi_Ey_z[i, j, p] + czH[p] * dEy_dz
+                    psi_Ey_z[i, j, p] = (bzH[i, j, p] * psi_Ey_z[i, j, p]
+                                         + czH[i, j, p] * dEy_dz)
         for i in prange(Nx):
             for j in range(Ny - 1):
                 for p in range(n_zH):
@@ -357,11 +365,13 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
                 for k in range(Nz):
                     dEz_dx = (Ez[i + 1, j, k] * Lz[i + 1, j, k]
                               - Ez[i, j, k] * Lz[i, j, k]) * inv_Ay[i, j, k]
-                    psi_Ez_x[p, j, k] = bxH[p] * psi_Ez_x[p, j, k] + cxH[p] * dEz_dx
+                    psi_Ez_x[p, j, k] = (bxH[p, j, k] * psi_Ez_x[p, j, k]
+                                         + cxH[p, j, k] * dEz_dx)
                 continue
             for k in range(Nz):
                 dEz_dx = (Ez[i + 1, j, k] - Ez[i, j, k]) / dxp[p]
-                psi_Ez_x[p, j, k] = bxH[p] * psi_Ez_x[p, j, k] + cxH[p] * dEz_dx
+                psi_Ez_x[p, j, k] = (bxH[p, j, k] * psi_Ez_x[p, j, k]
+                                     + cxH[p, j, k] * dEz_dx)
     if Nz > 1:
         for j in prange(Ny):
             for p in range(n_xH):
@@ -376,12 +386,14 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
                         k = sz[p]
                         dEx_dz = (Ex[i, j, k + 1] * Lx[i, j, k + 1]
                                   - Ex[i, j, k] * Lx[i, j, k]) * inv_Ay[i, j, k]
-                        psi_Ex_z[i, j, p] = bzH[p] * psi_Ex_z[i, j, p] + czH[p] * dEx_dz
+                        psi_Ex_z[i, j, p] = (bzH[i, j, p] * psi_Ex_z[i, j, p]
+                                             + czH[i, j, p] * dEx_dz)
                     continue
                 for p in range(n_zH):
                     k = sz[p]
                     dEx_dz = (Ex[i, j, k + 1] - Ex[i, j, k]) / dzp[p]
-                    psi_Ex_z[i, j, p] = bzH[p] * psi_Ex_z[i, j, p] + czH[p] * dEx_dz
+                    psi_Ex_z[i, j, p] = (bzH[i, j, p] * psi_Ex_z[i, j, p]
+                                         + czH[i, j, p] * dEx_dz)
         for i in prange(Nx - 1):
             for j in range(Ny):
                 for p in range(n_zH):
@@ -402,11 +414,13 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
                 for k in range(Nz):
                     dEy_dx = (Ey[i + 1, j, k] * Ly[i + 1, j, k]
                               - Ey[i, j, k] * Ly[i, j, k]) * inv_Az[i, j, k]
-                    psi_Ey_x[p, j, k] = bxH[p] * psi_Ey_x[p, j, k] + cxH[p] * dEy_dx
+                    psi_Ey_x[p, j, k] = (bxH[p, j, k] * psi_Ey_x[p, j, k]
+                                         + cxH[p, j, k] * dEy_dx)
                 continue
             for k in range(Nz):
                 dEy_dx = (Ey[i + 1, j, k] - Ey[i, j, k]) / dxp[p]
-                psi_Ey_x[p, j, k] = bxH[p] * psi_Ey_x[p, j, k] + cxH[p] * dEy_dx
+                psi_Ey_x[p, j, k] = (bxH[p, j, k] * psi_Ey_x[p, j, k]
+                                     + cxH[p, j, k] * dEy_dx)
     for j in prange(Ny - 1):
         for p in range(n_xH):
             i = sx[p]
@@ -420,11 +434,13 @@ def _update_H_pml(Ex, Ey, Ez, Hx, Hy, Hz, mu_x, mu_y, mu_z,
                 for k in range(Nz):
                     dEx_dy = (Ex[i, j + 1, k] * Lx[i, j + 1, k]
                               - Ex[i, j, k] * Lx[i, j, k]) * inv_Az[i, j, k]
-                    psi_Ex_y[i, p, k] = byH[p] * psi_Ex_y[i, p, k] + cyH[p] * dEx_dy
+                    psi_Ex_y[i, p, k] = (byH[i, p, k] * psi_Ex_y[i, p, k]
+                                         + cyH[i, p, k] * dEx_dy)
                 continue
             for k in range(Nz):
                 dEx_dy = (Ex[i, j + 1, k] - Ex[i, j, k]) / dyp[p]
-                psi_Ex_y[i, p, k] = byH[p] * psi_Ex_y[i, p, k] + cyH[p] * dEx_dy
+                psi_Ex_y[i, p, k] = (byH[i, p, k] * psi_Ex_y[i, p, k]
+                                     + cyH[i, p, k] * dEx_dy)
     for i in prange(Nx - 1):
         for p in range(n_yH):
             j = sy[p]
@@ -440,7 +456,9 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
                   lossy, Cb_x, Cb_y, Cb_z):
     # dxd/dyd/dzd are the DUAL widths sampled at sel_* - 1 (per-slab, in sel_*E
     # order), so they index by the slab counter p — matching update_E's per-cell
-    # dual divisor. On a uniform grid they are the constant PML spacing.
+    # dual divisor. On a uniform grid they are the constant PML spacing. The
+    # (b, c) coefficients are full slabs shaped like their psi and indexed with
+    # the same triple — sigma_max is material-aware per cell (see wavesim.pml).
     #
     # Lossy dielectrics (see wavesim.pml.update_E_pml): the psi recursion, the
     # signs and the slab bookkeeping are all untouched; only the SIX correction
@@ -461,7 +479,8 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
             j = sy[p]
             for k in range(Nz):
                 dHz_dy = (Hz[i, j, k] - Hz[i, j - 1, k]) / dyd[p]
-                psi_Hz_y[i, p, k] = byE[p] * psi_Hz_y[i, p, k] + cyE[p] * dHz_dy
+                psi_Hz_y[i, p, k] = (byE[i, p, k] * psi_Hz_y[i, p, k]
+                                     + cyE[i, p, k] * dHz_dy)
     if Nz > 1:
         for i in prange(Nx):
             for p in range(n_yE):
@@ -478,7 +497,8 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
                 for p in range(n_zE):
                     k = sz[p]
                     dHy_dz = (Hy[i, j, k] - Hy[i, j, k - 1]) / dzd[p]
-                    psi_Hy_z[i, j, p] = bzE[p] * psi_Hy_z[i, j, p] + czE[p] * dHy_dz
+                    psi_Hy_z[i, j, p] = (bzE[i, j, p] * psi_Hy_z[i, j, p]
+                                         + czE[i, j, p] * dHy_dz)
         for i in prange(Nx):
             for j in range(1, Ny):
                 if lossy:
@@ -505,7 +525,8 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
             i = sx[p]
             for k in range(Nz):
                 dHz_dx = (Hz[i, j, k] - Hz[i - 1, j, k]) / dxd[p]
-                psi_Hz_x[p, j, k] = bxE[p] * psi_Hz_x[p, j, k] + cxE[p] * dHz_dx
+                psi_Hz_x[p, j, k] = (bxE[p, j, k] * psi_Hz_x[p, j, k]
+                                     + cxE[p, j, k] * dHz_dx)
     if Nz > 1:
         for j in prange(Ny):
             for p in range(n_xE):
@@ -522,7 +543,8 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
                 for p in range(n_zE):
                     k = sz[p]
                     dHx_dz = (Hx[i, j, k] - Hx[i, j, k - 1]) / dzd[p]
-                    psi_Hx_z[i, j, p] = bzE[p] * psi_Hx_z[i, j, p] + czE[p] * dHx_dz
+                    psi_Hx_z[i, j, p] = (bzE[i, j, p] * psi_Hx_z[i, j, p]
+                                         + czE[i, j, p] * dHx_dz)
         for i in prange(1, Nx):
             for j in range(Ny):
                 if lossy:
@@ -549,7 +571,8 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
             i = sx[p]
             for k in range(Nz):
                 dHy_dx = (Hy[i, j, k] - Hy[i - 1, j, k]) / dxd[p]
-                psi_Hy_x[p, j, k] = bxE[p] * psi_Hy_x[p, j, k] + cxE[p] * dHy_dx
+                psi_Hy_x[p, j, k] = (bxE[p, j, k] * psi_Hy_x[p, j, k]
+                                     + cxE[p, j, k] * dHy_dx)
     for j in prange(1, Ny):
         for p in range(n_xE):
             i = sx[p]
@@ -565,7 +588,8 @@ def _update_E_pml(Ex, Ey, Ez, Hx, Hy, Hz, eps_x, eps_y, eps_z,
             j = sy[p]
             for k in range(Nz):
                 dHx_dy = (Hx[i, j, k] - Hx[i, j - 1, k]) / dyd[p]
-                psi_Hx_y[i, p, k] = byE[p] * psi_Hx_y[i, p, k] + cyE[p] * dHx_dy
+                psi_Hx_y[i, p, k] = (byE[i, p, k] * psi_Hx_y[i, p, k]
+                                     + cyE[i, p, k] * dHx_dy)
     for i in prange(1, Nx):
         for p in range(n_yE):
             j = sy[p]
@@ -624,9 +648,10 @@ def update_E(grid: FDTDGrid) -> FDTDGrid:
 
 
 def _ravel(a):
-    """Slab (b, c) coefficient arrays are stored reshaped to broadcast; the kernels
-    want them as 1D in slab order, which ravel() recovers (C-order over a singleton
-    -> n -> singleton reshape)."""
+    """Slab spacing arrays are stored reshaped to broadcast; the kernels want them
+    as 1D in slab order, which ravel() recovers (C-order over a singleton -> n ->
+    singleton reshape). The (b, c) coefficients are NOT among them: they carry a
+    per-cell material scaling and go to the kernels shaped like their psi."""
     return np.ascontiguousarray(a).ravel()
 
 
@@ -638,9 +663,9 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
         grid.dt, _ravel(cpml.dxp_sH), _ravel(cpml.dyp_sH), _ravel(cpml.dzp_sH),
         grid.Nx, grid.Ny, grid.Nz,
         cpml.sel_xH, cpml.sel_yH, cpml.sel_zH,
-        _ravel(cpml.bxH_s), _ravel(cpml.cxH_s),
-        _ravel(cpml.byH_s), _ravel(cpml.cyH_s),
-        _ravel(cpml.bzH_s), _ravel(cpml.czH_s),
+        cpml.bxH_s, cpml.cxH_s,
+        cpml.byH_s, cpml.cyH_s,
+        cpml.bzH_s, cpml.czH_s,
         cpml.psi_Ez_y, cpml.psi_Ey_z, cpml.psi_Ex_z,
         cpml.psi_Ez_x, cpml.psi_Ey_x, cpml.psi_Ex_y,
         *_conformal_pml_args(grid))
@@ -669,9 +694,9 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
         grid.dt, _ravel(cpml.dxd_sE), _ravel(cpml.dyd_sE), _ravel(cpml.dzd_sE),
         grid.Nx, grid.Ny, grid.Nz,
         cpml.sel_xE, cpml.sel_yE, cpml.sel_zE,
-        _ravel(cpml.bxE_s), _ravel(cpml.cxE_s),
-        _ravel(cpml.byE_s), _ravel(cpml.cyE_s),
-        _ravel(cpml.bzE_s), _ravel(cpml.czE_s),
+        cpml.bxE_s, cpml.cxE_s,
+        cpml.byE_s, cpml.cyE_s,
+        cpml.bzE_s, cpml.czE_s,
         cpml.psi_Hz_y, cpml.psi_Hy_z, cpml.psi_Hx_z,
         cpml.psi_Hz_x, cpml.psi_Hy_x, cpml.psi_Hx_y,
         *_lossy_pml_args(grid))

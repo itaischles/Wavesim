@@ -49,6 +49,77 @@ sits at an integer (non-staggered) coordinate. Hence:
     *_E profiles : sampled at (i + 0.5) * ds   (used in the E-field updates)
     *_H profiles : sampled at  i        * ds   (used in the H-field updates)
 
+Material-aware sigma_max (per cell)
+-----------------------------------
+sigma_max is a *matched* conductivity, and a vacuum constant does not match a
+substrate. The textbook value
+
+    sigma_true_max = 0.8 * (m + 1) / (eta * ds),   eta = ETA0 * sqrt(mu_r/eps_r)
+
+is a true conductivity — it enters the field update as sigma/eps. CPML's sigma is
+normalised to *vacuum* permittivity instead (see :func:`_bc`: the exponent is
+sigma*dt/EPS0 whatever the cell holds), and converting between the two divides by
+eps_r:
+
+    sigma_max = 0.8 * (m + 1) / (ETA0 * ds) * sqrt(mu_r / eps_r)
+
+So in this normalisation a dielectric wants a *weaker* sigma than vacuum, not a
+stronger one — the same profile attenuates more there, because the wave spends
+sqrt(eps_r) times as many timesteps crossing each cell. (Miss the normalisation
+and you get the reciprocal factor, which is worse than leaving the profile alone
+— 4 dB worse at eps_r=4, 17 dB at eps_r=9.)
+
+That impedance-matched value is the right one for total attenuation, but it is
+not where the discrete optimum sits: it buys attenuation at the price of a
+steeper profile per cell, and how that trade lands depends on how the medium is
+resolved. Measured against an extended-domain reference (residual at a probe
+beside the absorber, 10-cell PML, point source, in dB relative to the incident
+peak):
+
+                       eps_r=4          eps_r=9         eps_r=20
+    vacuum sigma_max     -81.8            -78.2            -72.0
+    sqrt(mu_r/eps_r)     -82.0            -70.7            -61.9
+    fourth root          -85.9            -83.0            -81.4
+    best measured        -85.9 (0.70)     -84.5 (0.50)     -81.4 (0.47)
+
+with the wave equally resolved in cells in every case. Under a fixed source band
+— where a dielectric is meshed sqrt(eps_r) times more coarsely and grid
+dispersion sets the floor — the ordering runs the other way and the full
+impedance scaling wins by a few dB, but everything is 25-40 dB there and the
+model has bigger problems. The geometric mean of the two limits,
+
+    n(cell) = (mu_r / eps_r) ** 0.25             (1 in vacuum)
+
+is within 1.5 dB of the optimum in the resolved regime and still ahead of a
+vacuum profile in the coarse one, so it is what this module uses. Either endpoint
+gives up 6-20 dB in one regime or the other.
+
+The factor is sampled per cell (see :func:`_material_scale`), which makes the
+(b, c) coefficients full 3D slabs instead of 1D profiles. The depth grading,
+alpha, kappa=1 and the recursion itself are untouched; only the amplitude of
+sigma changes, and only by the local material.
+
+Cost: two coefficient slabs (b and c) per (axis, grid) alongside the two psi
+slabs that share them, so the CPML footprint is twice the psi arrays rather than
+just the psi arrays. That is the price of the profile knowing where it is; on the
+compressed boundary-slab layout above it is a small fraction of the field arrays.
+
+The material map is read ONCE, in :func:`init_cpml` — build the geometry before
+the absorber, not after.
+
+PEC inside the PML
+------------------
+A conductor may sit in, or cross, the absorbing shell, and the epsilon a
+voxeliser leaves *inside* metal is not a material property at all (typically
+whatever filled the background). Feeding it to sigma_max would let an arbitrary
+placeholder set the absorber profile. :func:`_material_scale` therefore treats
+every PEC cell — and any cell with a non-finite or non-positive eps/mu — as
+having no material of its own, and fills it from its nearest non-PEC neighbours,
+so the profile a conductor passes through is the one its surroundings ask for.
+Nothing propagates inside the metal (E is zeroed on those edges every step, so
+the psi recursion there stays at 0 as well), which is exactly why the value must
+come from outside it.
+
 Sign convention (matches update.py exactly)
 --------------------------------------------
     Hx -= coef * (dEz/dy - dEy/dz)   -> psi correction:  -psi_Ez_y, +psi_Ey_z
@@ -64,7 +135,8 @@ import numpy as np
 
 from wavesim.grid import FDTDGrid
 from wavesim.loss import loss_coefficients
-from wavesim.pec import conformal_geometry, conformal_edge_eps
+from wavesim.pec import (conformal_geometry, conformal_edge_eps,
+                         COVERED_FRACTION_TOL, _axis_slice)
 from wavesim.constants import EPS0, MU0, ETA0
 
 
@@ -92,7 +164,10 @@ class CPMLArrays:
     psi_Hx_y: np.ndarray   # correction to dHx/dy in the Ez update  (y axis)
 
     # --- Precomputed (b, c) profiles, one 1D array per axis & grid ------ #
-    # Full-length profiles (cheap 1D arrays) kept for visualisation/inspection.
+    # Full-length VACUUM profiles (cheap 1D arrays), kept for visualisation and
+    # inspection and used to pick the active slab indices. The coefficients the
+    # solver actually steps with are the material-scaled 3D slabs below; these
+    # are what they reduce to where n(cell) == 1.
     bx_E: np.ndarray; cx_E: np.ndarray   # shape (Nx,)
     bx_H: np.ndarray; cx_H: np.ndarray
     by_E: np.ndarray; cy_E: np.ndarray   # shape (Ny,)
@@ -107,13 +182,17 @@ class CPMLArrays:
     sel_xH: np.ndarray; sel_yH: np.ndarray; sel_zH: np.ndarray
     sel_xE: np.ndarray; sel_yE: np.ndarray; sel_zE: np.ndarray
 
-    # --- (b, c) sampled at sel_*, reshaped to broadcast along that axis -- #
-    bxH_s: np.ndarray; cxH_s: np.ndarray     # shape (n_xH, 1, 1)
-    byH_s: np.ndarray; cyH_s: np.ndarray     # shape (1, n_yH, 1)
-    bzH_s: np.ndarray; czH_s: np.ndarray     # shape (1, 1, n_zH)
-    bxE_s: np.ndarray; cxE_s: np.ndarray     # shape (n_xE, 1, 1)
-    byE_s: np.ndarray; cyE_s: np.ndarray     # shape (1, n_yE, 1)
-    bzE_s: np.ndarray; czE_s: np.ndarray     # shape (1, 1, n_zE)
+    # --- (b, c) on the slab, per cell ----------------------------------- #
+    # Depth grading along the derivative axis, material scaling across the other
+    # two (see "Material-aware sigma_max" above), so each is shaped exactly like
+    # the psi arrays it drives — and is shared by the two psi that live on the
+    # same (axis, grid), e.g. bxH_s serves psi_Ez_x and psi_Ey_x alike.
+    bxH_s: np.ndarray; cxH_s: np.ndarray     # shape (n_xH, Ny, Nz)
+    byH_s: np.ndarray; cyH_s: np.ndarray     # shape (Nx, n_yH, Nz)
+    bzH_s: np.ndarray; czH_s: np.ndarray     # shape (Nx, Ny, n_zH)
+    bxE_s: np.ndarray; cxE_s: np.ndarray     # shape (n_xE, Ny, Nz)
+    byE_s: np.ndarray; cyE_s: np.ndarray     # shape (Nx, n_yE, Nz)
+    bzE_s: np.ndarray; czE_s: np.ndarray     # shape (Nx, Ny, n_zE)
 
     # --- Per-cell spacing sampled at sel_*, reshaped to broadcast (Session 4) -- #
     # The CPML correction is part of the SAME curl as the base field update, so
@@ -146,9 +225,12 @@ def _pml_face_widths(dp, d_pml, low, high, axis):
     generator guarantees this; it keeps the delicate grading math essentially
     unchanged). The solver still handles a different constant per face, but not a
     graded PML — so we assert the constraint holds and fail loudly on a mesh that
-    violates it instead of silently mis-grading the absorber. A per-cell
-    ``sigma_max`` + cumulative-sum profile would lift this restriction; it is a
-    documented follow-on, not built here.
+    violates it instead of silently mis-grading the absorber. Lifting the
+    restriction needs a depth coordinate accumulated from the actual cell widths
+    (a cumulative sum) rather than an index; that is a documented follow-on, not
+    built here. Note it is a separate axis of freedom from the per-cell
+    ``sigma_max`` this module already carries — that one varies with the
+    *material* across the slab, this one would vary the *depth* along it.
 
     Only enabled faces on a thick-enough axis are checked; the edge widths
     ``dp[0]`` / ``dp[-1]`` are returned regardless (unused where the profile is
@@ -173,9 +255,9 @@ def _pml_face_widths(dp, d_pml, low, high, axis):
     return ds_lo, ds_hi
 
 
-def _calc_profile_1d(N, ds_lo, ds_hi, dt, d_pml, staggered, low=True, high=True):
+def _sigma_alpha_1d(N, ds_lo, ds_hi, d_pml, staggered, low=True, high=True):
     """
-    Build the 1D (b, c) CPML coefficient arrays along one axis.
+    Build the 1D (sigma, alpha) CPML profiles along one axis.
 
     Roden-Gedney profiles (kappa_max = 1 for v1):
         sigma(d) = sigma_max * (d / d_pml)^m
@@ -184,8 +266,14 @@ def _calc_profile_1d(N, ds_lo, ds_hi, dt, d_pml, staggered, low=True, high=True)
         alpha_max = 0.05
 
     where d is the depth into the PML (0 at the inner edge, d_pml*ds at the
-    domain boundary). Returns (b, c) of length N; both reduce to (1, 0)
-    outside the PML so the correction vanishes in the interior.
+    domain boundary). Returns (sigma, alpha) of length N, both zero outside the
+    PML so :func:`_bc` reduces to (1, 0) there and the correction vanishes in
+    the interior.
+
+    ``sigma`` here is the VACUUM profile: :func:`init_cpml` multiplies it by the
+    per-cell ``(mu_r/eps_r)**0.25`` of :func:`_material_scale` before forming
+    (b, c), which is the whole of the material awareness. Keeping the two apart
+    is what lets one 1D grading serve every cell of a slab.
 
     Non-uniform grid (Session 4)
     ----------------------------
@@ -207,13 +295,10 @@ def _calc_profile_1d(N, ds_lo, ds_hi, dt, d_pml, staggered, low=True, high=True)
         or a symmetry plane). With b=1, c=0 there the psi recursion stays at 0,
         so no correction is applied on that side.
     """
-    b = np.ones(N)
-    c = np.zeros(N)
-
     # Too thin to host two PML slabs (e.g. Nz=1 slice), or both faces disabled:
     # no PML on this axis.
     if N <= 2 * d_pml or not (low or high):
-        return b, c
+        return np.zeros(N), np.zeros(N)
 
     m = 3
     alpha_max = 0.05
@@ -250,16 +335,137 @@ def _calc_profile_1d(N, ds_lo, ds_hi, dt, d_pml, staggered, low=True, high=True)
         sigma[right] = sigma_max * depth_r ** m
         alpha[right] = alpha_max * (1.0 - depth_r)
 
-    # kappa = 1, so the standard CPML coefficients simplify to:
-    #   b = exp(-(sigma + alpha) * dt / EPS0)
-    #   c = sigma / (sigma + alpha) * (b - 1)
-    b = np.exp(-(sigma + alpha) * dt / EPS0)
+    return sigma, alpha
 
+
+def _bc(sigma, alpha, dt):
+    """The CPML recursion coefficients (b, c) for a (sigma, alpha) pair.
+
+    kappa = 1, so the standard CPML coefficients simplify to:
+        b = exp(-(sigma + alpha) * dt / EPS0)
+        c = sigma / (sigma + alpha) * (b - 1)
+
+    Works on any shape and broadcasts sigma against alpha, which is how a 1D
+    depth grading and a 3D material scaling combine into one slab of
+    coefficients. Note the EPS0: CPML's sigma is normalised to *vacuum*
+    permittivity whatever material the cell holds — the material enters through
+    sigma_max, not here.
+    """
+    sigma, alpha = np.broadcast_arrays(sigma, alpha)
+    b = np.exp(-(sigma + alpha) * dt / EPS0)
     denom = sigma + alpha
+    c = np.zeros(b.shape)
     mask = denom > 0.0
     c[mask] = (sigma[mask] / denom[mask]) * (b[mask] - 1.0)
-
     return b, c
+
+
+# ---------------------------------------------------------------------- #
+# Per-cell material scaling of sigma_max
+# ---------------------------------------------------------------------- #
+
+# How far the material of a PEC cell is allowed to be borrowed from. Each pass
+# grows the known region by one cell in each of the six directions, so a
+# conductor up to twice this many cells thick — filled from both sides — takes
+# its profile entirely from the dielectric around it. Anything still unknown
+# after that is deeper inside metal than any
+# field reaches, and takes the vacuum value — sigma there scales nothing, since
+# the psi that would use it never leaves 0 (E is held at 0 on those edges).
+_PEC_FILL_PASSES = 4
+
+
+def _pec_cell_mask(grid: FDTDGrid) -> np.ndarray:
+    """Cells that are wholly conductor — the ones whose eps/mu mean nothing.
+
+    ``pec_mask`` is the fully-covered test on both the staircase and the
+    conformal path (see :class:`~wavesim.grid.FDTDGrid`), and on a cut-cell grid
+    a cell whose three own edges are all covered is inside the metal whether or
+    not anyone filled ``pec_mask`` in. Either alone would miss a model that
+    carries only the other, so take both.
+
+    A *partially* covered cut cell is deliberately not here: it holds real
+    dielectric on its open part, and that is the material its sigma should grade
+    against.
+    """
+    shape = (grid.Nx, grid.Ny, grid.Nz)
+    pec = np.zeros(shape, dtype=bool)
+    if grid.pec_mask is not None:
+        pec |= grid.pec_mask
+    if grid.is_conformal:
+        tol = COVERED_FRACTION_TOL
+        pec |= ((grid.pec_edge_open_x <= tol)
+                & (grid.pec_edge_open_y <= tol)
+                & (grid.pec_edge_open_z <= tol))
+    return pec
+
+
+def _fill_from_neighbours(value: np.ndarray, known: np.ndarray,
+                          passes: int = _PEC_FILL_PASSES) -> np.ndarray:
+    """Grow ``value`` outward-in: unknown cells take the mean of their known
+    6-neighbours, repeated ``passes`` times. Cells still unknown at the end keep
+    whatever ``value`` already held there.
+
+    A breadth-first fill rather than a nearest-neighbour transform because the
+    distances involved are a few cells — the conductor's own thickness — and a
+    bounded number of whole-array passes costs less at setup than an exact
+    distance map over the full domain.
+    """
+    out = value.copy()
+    known = known.copy()
+    for _ in range(passes):
+        if known.all():
+            break
+        acc = np.zeros_like(out)
+        cnt = np.zeros(out.shape, dtype=np.int32)
+        for axis in range(3):
+            for forward in (True, False):
+                lo = _axis_slice(3, axis, 1, None)
+                hi = _axis_slice(3, axis, 0, -1)
+                src, dst = (lo, hi) if forward else (hi, lo)
+                acc[dst] += np.where(known[src], out[src], 0.0)
+                cnt[dst] += known[src]
+        new = (~known) & (cnt > 0)
+        out[new] = acc[new] / cnt[new]
+        known |= new
+    return out
+
+
+def _material_scale(grid: FDTDGrid) -> np.ndarray:
+    """Per-cell ``(mu_r / eps_r) ** 0.25``: the factor sigma_max carries so that
+    the absorber is graded for the material it is filled with rather than for
+    vacuum. The module docstring derives the exponent and gives the measurements
+    behind it — the short version is that CPML's sigma is normalised to EPS0, so
+    a dielectric wants *less* of it, and half the impedance ratio is where the
+    discrete optimum sits.
+
+    One scalar per cell, from the mean of the three eps (and three mu) tensor
+    components, and the same array feeds both the E-side and the H-side psi. The
+    half-cell stagger between where an E-side and an H-side coefficient sit is
+    deliberately ignored: sigma_max is a grading *heuristic* — 0.8*(m+1)/(eta*ds)
+    is fitted, not derived, and the exponent on top of it is fitted too — so half
+    a cell of stagger is nothing beside the material step it is tracking. Where
+    the material genuinely
+    steps, both sides step at the same cell, which is what keeps E and H seeing
+    one absorber.
+
+    eps comes from :func:`~wavesim.pec.conformal_edge_eps`, the same repaired
+    map :func:`update_E_pml` steps on, so a conductor-straddling edge does not
+    hand its filler value to the profile.
+
+    PEC cells, and any cell whose eps/mu is non-finite or non-positive, have no
+    material to speak of; they are filled from their neighbours by
+    :func:`_fill_from_neighbours` (vacuum where even that finds nothing).
+    """
+    eps = np.mean(np.asarray(conformal_edge_eps(grid), dtype=np.float64), axis=0)
+    mu = np.mean(np.asarray([grid.mu_x, grid.mu_y, grid.mu_z],
+                            dtype=np.float64), axis=0)
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        n = (mu / eps) ** 0.25
+    known = (np.isfinite(n) & (n > 0.0) & ~_pec_cell_mask(grid))
+
+    n = np.where(known, n, 1.0)
+    return _fill_from_neighbours(n, known)
 
 
 def _slab_indices(c, grid_type):
@@ -303,6 +509,11 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
 
     Notes
     -----
+    The material map is sampled HERE and baked into the (b, c) slabs (see
+    :func:`_material_scale` and the module docstring): build the geometry first,
+    then the absorber. Changing eps/mu afterwards leaves the PML grading matched
+    to the old material — call ``init_cpml`` again to rebuild it.
+
     The z-axis profiles return (1, 0) when Nz <= 2*d_pml, so the z-face PML is
     inert for Nz=1 slices (sel_zE/sel_zH are empty) and activates on its own
     once Nz is large enough (subject to z0/z1 being in `faces`).
@@ -328,12 +539,23 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
     dsy_lo, dsy_hi = _pml_face_widths(grid.dyp, d_pml, y_lo, y_hi, 'y')
     dsz_lo, dsz_hi = _pml_face_widths(grid.dzp, d_pml, z_lo, z_hi, 'z')
 
-    bx_E, cx_E = _calc_profile_1d(Nx, dsx_lo, dsx_hi, grid.dt, d_pml, True,  x_lo, x_hi)
-    bx_H, cx_H = _calc_profile_1d(Nx, dsx_lo, dsx_hi, grid.dt, d_pml, False, x_lo, x_hi)
-    by_E, cy_E = _calc_profile_1d(Ny, dsy_lo, dsy_hi, grid.dt, d_pml, True,  y_lo, y_hi)
-    by_H, cy_H = _calc_profile_1d(Ny, dsy_lo, dsy_hi, grid.dt, d_pml, False, y_lo, y_hi)
-    bz_E, cz_E = _calc_profile_1d(Nz, dsz_lo, dsz_hi, grid.dt, d_pml, True,  z_lo, z_hi)
-    bz_H, cz_H = _calc_profile_1d(Nz, dsz_lo, dsz_hi, grid.dt, d_pml, False, z_lo, z_hi)
+    # Vacuum (sigma, alpha) gradings, one pair per axis and grid. sigma is scaled
+    # per cell below; alpha and the depth grading are material-independent.
+    sa = lambda N, lo, hi, stag, fl, fh: _sigma_alpha_1d(   # noqa: E731
+        N, lo, hi, d_pml, stag, fl, fh)
+    sx_E, ax_E = sa(Nx, dsx_lo, dsx_hi, True,  x_lo, x_hi)
+    sx_H, ax_H = sa(Nx, dsx_lo, dsx_hi, False, x_lo, x_hi)
+    sy_E, ay_E = sa(Ny, dsy_lo, dsy_hi, True,  y_lo, y_hi)
+    sy_H, ay_H = sa(Ny, dsy_lo, dsy_hi, False, y_lo, y_hi)
+    sz_E, az_E = sa(Nz, dsz_lo, dsz_hi, True,  z_lo, z_hi)
+    sz_H, az_H = sa(Nz, dsz_lo, dsz_hi, False, z_lo, z_hi)
+
+    # Full-length vacuum (b, c): the reference profile, and the thing whose
+    # nonzero pattern defines the slabs. The material factor is strictly
+    # positive, so scaling sigma by it cannot move that pattern.
+    bx_E, cx_E = _bc(sx_E, ax_E, grid.dt); bx_H, cx_H = _bc(sx_H, ax_H, grid.dt)
+    by_E, cy_E = _bc(sy_E, ay_E, grid.dt); by_H, cy_H = _bc(sy_H, ay_H, grid.dt)
+    bz_E, cz_E = _bc(sz_E, az_E, grid.dt); bz_H, cz_H = _bc(sz_H, az_H, grid.dt)
 
     # Active boundary-slab indices along each (axis, grid).
     sel_xH = _slab_indices(cx_H, 'H'); sel_xE = _slab_indices(cx_E, 'E')
@@ -351,12 +573,23 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
         shape = [1, 1, 1]; shape[axis] = -1
         return arr[sel].reshape(shape).astype(dtype, copy=False)
 
-    bxH_s, cxH_s = _rs(bx_H, sel_xH, 0), _rs(cx_H, sel_xH, 0)
-    byH_s, cyH_s = _rs(by_H, sel_yH, 1), _rs(cy_H, sel_yH, 1)
-    bzH_s, czH_s = _rs(bz_H, sel_zH, 2), _rs(cz_H, sel_zH, 2)
-    bxE_s, cxE_s = _rs(bx_E, sel_xE, 0), _rs(cx_E, sel_xE, 0)
-    byE_s, cyE_s = _rs(by_E, sel_yE, 1), _rs(cy_E, sel_yE, 1)
-    bzE_s, czE_s = _rs(bz_E, sel_zE, 2), _rs(cz_E, sel_zE, 2)
+    # Per-cell (b, c) on each slab: the 1D depth grading of sigma scaled by the
+    # material factor at the cells the slab covers, then turned into coefficients.
+    # The result is shaped like the psi arrays it drives.
+    n_mat = _material_scale(grid)
+
+    def _slab_bc(sigma, alpha, sel, axis):
+        shape = [1, 1, 1]; shape[axis] = -1
+        sig = sigma[sel].reshape(shape) * np.take(n_mat, sel, axis=axis)
+        b, c = _bc(sig, alpha[sel].reshape(shape), grid.dt)
+        return b.astype(dtype, copy=False), c.astype(dtype, copy=False)
+
+    bxH_s, cxH_s = _slab_bc(sx_H, ax_H, sel_xH, 0)
+    byH_s, cyH_s = _slab_bc(sy_H, ay_H, sel_yH, 1)
+    bzH_s, czH_s = _slab_bc(sz_H, az_H, sel_zH, 2)
+    bxE_s, cxE_s = _slab_bc(sx_E, ax_E, sel_xE, 0)
+    byE_s, cyE_s = _slab_bc(sy_E, ay_E, sel_yE, 1)
+    bzE_s, czE_s = _slab_bc(sz_E, az_E, sel_zE, 2)
 
     # Per-cell spacing divisors sampled at the slab indices (Session 4). The CPML
     # correction shares the base update's curl, so it uses the same divisor:

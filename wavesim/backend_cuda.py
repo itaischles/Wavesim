@@ -171,7 +171,7 @@ def _k_HX_Y(Ez, Hx, mu_x, psi, b, c, sel, cH, dy, Nx, nP, Nz):
         return
     j = sel[p]
     dEz_dy = (Ez[i, j + 1, k] - Ez[i, j, k]) / dy
-    psi[i, p, k] = b[p] * psi[i, p, k] + c[p] * dEz_dy
+    psi[i, p, k] = b[i, p, k] * psi[i, p, k] + c[i, p, k] * dEz_dy
     if Nz > 1:
         if k < Nz - 1:
             Hx[i, j, k] -= (cH / mu_x[i, j, k]) * psi[i, p, k]
@@ -187,7 +187,7 @@ def _k_HX_Z(Ey, Hx, mu_x, psi, b, c, sel, cH, dz, Nx, Ny, nP):
         return
     k = sel[p]
     dEy_dz = (Ey[i, j, k + 1] - Ey[i, j, k]) / dz
-    psi[i, j, p] = b[p] * psi[i, j, p] + c[p] * dEy_dz
+    psi[i, j, p] = b[i, j, p] * psi[i, j, p] + c[i, j, p] * dEy_dz
     if j < Ny - 1:
         Hx[i, j, k] += (cH / mu_x[i, j, k]) * psi[i, j, p]
 
@@ -200,7 +200,7 @@ def _k_HY_X(Ez, Hy, mu_y, psi, b, c, sel, cH, dx, nP, Ny, Nz):
         return
     i = sel[p]
     dEz_dx = (Ez[i + 1, j, k] - Ez[i, j, k]) / dx
-    psi[p, j, k] = b[p] * psi[p, j, k] + c[p] * dEz_dx
+    psi[p, j, k] = b[p, j, k] * psi[p, j, k] + c[p, j, k] * dEz_dx
     if Nz > 1:
         if k < Nz - 1:
             Hy[i, j, k] += (cH / mu_y[i, j, k]) * psi[p, j, k]
@@ -216,7 +216,7 @@ def _k_HY_Z(Ex, Hy, mu_y, psi, b, c, sel, cH, dz, Nx, Ny, nP):
         return
     k = sel[p]
     dEx_dz = (Ex[i, j, k + 1] - Ex[i, j, k]) / dz
-    psi[i, j, p] = b[p] * psi[i, j, p] + c[p] * dEx_dz
+    psi[i, j, p] = b[i, j, p] * psi[i, j, p] + c[i, j, p] * dEx_dz
     if i < Nx - 1:
         Hy[i, j, k] -= (cH / mu_y[i, j, k]) * psi[i, j, p]
 
@@ -229,7 +229,7 @@ def _k_HZ_X(Ey, Hz, mu_z, psi, b, c, sel, cH, dx, nP, Ny, Nz):
         return
     i = sel[p]
     dEy_dx = (Ey[i + 1, j, k] - Ey[i, j, k]) / dx
-    psi[p, j, k] = b[p] * psi[p, j, k] + c[p] * dEy_dx
+    psi[p, j, k] = b[p, j, k] * psi[p, j, k] + c[p, j, k] * dEy_dx
     if j < Ny - 1:
         Hz[i, j, k] -= (cH / mu_z[i, j, k]) * psi[p, j, k]
 
@@ -242,7 +242,7 @@ def _k_HZ_Y(Ex, Hz, mu_z, psi, b, c, sel, cH, dy, Nx, nP, Nz):
         return
     j = sel[p]
     dEx_dy = (Ex[i, j + 1, k] - Ex[i, j, k]) / dy
-    psi[i, p, k] = b[p] * psi[i, p, k] + c[p] * dEx_dy
+    psi[i, p, k] = b[i, p, k] * psi[i, p, k] + c[i, p, k] * dEx_dy
     if i < Nx - 1:
         Hz[i, j, k] += (cH / mu_z[i, j, k]) * psi[i, p, k]
 
@@ -258,7 +258,7 @@ def _k_EX_Y(Hz, Ex, eps_x, psi, b, c, sel, cE, dy, Nx, nP, Nz):
         return
     j = sel[p]
     dHz_dy = (Hz[i, j, k] - Hz[i, j - 1, k]) / dy
-    psi[i, p, k] = b[p] * psi[i, p, k] + c[p] * dHz_dy
+    psi[i, p, k] = b[i, p, k] * psi[i, p, k] + c[i, p, k] * dHz_dy
     if Nz > 1:
         if k >= 1:
             Ex[i, j, k] += (cE / eps_x[i, j, k]) * psi[i, p, k]
@@ -274,7 +274,7 @@ def _k_EX_Z(Hy, Ex, eps_x, psi, b, c, sel, cE, dz, Nx, Ny, nP):
         return
     k = sel[p]
     dHy_dz = (Hy[i, j, k] - Hy[i, j, k - 1]) / dz
-    psi[i, j, p] = b[p] * psi[i, j, p] + c[p] * dHy_dz
+    psi[i, j, p] = b[i, j, p] * psi[i, j, p] + c[i, j, p] * dHy_dz
     if j >= 1:
         Ex[i, j, k] -= (cE / eps_x[i, j, k]) * psi[i, j, p]
 
@@ -287,7 +287,7 @@ def _k_EY_X(Hz, Ey, eps_y, psi, b, c, sel, cE, dx, nP, Ny, Nz):
         return
     i = sel[p]
     dHz_dx = (Hz[i, j, k] - Hz[i - 1, j, k]) / dx
-    psi[p, j, k] = b[p] * psi[p, j, k] + c[p] * dHz_dx
+    psi[p, j, k] = b[p, j, k] * psi[p, j, k] + c[p, j, k] * dHz_dx
     if Nz > 1:
         if k >= 1:
             Ey[i, j, k] -= (cE / eps_y[i, j, k]) * psi[p, j, k]
@@ -303,7 +303,7 @@ def _k_EY_Z(Hx, Ey, eps_y, psi, b, c, sel, cE, dz, Nx, Ny, nP):
         return
     k = sel[p]
     dHx_dz = (Hx[i, j, k] - Hx[i, j, k - 1]) / dz
-    psi[i, j, p] = b[p] * psi[i, j, p] + c[p] * dHx_dz
+    psi[i, j, p] = b[i, j, p] * psi[i, j, p] + c[i, j, p] * dHx_dz
     if i >= 1:
         Ey[i, j, k] += (cE / eps_y[i, j, k]) * psi[i, j, p]
 
@@ -316,7 +316,7 @@ def _k_EZ_X(Hy, Ez, eps_z, psi, b, c, sel, cE, dx, nP, Ny, Nz):
         return
     i = sel[p]
     dHy_dx = (Hy[i, j, k] - Hy[i - 1, j, k]) / dx
-    psi[p, j, k] = b[p] * psi[p, j, k] + c[p] * dHy_dx
+    psi[p, j, k] = b[p, j, k] * psi[p, j, k] + c[p, j, k] * dHy_dx
     if j >= 1:
         Ez[i, j, k] += (cE / eps_z[i, j, k]) * psi[p, j, k]
 
@@ -329,7 +329,7 @@ def _k_EZ_Y(Hx, Ez, eps_z, psi, b, c, sel, cE, dy, Nx, nP, Nz):
         return
     j = sel[p]
     dHx_dy = (Hx[i, j, k] - Hx[i, j - 1, k]) / dy
-    psi[i, p, k] = b[p] * psi[i, p, k] + c[p] * dHx_dy
+    psi[i, p, k] = b[i, p, k] * psi[i, p, k] + c[i, p, k] * dHx_dy
     if i >= 1:
         Ez[i, j, k] -= (cE / eps_z[i, j, k]) * psi[i, p, k]
 
@@ -417,10 +417,14 @@ def update_E(grid: FDTDGrid) -> FDTDGrid:
     return g
 
 
-def _dev_ravel(a, dtype):
-    """CPML (b, c) slab arrays are stored reshaped to broadcast; the kernels want
-    them 1D in slab order and in the field dtype."""
-    return cuda.to_device(np.ascontiguousarray(a).ravel().astype(dtype, copy=False))
+def _dev_cast(a, dtype):
+    """A CPML (b, c) slab on the device, in the field dtype.
+
+    These are full 3D slabs shaped like the psi they drive — sigma_max carries a
+    per-cell material factor (see :mod:`wavesim.pml`) — so the kernels index them
+    with the same triple as psi and nothing is flattened on the way over.
+    """
+    return cuda.to_device(np.ascontiguousarray(a, dtype=dtype))
 
 
 def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays]:
@@ -443,9 +447,9 @@ def update_H_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     szH = cuda.to_device(cpml.sel_zH)
     nxH, nyH, nzH = cpml.sel_xH.shape[0], cpml.sel_yH.shape[0], cpml.sel_zH.shape[0]
 
-    bxH, cxH = _dev_ravel(cpml.bxH_s, dtype), _dev_ravel(cpml.cxH_s, dtype)
-    byH, cyH = _dev_ravel(cpml.byH_s, dtype), _dev_ravel(cpml.cyH_s, dtype)
-    bzH, czH = _dev_ravel(cpml.bzH_s, dtype), _dev_ravel(cpml.czH_s, dtype)
+    bxH, cxH = _dev_cast(cpml.bxH_s, dtype), _dev_cast(cpml.cxH_s, dtype)
+    byH, cyH = _dev_cast(cpml.byH_s, dtype), _dev_cast(cpml.cyH_s, dtype)
+    bzH, czH = _dev_cast(cpml.bzH_s, dtype), _dev_cast(cpml.czH_s, dtype)
 
     p_Ez_y = cuda.to_device(cpml.psi_Ez_y)
     p_Ey_z = cuda.to_device(cpml.psi_Ey_z)
@@ -496,9 +500,9 @@ def update_E_pml(grid: FDTDGrid, cpml: CPMLArrays) -> tuple[FDTDGrid, CPMLArrays
     szE = cuda.to_device(cpml.sel_zE)
     nxE, nyE, nzE = cpml.sel_xE.shape[0], cpml.sel_yE.shape[0], cpml.sel_zE.shape[0]
 
-    bxE, cxE = _dev_ravel(cpml.bxE_s, dtype), _dev_ravel(cpml.cxE_s, dtype)
-    byE, cyE = _dev_ravel(cpml.byE_s, dtype), _dev_ravel(cpml.cyE_s, dtype)
-    bzE, czE = _dev_ravel(cpml.bzE_s, dtype), _dev_ravel(cpml.czE_s, dtype)
+    bxE, cxE = _dev_cast(cpml.bxE_s, dtype), _dev_cast(cpml.cxE_s, dtype)
+    byE, cyE = _dev_cast(cpml.byE_s, dtype), _dev_cast(cpml.cyE_s, dtype)
+    bzE, czE = _dev_cast(cpml.bzE_s, dtype), _dev_cast(cpml.czE_s, dtype)
 
     p_Hz_y = cuda.to_device(cpml.psi_Hz_y)
     p_Hy_z = cuda.to_device(cpml.psi_Hy_z)
@@ -640,12 +644,12 @@ class CudaResident:
                                         c.sel_zH.shape[0])
         self.nxE, self.nyE, self.nzE = (c.sel_xE.shape[0], c.sel_yE.shape[0],
                                         c.sel_zE.shape[0])
-        self.bxH, self.cxH = _dev_ravel(c.bxH_s, dt), _dev_ravel(c.cxH_s, dt)
-        self.byH, self.cyH = _dev_ravel(c.byH_s, dt), _dev_ravel(c.cyH_s, dt)
-        self.bzH, self.czH = _dev_ravel(c.bzH_s, dt), _dev_ravel(c.czH_s, dt)
-        self.bxE, self.cxE = _dev_ravel(c.bxE_s, dt), _dev_ravel(c.cxE_s, dt)
-        self.byE, self.cyE = _dev_ravel(c.byE_s, dt), _dev_ravel(c.cyE_s, dt)
-        self.bzE, self.czE = _dev_ravel(c.bzE_s, dt), _dev_ravel(c.czE_s, dt)
+        self.bxH, self.cxH = _dev_cast(c.bxH_s, dt), _dev_cast(c.cxH_s, dt)
+        self.byH, self.cyH = _dev_cast(c.byH_s, dt), _dev_cast(c.cyH_s, dt)
+        self.bzH, self.czH = _dev_cast(c.bzH_s, dt), _dev_cast(c.czH_s, dt)
+        self.bxE, self.cxE = _dev_cast(c.bxE_s, dt), _dev_cast(c.cxE_s, dt)
+        self.byE, self.cyE = _dev_cast(c.byE_s, dt), _dev_cast(c.cyE_s, dt)
+        self.bzE, self.czE = _dev_cast(c.bzE_s, dt), _dev_cast(c.czE_s, dt)
         self.p_Ez_y = cuda.to_device(c.psi_Ez_y)
         self.p_Ey_z = cuda.to_device(c.psi_Ey_z)
         self.p_Ex_z = cuda.to_device(c.psi_Ex_z)
