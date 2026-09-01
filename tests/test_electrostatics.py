@@ -669,3 +669,213 @@ def test_cg_reproduces_the_direct_charge_and_energy():
     assert iterative.charge("top") == pytest.approx(direct.charge("top"),
                                                     rel=1e-8)
     assert iterative.energy == pytest.approx(direct.energy, rel=1e-8)
+
+
+# ====================================================================== #
+# Floating conductors
+#
+# A floating body is one unknown potential plus one Gauss's law constraint, so
+# the tests come in matching pairs: the potential it settles at, against a
+# closed-form divider, and the charge it holds, against the number that was
+# asked for. Both are exactly representable here — three parallel plates make a
+# capacitive divider whose answer the mesh can hit to round-off — which is what
+# lets these demand round-off rather than a tolerance.
+# ====================================================================== #
+
+def _three_plates(g):
+    """Driven plates at cells 2 and 15 with a third, floatable, at cell 8.
+
+    Node sets 2..3, 8..9 and 15..16, so the two gaps span five and six
+    intervals — deliberately unequal, so a divider that ignored the geometry and
+    simply averaged the two drives would still be wrong.
+    """
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 2e-3, 3e-3, 1.0, pec=True, name="bot")
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 8e-3, 9e-3, 1.0, pec=True, name="mid")
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 15e-3, 16e-3, 1.0, pec=True, name="top")
+    return g
+
+
+def _float_solve(g, potentials, floating, boundary='neumann', method='direct',
+                 **kw):
+    es = Electrostatics(g)
+    for name, volts in potentials.items():
+        es.set_potential(name, volts)
+    for name, charge in floating.items():
+        es.set_floating(name, charge)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return es.solve(boundary=boundary, method=method, **kw)
+
+
+def test_a_floating_plate_sits_at_the_capacitive_divider():
+    """Two series gaps of 5 and 6 cells put the middle plate at 5/11 of the drive.
+
+    The plates are full width, so the two capacitors share an area that cancels
+    and the divider is purely the gap ratio. Exactly representable, hence exact.
+    """
+    sol = _float_solve(_three_plates(_grid()), {"bot": 0.0, "top": 10.0},
+                       {"mid": 0.0})
+    assert sol.potential_of("mid") == pytest.approx(10.0 * 5 / 11, rel=1e-12)
+
+
+def test_a_floating_conductor_holds_the_charge_it_was_given():
+    """The constraint row *is* the flux out of the body, so this is an identity.
+
+    It is still worth asserting: it is the one place the sign, the eps0 scaling
+    and the reduction's row ordering all have to agree, and getting any of them
+    wrong leaves a solution that looks perfectly plausible.
+    """
+    g = _three_plates(_grid())
+    for q in (0.0, 1e-12, -3e-13):
+        sol = _float_solve(g, {"bot": 0.0, "top": 0.0}, {"mid": q})
+        assert sol.charge("mid") == pytest.approx(q, abs=1e-24)
+
+
+def test_a_charged_floating_plate_sits_at_Q_over_C():
+    """With both neighbours grounded the body is just a capacitor to ground.
+
+    ``C = eps0*A*(1/d1 + 1/d2)`` with ``A`` the dual-cell area of the full-width
+    plate — eleven dual widths, not twelve, because the end nodes own half a
+    cell each (see ``_node_dual``). That the analytic value needs that detail is
+    the point: it checks the charge lands on the same control volume the
+    operator integrates over.
+    """
+    q = 1e-12
+    sol = _float_solve(_three_plates(_grid()), {"bot": 0.0, "top": 0.0},
+                       {"mid": q})
+    area = (11 * DS) ** 2
+    C = EPS0 * area * (1 / (5 * DS) + 1 / (6 * DS))
+    assert sol.potential_of("mid") == pytest.approx(q / C, rel=1e-12)
+
+
+def test_an_uncharged_floating_conductor_leaves_the_system_neutral():
+    sol = _float_solve(_three_plates(_grid()), {"bot": 0.0, "top": 10.0},
+                       {"mid": 0.0})
+    total = sum(sol.charge(n) for n in ("bot", "mid", "top"))
+    assert total == pytest.approx(0.0, abs=1e-24)
+
+
+def test_a_floating_body_is_exactly_equipotential():
+    """Not approximately: the body has one unknown, so its nodes cannot differ.
+
+    This is the property the collapse buys over a Lagrange multiplier, which
+    would satisfy the constraint only to the solver's tolerance — so it is
+    asserted at zero spread, and under CG, where a tolerance would show.
+    """
+    g = _three_plates(_grid())
+    sol = _float_solve(g, {"bot": 0.0, "top": 10.0}, {"mid": 0.0},
+                       method='cg', rtol=1e-10)
+    body = sol.phi[sol.body_labels == sol.part_body["mid"]]
+    assert np.ptp(body) == 0.0
+
+
+def test_cg_and_the_factorisation_agree_on_a_floating_body():
+    g = _three_plates(_grid())
+    kw = dict(potentials={"bot": 0.0, "top": 10.0}, floating={"mid": 2e-13})
+    direct = _float_solve(g, method='direct', **kw)
+    iterative = _float_solve(g, method='cg', rtol=1e-12, **kw)
+    assert iterative.potential_of("mid") == pytest.approx(
+        direct.potential_of("mid"), rel=1e-8)
+    assert iterative.energy == pytest.approx(direct.energy, rel=1e-8)
+
+
+def test_floating_at_zero_charge_is_not_the_same_as_grounded():
+    """The distinction the API exists to make, asserted rather than assumed."""
+    g = _three_plates(_grid())
+    floated = _float_solve(g, {"bot": 0.0, "top": 10.0}, {"mid": 0.0})
+    grounded = _float_solve(g, {"bot": 0.0, "top": 10.0, "mid": 0.0}, {})
+    assert floated.potential_of("mid") > 1.0
+    assert grounded.potential_of("mid") == 0.0
+    assert abs(grounded.charge("mid")) > 1e-13     # ground supplied it
+
+
+def test_a_floating_conductor_still_cuts_the_field():
+    """A floated plate spanning the domain blocks the field, as metal does.
+
+    It carries no net charge but is polarised — the physics that an
+    'unset means grounded' model gets right for the field and wrong for the
+    charge, and that leaving it out of the solve entirely gets wrong for both.
+    """
+    sol = _float_solve(_three_plates(_grid()), {"bot": 0.0, "top": 10.0},
+                       {"mid": 0.0})
+    Ez = sol.E[2][6, 6, :]
+    assert np.all(np.abs(Ez[8:9]) < 1e-9)         # inside the metal
+    assert np.abs(Ez[4]) > 100.0                  # lower gap is live
+
+
+# -- floating: the guard rails ----------------------------------------- #
+
+def test_floating_and_driven_are_mutually_exclusive_and_last_wins():
+    g = _three_plates(_grid())
+    es = Electrostatics(g)
+    es.set_potential("mid", 5.0).set_floating("mid")
+    assert "mid" not in es.potentials and es.floating == {"mid": 0.0}
+    es.set_potential("mid", 5.0)
+    assert "mid" not in es.floating and es.potentials == {"mid": 5.0}
+
+
+def test_floating_a_part_shorted_to_a_driven_one_is_refused():
+    g = _grid()
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 2e-3, 3e-3, 1.0, pec=True, name="a")
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 3e-3, 4e-3, 1.0, pec=True, name="b")
+    with pytest.raises(ValueError, match="both be held at a potential"):
+        _float_solve(g, {"a": 1.0}, {"b": 0.0})
+
+
+def test_shorted_floating_parts_with_different_charges_are_refused():
+    g = _grid()
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 2e-3, 3e-3, 1.0, pec=True, name="a")
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 3e-3, 4e-3, 1.0, pec=True, name="b")
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 15e-3, 16e-3, 1.0, pec=True, name="drive")
+    with pytest.raises(ValueError, match="different floating charges"):
+        _float_solve(g, {"drive": 1.0}, {"a": 1e-12, "b": 2e-12})
+
+
+def test_shorted_floating_parts_with_the_same_charge_are_fine():
+    """One body, one surface, one charge — naming it twice is not a conflict."""
+    g = _grid()
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 2e-3, 3e-3, 1.0, pec=True, name="a")
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 3e-3, 4e-3, 1.0, pec=True, name="b")
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 15e-3, 16e-3, 1.0, pec=True, name="drive")
+    sol = _float_solve(g, {"drive": 1.0}, {"a": 1e-12, "b": 1e-12})
+    assert sol.charge("a") == pytest.approx(1e-12, abs=1e-24)
+    assert sol.potential_of("a") == sol.potential_of("b")
+
+
+def test_a_floating_conductor_touching_a_driven_wall_is_refused():
+    g = _grid()
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 0, 1e-3, 1.0, pec=True, name="onwall")
+    ws.set_box(g, 0, 12e-3, 0, 12e-3, 15e-3, 16e-3, 1.0, pec=True, name="drive")
+    with pytest.raises(ValueError, match="is not floating"):
+        _float_solve(g, {"drive": 1.0}, {"onwall": 0.0}, boundary='ground')
+
+
+def test_an_all_floating_neumann_box_is_still_singular():
+    """Floating pins nothing, so it cannot rescue an undetermined constant."""
+    g = _grid()
+    ws.set_box(g, 4e-3, 8e-3, 4e-3, 8e-3, 4e-3, 8e-3, 1.0, pec=True, name="a")
+    with pytest.raises(ValueError, match="singular"):
+        _float_solve(g, {}, {"a": 0.0}, boundary='neumann')
+
+
+def test_setting_floating_on_an_unknown_part_fails_immediately():
+    g = _plates(_grid())
+    with pytest.raises((KeyError, ValueError)):
+        Electrostatics(g).set_floating("nosuchpart")
+
+
+def test_the_solution_records_what_was_floated():
+    sol = _float_solve(_three_plates(_grid()), {"bot": 0.0, "top": 10.0},
+                       {"mid": 5e-13})
+    assert sol.floating == {"mid": 5e-13}
+    assert sol.floating_potentials["mid"] == pytest.approx(
+        sol.potential_of("mid"))
+
+
+def test_potential_of_reads_driven_conductors_too():
+    sol = _float_solve(_three_plates(_grid()), {"bot": -2.0, "top": 10.0},
+                       {"mid": 0.0})
+    assert sol.potential_of("bot") == -2.0
+    assert sol.potential_of("top") == 10.0
+    with pytest.raises(KeyError):
+        sol.potential_of("nosuchpart")

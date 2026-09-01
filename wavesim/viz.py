@@ -1511,6 +1511,12 @@ def _es_conditions(sol) -> str:
     """The drive conditions, so a picture is self-describing."""
     driven = ", ".join(f'{n} = {v:g} V'
                        for n, v in sorted(sol.potentials.items()))
+    # A floated body reads back the potential the solve found, which is the
+    # answer being looked at — so it is labelled with that, not with its charge.
+    for n in sorted(getattr(sol, 'floating', ()) or ()):
+        found = sol.floating_potentials.get(n)
+        if found is not None:
+            driven += (", " if driven else "") + f'{n} = {found:g} V (floating)'
     if sol.grounded_bodies:
         driven += (", " if driven else "") + f'{sol.grounded_bodies} grounded'
     return driven or "no assigned potentials"

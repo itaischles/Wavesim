@@ -83,6 +83,32 @@ finite box is an infinite domain, and no local rule at the wall reproduces it.
 An isolated charged object is modelled by putting a Dirichlet ``φ = 0`` box far
 enough away that moving it further stops changing the answer — which is a
 convergence study the caller owns, not a setting.
+
+Floating conductors
+-------------------
+A conductor need not be driven. A piece of metal nobody connects to anything
+still has to be an equipotential, and it still has to hold whatever total charge
+it started with — usually none. That is one unknown potential plus one Gauss's
+law constraint, not one unknown per node, and it is imposed here by *collapsing*
+every node of the body onto a single column of the system rather than by adding
+a Lagrange multiplier:
+
+    ``x_full = P x_reduced``,   ``(Pᵀ A P) x_reduced = Pᵀ b + Q/ε₀``
+
+with ``P`` the 0/1 map sending each floating body's nodes to one shared unknown.
+Two things follow, and both are the reason it is done this way. The reduced
+operator stays symmetric positive definite — so conjugate gradients, the only
+method that scales here, still applies unchanged, which a saddle-point
+multiplier formulation would have destroyed. And the equipotential constraint is
+satisfied *exactly*, at every iterate, because the body has literally one number
+to be; it is not something the solve converges towards.
+
+The constraint row is the sum of the body's node rows, whose internal faces
+cancel in pairs, leaving exactly the flux out of the body's surface — which is
+:func:`_node_flux`, which is the charge. So the charge boundary condition is not
+a second discretisation bolted on: it is the same finite-volume balance the free
+nodes obey, summed. :meth:`ElectrostaticSolution.charge` on a floating body
+returns the number that was asked for, and that agreement is a real check.
 """
 
 from __future__ import annotations
@@ -420,6 +446,65 @@ def _assemble(coefs, fixed: np.ndarray):
     return A, B, free_idx
 
 
+def _floating_reduction(groups: np.ndarray, free_idx: np.ndarray, n_free: int,
+                        n_groups: int):
+    """The 0/1 map ``P`` collapsing each floating body onto one unknown.
+
+    ``groups`` labels every node with its floating body (0…``n_groups``−1) or −1;
+    those nodes are *free*, deliberately, since a floating body's potential is
+    what we are solving for. ``P`` is ``n_free × n_reduced``: an ordinary free
+    node gets its own column, and every node of floating body ``g`` shares the
+    column ``n_plain + g``. The floating unknowns are placed last so the caller
+    can add their charges to the tail of the right-hand side by slicing.
+
+    Returns ``(P, n_reduced)``, or ``(None, n_free)`` when nothing floats, which
+    is the signal to solve the system as assembled and skip the reduction
+    entirely.
+
+    ``P`` has one entry per row and full column rank, so ``PᵀAP`` inherits
+    symmetry and positive definiteness from ``A`` — no fill-in worth worrying
+    about either, since only the body's own columns merge.
+    """
+    if n_groups == 0:
+        return None, n_free
+
+    live = free_idx >= 0
+    group_of_row = np.full(n_free, -1, dtype=np.int64)
+    group_of_row[free_idx[live]] = groups[live]
+
+    plain = group_of_row < 0
+    n_plain = int(plain.sum())
+    cols = np.empty(n_free, dtype=np.int64)
+    cols[plain] = np.arange(n_plain)
+    cols[~plain] = n_plain + group_of_row[~plain]
+
+    n_reduced = n_plain + n_groups
+    P = coo_matrix((np.ones(n_free), (np.arange(n_free), cols)),
+                   shape=(n_free, n_reduced)).tocsr()
+    return P, n_reduced
+
+
+def _check_floating_coupled(A_red, n_groups: int, group_names) -> None:
+    """Refuse a floating body that no face of the operator touches.
+
+    Its column is then identically zero: the body's charge has nowhere to go and
+    its potential is not determined by anything, so the reduced system is
+    singular and CG would wander rather than fail. Caught here so the message
+    names the part instead of the matrix.
+    """
+    if n_groups == 0:
+        return
+    diag = A_red.diagonal()[A_red.shape[0] - n_groups:]
+    for g in np.flatnonzero(diag <= 0.0):
+        names = ", ".join(group_names[g]) or "an unnamed body"
+        raise ValueError(
+            f"floating conductor {names} is not coupled to anything: every "
+            f"edge leaving it is covered by metal, so its potential is not "
+            f"determined and its charge has nowhere to terminate. It is either "
+            f"fully enclosed by another conductor it touches, or a single node "
+            f"lost inside one — wavesim.parts.check_shorts() lists such joins.")
+
+
 # ====================================================================== #
 # Derived quantities
 #
@@ -623,6 +708,8 @@ class ElectrostaticSolution:
     method: str
     n_unknowns: int
     iterations: int = 0
+    floating: Dict[str, float] = field(default_factory=dict)
+    floating_potentials: Dict[str, float] = field(default_factory=dict)
     node_pec: np.ndarray = field(default=None, repr=False)
     coefs: Tuple[np.ndarray, ...] = field(default=None, repr=False)
     open_lengths: Tuple[np.ndarray, ...] = field(default=None, repr=False)
@@ -634,6 +721,27 @@ class ElectrostaticSolution:
     def potential_at(self, x: float, y: float, z: float) -> float:
         """φ at the node nearest a physical position, in volts."""
         return float(self.phi[self.grid.position_to_index(x, y, z)])
+
+    def potential_of(self, name: str) -> float:
+        """The potential in volts of the body the named part belongs to.
+
+        For a driven conductor this returns what was assigned; for a floating
+        one it returns what the solve found, which is the answer that was being
+        asked for. Read off φ itself rather than from either dictionary, so the
+        two cases go through one path and the number is the one the fields were
+        actually built from.
+        """
+        body = self._body_of(name)
+        nodes = self.phi[self.body_labels == body]
+        return float(nodes.flat[0])
+
+    def _body_of(self, name: str) -> int:
+        body = self.part_body.get(name)
+        if body is None:
+            known = ", ".join(sorted(self.part_body)) or "none"
+            raise KeyError(f"no conductor named {name!r} in this solution; "
+                           f"available: {known}")
+        return body
 
     # -- fields --------------------------------------------------------- #
 
@@ -728,12 +836,8 @@ class ElectrostaticSolution:
         every node the conductor occupies, which telescopes to the flux through
         its surface because interior nodes are surrounded by their own potential.
         """
-        body = self.part_body.get(name)
-        if body is None:
-            known = ", ".join(sorted(self.part_body)) or "none"
-            raise KeyError(f"no conductor named {name!r} in this solution; "
-                           f"available: {known}")
-        return float(self.node_charge[self.body_labels == body].sum())
+        here = self.body_labels == self._body_of(name)
+        return float(self.node_charge[here].sum())
 
 
 # ====================================================================== #
@@ -754,27 +858,61 @@ class Electrostatics:
     different ones is refused rather than averaged — it is a modelling error,
     usually two CAD solids clearing each other by less than a cell.
 
-    A conductor nobody assigned a potential to is grounded at 0 V, with a
-    warning saying how many were. That is the useful default (an enclosure or a
-    shield is normally exactly that) and it is also what a mistyped part name
-    looks like, so it is worth saying out loud.
+    A part may instead be made **floating**, which ties its potential to nothing
+    external:
+
+        >>> es.set_floating('shield')                 # isolated, uncharged
+        >>> es.set_floating('droplet', charge=1e-12)  # isolated, 1 pC on it
+
+    Its potential is then an unknown of the solve, fixed by the charge it
+    carries and by everything around it — the pick-up voltage on an unconnected
+    trace, the field-shaping of an unbiased guard ring, the potential a charged
+    isolated body settles at. Read it back with
+    :meth:`ElectrostaticSolution.potential_of`.
+
+    A conductor nobody assigned either to is grounded at 0 V, with a warning
+    saying how many were. That is the useful default (an enclosure or a shield
+    is normally exactly that) and it is also what a mistyped part name looks
+    like, so it is worth saying out loud. Note the difference from floating,
+    which is easy to blur: grounded is 0 V holding whatever charge that takes,
+    floating is 0 C sitting at whatever potential that takes.
     """
 
     def __init__(self, grid: FDTDGrid):
         self.grid = grid
         self.potentials: Dict[str, float] = {}
+        self.floating: Dict[str, float] = {}
 
     # -- setup ---------------------------------------------------------- #
 
     def set_potential(self, name: str, volts: float) -> 'Electrostatics':
         """Hold the named PEC part at ``volts``. Returns self, so calls chain."""
         part_id(self.grid, name)          # raises, listing the names that exist
+        self.floating.pop(name, None)     # the two are exclusive; last call wins
         self.potentials[name] = float(volts)
         return self
 
     def ground(self, name: str) -> 'Electrostatics':
         """Hold the named part at 0 V — ``set_potential(name, 0.0)``."""
         return self.set_potential(name, 0.0)
+
+    def set_floating(self, name: str, charge: float = 0.0) -> 'Electrostatics':
+        """Let the named part find its own potential, holding ``charge`` coulombs.
+
+        The default of zero charge is the ordinary case: a conductor that was
+        neutral before the field arrived stays neutral, redistributing its own
+        charge over its surface until it is an equipotential. Give a nonzero
+        ``charge`` to model a body that was charged and then isolated.
+
+        A part can be driven or floating, not both — calling this after
+        :meth:`set_potential` on the same part replaces it, and vice versa, so
+        the last call wins rather than the two silently disagreeing. Returns
+        self, so calls chain.
+        """
+        part_id(self.grid, name)          # raises, listing the names that exist
+        self.potentials.pop(name, None)
+        self.floating[name] = float(charge)
+        return self
 
     # -- solve ---------------------------------------------------------- #
 
@@ -814,6 +952,13 @@ class Electrostatics:
         Returns
         -------
         ElectrostaticSolution
+
+        Notes
+        -----
+        Parts left floating by :meth:`set_floating` add one unknown each rather
+        than one per node, and their charge enters the right-hand side; see
+        "Floating conductors" in the module docstring. They pin nothing, so a
+        model in which *every* conductor floats still needs a Dirichlet face.
         """
         if rho is not None:
             raise NotImplementedError(
@@ -832,11 +977,13 @@ class Electrostatics:
         part_body = {name: b + 1
                      for b, names in enumerate(occupants) for name in names}
 
-        fixed, phi_fixed, n_grounded = self._pin_conductors(
-            labels, n_bodies, occupants)
-        self._pin_boundary(bc, fixed, phi_fixed)
+        fixed, phi_fixed, n_grounded, groups, charges, group_names = \
+            self._pin_conductors(labels, n_bodies, occupants)
+        self._pin_boundary(bc, fixed, phi_fixed, groups, group_names)
 
         if not fixed.any():
+            # A floating body is no help here: it pins nothing, so an all-float
+            # all-Neumann model is still only determined up to a constant.
             raise ValueError(
                 "the problem is singular: no conductor carries a potential and "
                 "every domain face is Neumann, so phi is only determined up to "
@@ -858,6 +1005,8 @@ class Electrostatics:
         coefs = _face_coefs(grid, node_pec, lengths)
         A, B, free_idx = _assemble(coefs, fixed)
         n_free = A.shape[0]
+        n_groups = len(charges)
+        P, n_unknowns = _floating_reduction(groups, free_idx, n_free, n_groups)
 
         phi = np.zeros((grid.Nx, grid.Ny, grid.Nz), dtype=np.float64)
         phi[fixed] = phi_fixed[fixed]
@@ -865,38 +1014,94 @@ class Electrostatics:
         iterations = 0
         if n_free:
             b = B @ phi_fixed[fixed]
-            x, iterations = _linear_solve(A, b, chosen, rtol, maxiter)
+            if P is None:
+                x, iterations = _linear_solve(A, b, chosen, rtol, maxiter)
+            else:
+                A_red = (P.T @ A @ P).tocsr()
+                _check_floating_coupled(A_red, n_groups, group_names)
+                # The operator is assembled in *relative* permittivity, so the
+                # flux it balances is Q/eps0 — the same factor node_charge
+                # multiplies back in.
+                b_red = P.T @ b
+                b_red[n_unknowns - n_groups:] += np.asarray(charges) / EPS0
+                x_red, iterations = _linear_solve(A_red, b_red, chosen,
+                                                  rtol, maxiter)
+                x = P @ x_red
             phi[~fixed] = x
+
+        floating_potentials = {
+            name: float(phi[groups == g].flat[0])
+            for g, names in enumerate(group_names) for name in names}
 
         return ElectrostaticSolution(
             phi=phi, grid=grid, potentials=dict(self.potentials), boundary=bc,
-            grounded_bodies=n_grounded, method=chosen, n_unknowns=n_free,
-            iterations=iterations, node_pec=node_pec, coefs=coefs,
-            open_lengths=lengths, body_labels=labels, part_body=part_body)
+            grounded_bodies=n_grounded, method=chosen, n_unknowns=n_unknowns,
+            iterations=iterations, floating=dict(self.floating),
+            floating_potentials=floating_potentials, node_pec=node_pec,
+            coefs=coefs, open_lengths=lengths, body_labels=labels,
+            part_body=part_body)
 
     # -- pinning -------------------------------------------------------- #
 
     def _pin_conductors(self, labels, n_bodies, occupants):
-        """Pin every conductor node to its body's potential.
+        """Pin every driven conductor node, and group every floating one.
 
         Works body by body rather than part by part, because a body is the thing
         that physically holds one potential. A body with no named part is
         grounded; a body with one is held at it, *including* any unnamed metal
         fused to it — that metal is the same conductor, so grounding it instead
         would be inventing a short. A body claimed at two different potentials
-        has no solution and raises.
+        has no solution and raises, and so does one claimed both driven and
+        floating, for the same reason: a conductor cannot be at a chosen
+        potential and at a found one at once.
+
+        Returns ``(fixed, phi_fixed, n_grounded, groups, charges, group_names)``.
+        A floating body is deliberately *not* in ``fixed`` — its nodes stay
+        unknowns — and is instead labelled in ``groups`` (−1 elsewhere) for
+        :func:`_floating_reduction` to collapse.
         """
         grid = self.grid
         shape = (grid.Nx, grid.Ny, grid.Nz)
         fixed = np.zeros(shape, dtype=bool)
         phi_fixed = np.zeros(shape, dtype=np.float64)
+        groups = np.full(shape, -1, dtype=np.int64)
+        charges: list = []
+        group_names: list = []
 
         if n_bodies == 0:
-            return fixed, phi_fixed, 0
+            return fixed, phi_fixed, 0, groups, charges, group_names
 
         n_grounded = 0
         for body in range(1, n_bodies + 1):
+            here = labels == body
             names = [n for n in occupants[body - 1] if n in self.potentials]
+            floaters = [n for n in occupants[body - 1] if n in self.floating]
+
+            if names and floaters:
+                raise ValueError(
+                    f"parts {names} and {floaters} are electrically the same "
+                    f"conductor, but the first were driven and the second left "
+                    f"floating. One lump of metal cannot both be held at a "
+                    f"potential and find its own — the usual cause is two "
+                    f"solids that clear each other in CAD by less than a cell. "
+                    f"wavesim.parts.check_shorts() lists every such join.")
+
+            if floaters:
+                amounts = {self.floating[n] for n in floaters}
+                if len(amounts) > 1:
+                    detail = ", ".join(f"{n}={self.floating[n]} C"
+                                       for n in floaters)
+                    raise ValueError(
+                        f"parts {floaters} are electrically the same conductor "
+                        f"but were given different floating charges ({detail}). "
+                        f"They share one surface and so one total charge; say "
+                        f"which it is rather than leaving it to be summed or "
+                        f"picked.")
+                groups[here] = len(charges)
+                charges.append(amounts.pop())
+                group_names.append(tuple(floaters))
+                continue
+
             values = {self.potentials[n] for n in names}
             if len(values) > 1:
                 detail = ", ".join(f"{n}={self.potentials[n]} V" for n in names)
@@ -912,7 +1117,6 @@ class Electrostatics:
             else:
                 volts = 0.0
                 n_grounded += 1
-            here = labels == body
             fixed |= here
             phi_fixed[here] = volts
 
@@ -924,15 +1128,32 @@ class Electrostatics:
                 f"looks like — wavesim.parts.describe_conductors(grid) lists "
                 f"what is in the model.", stacklevel=3)
 
-        return fixed, phi_fixed, n_grounded
+        return fixed, phi_fixed, n_grounded, groups, charges, group_names
 
-    def _pin_boundary(self, bc, fixed, phi_fixed):
+    def _pin_boundary(self, bc, fixed, phi_fixed, groups, group_names):
         """Pin the Dirichlet domain faces, refusing to short a live conductor."""
         shape = fixed.shape
         for face, value in bc.items():
             if value == 'neumann':
                 continue
             layer = _boundary_layer(shape, face)
+
+            # A floating body touching a driven wall is not floating: the wall
+            # holds it, and its charge is whatever the wall supplies. Refusing
+            # is the honest answer, because pinning part of the body and leaving
+            # the rest an unknown would quietly break the equipotential the
+            # reduction is built on.
+            touching = np.unique(groups[layer])
+            for g in touching[touching >= 0]:
+                names = ", ".join(group_names[g]) or "an unnamed body"
+                raise ValueError(
+                    f"floating conductor {names} touches boundary[{face!r}], "
+                    f"which is held at {value} V. A conductor shorted to a "
+                    f"driven wall is not floating — it is at that wall's "
+                    f"potential, drawing whatever charge that takes. Move it "
+                    f"off the face, make the face Neumann, or drive the part "
+                    f"with set_potential instead.")
+
             clash = fixed[layer] & (phi_fixed[layer] != value)
             if clash.any():
                 volts = np.unique(phi_fixed[layer][clash])

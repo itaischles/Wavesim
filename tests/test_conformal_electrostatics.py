@@ -332,3 +332,45 @@ def test_an_uncut_grid_reports_no_slivers_and_allocates_no_grids():
     assert n_clamped == 0
     assert [L.shape for L in lengths] == [(grid.Nx, 1, 1), (1, grid.Ny, 1),
                                           (1, 1, grid.Nz)]
+
+
+# ---------------------------------------------------------------------- #
+# Floating conductors on cut cells
+#
+# The floating constraint is the sum of a body's node rows, so it inherits the
+# cut-cell weights rather than re-deriving them. The check that this is true is
+# a reciprocity one: measure C by driving the core, then float the core with a
+# known charge and see that it settles at exactly Q/C. Nothing in the second
+# solve knows the first one's answer, and a coefficient that entered the
+# constraint differently from the operator would break the identity — on cut
+# cells first, since that is where the two could disagree.
+# ---------------------------------------------------------------------- #
+
+def test_a_floating_cut_cell_conductor_sits_at_Q_over_its_measured_C():
+    grid, _ = _coax(48)
+    C = _solve(grid).charge("core")            # core at 1 V, shield at 0 V
+
+    Q = 1e-12
+    es = Electrostatics(grid)
+    es.set_potential("shield", 0.0).set_floating("core", Q)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sol = es.solve(boundary='neumann', method='direct')
+
+    assert sol.potential_of("core") == pytest.approx(Q / C, rel=1e-12)
+    assert sol.charge("core") == pytest.approx(Q, abs=1e-24)
+
+
+def test_a_floating_cut_cell_body_is_exactly_equipotential_under_cg():
+    """Cut cells are where a per-node scheme would leak: the open fractions make
+    the coefficients on a body's surface span orders of magnitude, so an
+    equipotential enforced by penalty or by tolerance would show it here. The
+    collapse makes the spread identically zero instead."""
+    grid, _ = _coax(48)
+    es = Electrostatics(grid)
+    es.set_potential("shield", 0.0).set_floating("core", 1e-12)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sol = es.solve(boundary='neumann', method='cg', rtol=1e-12)
+    body = sol.phi[sol.body_labels == sol.part_body["core"]]
+    assert np.ptp(body) == 0.0
