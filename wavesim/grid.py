@@ -457,10 +457,9 @@ def create_grid(Nx: int, Ny: int, Nz: int,
         (uniform cubic cells).
     dtype : numpy dtype, optional
         Storage dtype for all field and material arrays (default
-        ``np.float64``). Pass ``np.float32`` for the GPU (``backend='cuda'``)
-        path: it halves memory traffic and, on consumer NVIDIA cards, avoids the
-        heavily throttled float64 arithmetic. The NumPy/Numba CPU backends run
-        correctly in either precision but are validated in float64.
+        ``np.float64``). ``np.float32`` halves memory traffic; the NumPy/Numba
+        backends run correctly in either precision but are validated in
+        float64.
         :func:`wavesim.pml.init_cpml` follows this dtype automatically.
 
     Returns

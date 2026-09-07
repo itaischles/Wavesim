@@ -562,9 +562,8 @@ def init_cpml(grid: FDTDGrid, d_pml: int = 10,
     sel_yH = _slab_indices(cy_H, 'H'); sel_yE = _slab_indices(cy_E, 'E')
     sel_zH = _slab_indices(cz_H, 'H'); sel_zE = _slab_indices(cz_E, 'E')
 
-    # psi arrays and the sampled coefficients follow the grid's storage dtype
-    # (float32 for the GPU path); the full 1D profiles above stay float64 for
-    # inspection. The profiles are built in float64 and cast on sampling so the
+    # psi arrays and the sampled coefficients follow the grid's storage dtype;
+    # the full 1D profiles above stay float64 for inspection. The profiles are built in float64 and cast on sampling so the
     # exp()/division that shapes them keeps full precision.
     dtype = grid.Ex.dtype
 

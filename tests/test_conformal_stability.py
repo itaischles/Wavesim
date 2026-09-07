@@ -203,15 +203,6 @@ def test_unknown_mode_is_rejected():
         ws.Simulation(_cut_grid(0.05, threshold=0.4), conformal_stability='yes')
 
 
-def test_cuda_conformal_is_refused_rather_than_mismeasured():
-    """A CUDA probe would step the staircase kernel (R7's CudaResident hole) and
-    report a reassuring 1.000 for a conformal grid whose conformal update never
-    ran. Refuse instead — the backend's own guard, raised one step earlier."""
-    pytest.importorskip("wavesim.backend_cuda")
-    with pytest.raises(NotImplementedError, match="conformal"):
-        ws.Simulation(_cut_grid(0.05, threshold=0.4), backend='cuda')
-
-
 def test_clamping_cannot_always_save_it():
     """A grid that is unstable for a reason clamping does not reach must fail
     loudly rather than climb to a threshold that ruins the geometry."""

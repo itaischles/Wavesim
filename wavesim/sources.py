@@ -1670,10 +1670,7 @@ class ModalPort:
         as the single-port path always did, so it makes no new demand of the
         backend. Every path that runs boundaries runs them through
         :meth:`~wavesim.simulation.Simulation.step`, where ``grid.Hx`` &c. are
-        host numpy arrays on all three backends — the CUDA one included, since it
-        keeps the fields on the host between steps. (``run(backend='cuda')`` takes
-        the resident fast path, which does not run boundaries at all: a
-        pre-existing limitation, unrelated to this write.)
+        host numpy arrays on both backends.
         """
         group = self._group
         group.open_step(self, t)

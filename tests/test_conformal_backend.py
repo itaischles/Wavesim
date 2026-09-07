@@ -1,13 +1,12 @@
-"""Phase 4 — the conformal H update in the Numba backend, and the CUDA guard.
+"""Phase 4 — the conformal H update in the Numba backend.
 
 Until this landed, a conformal grid on ``backend='numba'`` was a **silently
 wrong answer**: the Numba H update integrated the full face area while
 ``apply_pec_mask`` zeroed E by the cut-cell rule, so E and H saw different
 conductors. Nothing raised, nothing warned, and the run looked healthy. That is
 exactly the failure the homogeneous-fill invariant exists to catch, and it must
-not be reachable by accident — hence both halves of this module: the Numba
-kernel now tracks the NumPy reference, and CUDA (which has no conformal kernel)
-refuses the grid outright rather than staircasing it.
+not be reachable by accident — hence this module, which pins the Numba kernel
+to the NumPy reference.
 """
 
 import numpy as np
@@ -134,30 +133,3 @@ def test_conformal_dispatch_actually_changes_the_answer():
     stair, conf = run(False), run(True)
     rel = np.abs(conf.Hz - stair.Hz).max() / np.abs(stair.Hz).max()
     assert rel > 1e-3, f"conformal geometry moved Hz by only {rel:.2e}"
-
-
-# ---------------------------------------------------------------------- #
-# CUDA refuses rather than staircasing
-# ---------------------------------------------------------------------- #
-
-def test_cuda_refuses_a_conformal_grid():
-    """CUDA has no conformal kernel and is deliberately out of scope, so it must
-    fail loudly. Importing the backend does not need a GPU — the guard is in the
-    host-side wrapper, ahead of any launch."""
-    cu = pytest.importorskip("wavesim.backend_cuda")
-    grid = _cut_coax()
-    for fn, args in ((cu.update_H, (grid,)),
-                     (cu.update_H_pml, (grid, None))):
-        with pytest.raises(NotImplementedError, match="conformal"):
-            fn(*args)
-
-
-def test_cuda_still_accepts_a_staircase_grid():
-    """The guard must key on the fraction arrays, not on ``pec_mask``: a plain
-    staircased conductor is still a supported CUDA run."""
-    cu = pytest.importorskip("wavesim.backend_cuda")
-    grid = create_grid(8, 8, 8, 1e-3)
-    ws.set_vacuum(grid)
-    grid.pec_mask = np.zeros((8, 8, 8), dtype=bool)
-    grid.pec_mask[3:5, 3:5, 3:5] = True
-    cu._refuse_conformal(grid)          # does not raise

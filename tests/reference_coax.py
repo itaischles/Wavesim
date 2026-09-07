@@ -29,7 +29,7 @@ Conformal mode (``--conformal``) runs the same case with the analytic cut-cell
 fractions from :mod:`conformal_shapes`, which is how V3-V5 are re-measured after
 S5. It runs on Numba like everything else — the conformal H update landed there
 in phase 4, and ``tests/test_conformal_backend.py`` pins it bit-identical to the
-NumPy reference. CUDA has no conformal kernel and refuses such a grid outright.
+NumPy reference.
 """
 
 import sys

@@ -162,41 +162,6 @@ def test_apply_pec_mask_leaves_no_field_on_conductor_edges():
 # ---------------------------------------------------------------------- #
 
 @pytest.mark.slow
-def test_cuda_pec_matches_numpy():
-    """The device-side PEC kernel must apply the same edge rule as the host.
-
-    ``CudaResident`` runs PEC on the GPU, so it needs the per-component masks
-    too — it takes them from :func:`build_pec_edge_masks` on the host, which is
-    what makes this parity exact rather than approximate.
-    """
-    from conftest import cuda_available
-    if not cuda_available():
-        pytest.skip("no CUDA device")
-
-    n, steps = 24, 40
-
-    def run(backend):
-        grid = ws.create_grid(Nx=n, Ny=n, Nz=n, dx=1e-3, dy=1e-3, dz=1e-3)
-        ws.set_vacuum(grid)
-        grid.pec_mask = np.zeros((n, n, n), dtype=bool)
-        grid.pec_mask[9:13, 9:13, 9:13] = True
-        src = ws.PointSource('Ez', 5e-3, 5e-3, 5e-3,
-                             ws.GaussianPulse.for_fmax(60e9))
-        ws.Simulation(grid, sources=[src], backend=backend).run(steps)
-        return grid
-
-    a, b = run('numpy'), run('cuda')
-    for comp in ('Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'):
-        x, y = getattr(a, comp), getattr(b, comp)
-        scale = max(np.abs(x).max(), 1e-30)
-        assert np.abs(x - y).max() / scale < 1e-10, f"{comp} diverged"
-
-    ex, ey, ez = build_pec_edge_masks(a.pec_mask)
-    for g in (a, b):
-        assert not g.Ex[ex].any() and not g.Ey[ey].any() and not g.Ez[ez].any()
-
-
-@pytest.mark.slow
 def test_coax_propagation_velocity_matches_fill():
     """A pulse on a uniform coax travels at c/√ε_r, whatever the staircase.
 
