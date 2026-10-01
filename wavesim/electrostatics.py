@@ -116,6 +116,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Dict, Tuple
+import time
 import warnings
 
 import numpy as np
@@ -918,7 +919,7 @@ class Electrostatics:
 
     def solve(self, boundary='ground', method: str = 'auto',
               rtol: float = 1e-10, maxiter: int = None,
-              rho=None) -> ElectrostaticSolution:
+              rho=None, progress=None) -> ElectrostaticSolution:
         """Solve for the potential.
 
         Parameters
@@ -948,6 +949,13 @@ class Electrostatics:
             *relative* permittivity — so adding it is a small change, but
             nothing has needed it yet and an untested path is worse than an
             absent one.
+        progress : callable, optional
+            Called as ``progress(fraction)`` with a fraction in ``[0, 1]`` that
+            never decreases, ending at 1 once the solve is done. CG has no
+            iteration count to measure against, so the fraction is how far the
+            residual has fallen toward ``rtol`` on a log scale — the scale CG
+            converges on, which makes it close to linear in time. The direct
+            path reports only 0 and 1.
 
         Returns
         -------
@@ -1015,7 +1023,8 @@ class Electrostatics:
         if n_free:
             b = B @ phi_fixed[fixed]
             if P is None:
-                x, iterations = _linear_solve(A, b, chosen, rtol, maxiter)
+                x, iterations = _linear_solve(A, b, chosen, rtol, maxiter,
+                                              progress)
             else:
                 A_red = (P.T @ A @ P).tocsr()
                 _check_floating_coupled(A_red, n_groups, group_names)
@@ -1025,9 +1034,11 @@ class Electrostatics:
                 b_red = P.T @ b
                 b_red[n_unknowns - n_groups:] += np.asarray(charges) / EPS0
                 x_red, iterations = _linear_solve(A_red, b_red, chosen,
-                                                  rtol, maxiter)
+                                                  rtol, maxiter, progress)
                 x = P @ x_red
             phi[~fixed] = x
+        if progress is not None:
+            progress(1.0)
 
         floating_potentials = {
             name: float(phi[groups == g].flat[0])
@@ -1174,9 +1185,22 @@ class Electrostatics:
         return AUTO_METHOD if method == 'auto' else method
 
 
+# Seconds between progress reports from CG. Each report costs one extra
+# matrix-vector product to form the true residual (scipy's callback hands over
+# only the iterate), so they are rationed by time rather than taken every
+# iteration, which would add roughly half again to the cost of the solve.
+PROGRESS_INTERVAL = 0.25
+
+
 def _linear_solve(A: csr_matrix, b: np.ndarray, method: str,
-                  rtol: float, maxiter) -> Tuple[np.ndarray, int]:
-    """Solve ``A x = b`` for a symmetric positive-definite ``A``."""
+                  rtol: float, maxiter, progress=None) -> Tuple[np.ndarray, int]:
+    """Solve ``A x = b`` for a symmetric positive-definite ``A``.
+
+    *progress*, if given, is called with a non-decreasing fraction in [0, 1];
+    see :meth:`Electrostatics.solve`.
+    """
+    if progress is not None:
+        progress(0.0)
     if method == 'direct':
         return splu(A.tocsc()).solve(b), 0
 
@@ -1188,10 +1212,31 @@ def _linear_solve(A: csr_matrix, b: np.ndarray, method: str,
     M = LinearOperator(A.shape, matvec=lambda v: v / d)
 
     count = 0
+    # CG stops once ||r|| <= rtol*||b||, starting from x0 = 0 where ||r|| = ||b||.
+    # The fraction of the log10 distance between the two that has been covered
+    # is the progress; the residual is not monotone in this norm, so the
+    # reported fraction keeps its best value rather than stepping back.
+    b_norm = float(np.linalg.norm(b))
+    span = -np.log10(rtol) if 0.0 < rtol < 1.0 else 0.0
+    report = {"best": 0.0, "last": time.perf_counter()}
 
-    def tick(_):
+    def tick(xk):
         nonlocal count
         count += 1
+        if progress is None or span <= 0.0 or b_norm == 0.0:
+            return
+        now = time.perf_counter()
+        if now - report["last"] < PROGRESS_INTERVAL:
+            return
+        report["last"] = now
+        r_norm = float(np.linalg.norm(b - A @ xk))
+        if r_norm > 0.0:
+            frac = min(1.0, max(0.0, np.log10(b_norm / r_norm) / span))
+        else:
+            frac = 1.0
+        if frac > report["best"]:
+            report["best"] = frac
+            progress(frac)
 
     x, info = cg(A, b, rtol=rtol, maxiter=maxiter, M=M, callback=tick)
     if info > 0:
@@ -1250,7 +1295,7 @@ class CapacitanceMatrix:
 
 
 def capacitance_matrix(grid: FDTDGrid, names=None, *, boundary='ground',
-                       **solve_kw) -> CapacitanceMatrix:
+                       progress=None, **solve_kw) -> CapacitanceMatrix:
     """Extract the capacitance matrix by energising one conductor at a time.
 
     Runs one solve per conductor with that conductor at 1 V and the rest at 0 V,
@@ -1273,6 +1318,9 @@ def capacitance_matrix(grid: FDTDGrid, names=None, *, boundary='ground',
         exact. That is the normal way to measure a shielded structure, not an
         error. Note that a conductor touching a Dirichlet face is shorted to it
         as soon as this drives that conductor, and says so.
+    progress : callable, optional
+        Called as ``progress(fraction)`` over the whole extraction, each of the
+        per-conductor solves taking an equal share of ``[0, 1]``.
     **solve_kw
         Passed through to :meth:`Electrostatics.solve` (``method``, ``rtol``, …).
 
@@ -1307,7 +1355,11 @@ def capacitance_matrix(grid: FDTDGrid, names=None, *, boundary='ground',
             es = Electrostatics(grid)
             for n in names:
                 es.set_potential(n, 1.0 if n == driven else 0.0)
-            sol = es.solve(boundary=boundary, **solve_kw)
+            sub = None
+            if progress is not None:
+                def sub(frac, j=j):
+                    progress((j + frac) / n_cond)
+            sol = es.solve(boundary=boundary, progress=sub, **solve_kw)
             for i, probe in enumerate(names):
                 C[i, j] = sol.charge(probe)
     # The per-solve grounding notice is identical every time; say it once.

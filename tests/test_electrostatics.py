@@ -879,3 +879,44 @@ def test_potential_of_reads_driven_conductors_too():
     assert sol.potential_of("top") == 10.0
     with pytest.raises(KeyError):
         sol.potential_of("nosuchpart")
+
+
+# ---------------------------------------------------------------------- #
+# Progress reporting
+# ---------------------------------------------------------------------- #
+
+def _progress_of(method, monkeypatch):
+    # Report on every CG iteration: a test-sized solve is over well inside the
+    # real interval, and would otherwise show only its two end points.
+    monkeypatch.setattr("wavesim.electrostatics.PROGRESS_INTERVAL", 0.0)
+    seen = []
+    g = _plates(_grid())
+    Electrostatics(g).set_potential("bot", 0.0).set_potential(
+        "top", 1.0).solve(boundary='neumann', method=method,
+                           progress=seen.append)
+    return seen
+
+
+@pytest.mark.parametrize("method", ["cg", "direct"])
+def test_progress_runs_from_zero_to_one_without_stepping_back(method,
+                                                              monkeypatch):
+    seen = _progress_of(method, monkeypatch)
+    assert seen[0] == 0.0 and seen[-1] == 1.0
+    assert all(a <= b for a, b in zip(seen, seen[1:]))
+
+
+def test_cg_progress_reports_between_the_end_points(monkeypatch):
+    """The point of it: a long CG solve shows something other than 0 then 1."""
+    seen = _progress_of("cg", monkeypatch)
+    assert any(0.0 < f < 1.0 for f in seen)
+
+
+def test_capacitance_progress_covers_every_solve_once(monkeypatch):
+    monkeypatch.setattr("wavesim.electrostatics.PROGRESS_INTERVAL", 0.0)
+    seen = []
+    capacitance_matrix(_three_conductor_grid(), boundary='ground',
+                       method='direct', progress=seen.append)
+    assert seen[0] == 0.0 and seen[-1] == pytest.approx(1.0)
+    assert all(a <= b for a, b in zip(seen, seen[1:]))
+    # Two conductors, two solves: the first ends exactly halfway.
+    assert 0.5 in seen
