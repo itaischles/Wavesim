@@ -10,7 +10,7 @@ Design decisions:
 - Material arrays are split into x/y/z components to support future
   anisotropic materials.
 
-Non-uniform (rectilinear) grid — Session 2 of ``docs/nonuniform_grid_plan.md``
+Non-uniform (rectilinear) grid
 ------------------------------------------------------------------------------
 The grid is now **rectilinear**: cell widths may vary per-axis, per-index. The
 geometric source of truth is the node-coordinate array per axis (``x``/``y``/``z``,
