@@ -1192,24 +1192,35 @@ class Electrostatics:
 PROGRESS_INTERVAL = 0.25
 
 
+def jacobi_preconditioner(A: csr_matrix) -> LinearOperator:
+    """Jacobi (diagonal) preconditioner for conjugate gradients.
+
+    The cheapest thing that helps, and it helps most where it matters, because
+    a strong material contrast shows up directly on the diagonal. If a large
+    model ever converges too slowly this is the knob to replace (algebraic
+    multigrid), not the method — which is why it is a function of the matrix
+    alone that :func:`_linear_solve` takes as an argument.
+    """
+    d = A.diagonal()
+    return LinearOperator(A.shape, matvec=lambda v: v / d)
+
+
 def _linear_solve(A: csr_matrix, b: np.ndarray, method: str,
-                  rtol: float, maxiter, progress=None) -> Tuple[np.ndarray, int]:
+                  rtol: float, maxiter, progress=None,
+                  preconditioner=None) -> Tuple[np.ndarray, int]:
     """Solve ``A x = b`` for a symmetric positive-definite ``A``.
 
     *progress*, if given, is called with a non-decreasing fraction in [0, 1];
-    see :meth:`Electrostatics.solve`.
+    see :meth:`Electrostatics.solve`. *preconditioner* maps ``A`` to the
+    ``LinearOperator`` CG preconditions with, defaulting to
+    :func:`jacobi_preconditioner`; the direct path ignores it.
     """
     if progress is not None:
         progress(0.0)
     if method == 'direct':
         return splu(A.tocsc()).solve(b), 0
 
-    # Jacobi (diagonal) preconditioning: the cheapest thing that helps, and it
-    # helps most where it matters, because a strong permittivity contrast shows
-    # up directly on the diagonal. If a large model ever converges too slowly
-    # this is the knob to replace (algebraic multigrid), not the method.
-    d = A.diagonal()
-    M = LinearOperator(A.shape, matvec=lambda v: v / d)
+    M = (preconditioner or jacobi_preconditioner)(A)
 
     count = 0
     # CG stops once ||r|| <= rtol*||b||, starting from x0 = 0 where ||r|| = ||b||.

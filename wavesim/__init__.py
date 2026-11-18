@@ -54,6 +54,10 @@ from wavesim.electrostatics import (
     Electrostatics, ElectrostaticSolution,
     CapacitanceMatrix, capacitance_matrix,
 )
+from wavesim.magnetostatics import (
+    Magnetostatics, MagnetostaticSolution,
+    InductanceMatrix, inductance_matrix,
+)
 from wavesim.stability import (
     StabilityProbe, probe_growth, max_stable_dt, stability_margin,
     safe_area_threshold, ensure_stable_threshold,
@@ -134,6 +138,9 @@ __all__ = [
     # electrostatics
     "Electrostatics", "ElectrostaticSolution",
     "CapacitanceMatrix", "capacitance_matrix",
+    # magnetostatics
+    "Magnetostatics", "MagnetostaticSolution",
+    "InductanceMatrix", "inductance_matrix",
     # stability (conformal small-cut, plan S7)
     "StabilityProbe", "probe_growth", "max_stable_dt", "stability_margin",
     "safe_area_threshold", "ensure_stable_threshold",
